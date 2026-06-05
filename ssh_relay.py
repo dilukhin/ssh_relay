@@ -10,13 +10,14 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
   py ssh_relay.py stop
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 import argparse
 import atexit
 import getpass
 import json
 import os
+import shlex
 import socket
 import sys
 import threading
@@ -205,10 +206,17 @@ def load_paramiko():
     return paramiko
 
 
-def execute_remote_command(client: Any, command: str, timeout_seconds: int) -> dict[str, Any]:
+def execute_remote_command(
+    client: Any,
+    command: str,
+    timeout_seconds: int,
+    stdin_data: bytes | None = None,
+) -> dict[str, Any]:
     """Выполняет команду без PTY, одновременно вычитывая stdout и stderr."""
     channel = client.get_transport().open_session(timeout=10)
     channel.exec_command(command)
+    if stdin_data is not None:
+        channel.sendall(stdin_data)
     channel.shutdown_write()
     output: list[bytes] = []
     errors: list[bytes] = []
@@ -255,6 +263,34 @@ def execute_remote_command(client: Any, command: str, timeout_seconds: int) -> d
         channel.close()
 
 
+def verify_sudo_password(client: Any, sudo_password: str, timeout_seconds: int) -> None:
+    """Проверяет sudo-пароль без сохранения результата sudo timestamp."""
+    result = execute_remote_command(
+        client,
+        "sudo -k && sudo -S -p '' -v",
+        timeout_seconds,
+        stdin_data=(sudo_password + "\n").encode("utf-8"),
+    )
+    if result.get("exit_code") != 0:
+        raise RelayError("Проверка sudo-пароля не прошла. SSH-соединение будет закрыто.")
+
+
+def execute_sudo_command(
+    client: Any,
+    command: str,
+    timeout_seconds: int,
+    sudo_password: str,
+) -> dict[str, Any]:
+    """Выполняет команду через sudo, передавая пароль только во внутренний stdin."""
+    wrapped_command = "sudo -S -p '' -- sh -c " + shlex.quote(command)
+    return execute_remote_command(
+        client,
+        wrapped_command,
+        timeout_seconds,
+        stdin_data=(sudo_password + "\n").encode("utf-8"),
+    )
+
+
 def check_existing_session() -> bool:
     if not SESSION_FILE.exists():
         return False
@@ -284,6 +320,7 @@ def daemon(args: argparse.Namespace) -> int:
     identity_file: str | None = None
     password: str | None = None
     passphrase: str | None = None
+    sudo_password: str | None = None
     if args.identity_file:
         identity_path = Path(args.identity_file).expanduser()
         if not identity_path.is_file():
@@ -340,6 +377,17 @@ def daemon(args: argparse.Namespace) -> int:
         password = None
         passphrase = None
 
+    if args.enable_sudo:
+        sudo_password = getpass.getpass(f"sudo-пароль для {args.user}@{args.host}: ")
+        try:
+            verify_sudo_password(client, sudo_password, args.command_timeout)
+        except RelayError as exc:
+            sudo_password = None
+            client.close()
+            print(str(exc), file=sys.stderr)
+            return 1
+        print("Режим sudo включён: пароль проверен и хранится только в памяти daemon.")
+
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -362,6 +410,7 @@ def daemon(args: argparse.Namespace) -> int:
         "daemon_port": daemon_port,
         "auth_token": auth_token,
         "pid": os.getpid(),
+        "sudo_enabled": bool(args.enable_sudo),
     }
     try:
         write_session(session)
@@ -376,10 +425,11 @@ def daemon(args: argparse.Namespace) -> int:
     cleanup_done = False
 
     def cleanup() -> None:
-        nonlocal cleanup_done
+        nonlocal cleanup_done, sudo_password
         if cleanup_done:
             return
         cleanup_done = True
+        sudo_password = None
         remove_session_file(auth_token)
         client.close()
 
@@ -403,14 +453,25 @@ def daemon(args: argparse.Namespace) -> int:
 
                 action = request.get("action")
                 if action == "status":
-                    reply({"ok": True, "status": "active", "version": __version__})
+                    reply({
+                        "ok": True,
+                        "status": "active",
+                        "version": __version__,
+                        "sudo_enabled": bool(args.enable_sudo),
+                    })
                     return
                 if action == "stop":
                     reply({"ok": True, "status": "stopping"})
                     stop_event.set()
                     return
-                if action != "exec":
+                if action not in {"exec", "sudo_exec"}:
                     reply({"ok": False, "protocol_error": "Неизвестное действие relay."})
+                    return
+                if action == "sudo_exec" and not args.enable_sudo:
+                    reply({
+                        "ok": False,
+                        "protocol_error": "Режим sudo не включён. Перезапустите daemon с параметром --enable-sudo.",
+                    })
                     return
 
                 command = request.get("command")
@@ -419,7 +480,16 @@ def daemon(args: argparse.Namespace) -> int:
                     return
 
                 with command_lock:
-                    result = execute_remote_command(client, command, args.command_timeout)
+                    if action == "sudo_exec":
+                        if sudo_password is None:
+                            result = {
+                                "ok": False,
+                                "protocol_error": "Режим sudo недоступен: sudo-пароль отсутствует в памяти daemon.",
+                            }
+                        else:
+                            result = execute_sudo_command(client, command, args.command_timeout, sudo_password)
+                    else:
+                        result = execute_remote_command(client, command, args.command_timeout)
                 reply(result)
             except (socket.timeout, TimeoutError):
                 reply({"ok": False, "protocol_error": "Истекло время ожидания локального запроса."})
@@ -431,6 +501,7 @@ def daemon(args: argparse.Namespace) -> int:
     print(f"SSH-соединение установлено: {args.user}@{args.host}:{args.port}")
     print(f"Relay слушает локальный адрес 127.0.0.1:{daemon_port}")
     print(f"Файл сессии: {SESSION_FILE}")
+    print(f"Режим sudo: {'включён' if args.enable_sudo else 'выключен'}")
     print("Для завершения нажмите Ctrl+C или выполните команду stop.")
 
     try:
@@ -452,6 +523,25 @@ def exec_cmd(args: argparse.Namespace) -> int:
     try:
         session = read_session()
         result = request_daemon(session, "exec", command=args.remote_command)
+    except RelayError as exc:
+        remove_session_file()
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if not result.get("ok"):
+        print(f"Ошибка relay: {result.get('protocol_error', 'неизвестная ошибка')}", file=sys.stderr)
+        return 1
+    if result.get("stdout"):
+        sys.stdout.write(result["stdout"])
+    if result.get("stderr"):
+        sys.stderr.write(result["stderr"])
+    return int(result.get("exit_code", 1))
+
+
+def sudo_exec_cmd(args: argparse.Namespace) -> int:
+    try:
+        session = read_session()
+        result = request_daemon(session, "sudo_exec", command=args.remote_command)
     except RelayError as exc:
         remove_session_file()
         print(str(exc), file=sys.stderr)
@@ -500,6 +590,7 @@ def status(_: argparse.Namespace) -> int:
     print(f"Активна: {session['user']}@{session['host']}:{session['port']}")
     print(f"Локальный порт: {session['daemon_port']}")
     print(f"Версия relay: {result.get('version', session['version'])}")
+    print(f"Режим sudo: {'включён' if result.get('sudo_enabled') else 'выключен'}")
     return 0
 
 
@@ -539,11 +630,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_COMMAND_TIMEOUT,
         help=f"Предельное время одной команды в секундах, по умолчанию {DEFAULT_COMMAND_TIMEOUT}.",
     )
+    daemon_parser.add_argument(
+        "--enable-sudo",
+        action="store_true",
+        help="Включить явный режим sudo с ручным вводом sudo-пароля в терминале daemon.",
+    )
     daemon_parser.set_defaults(handler=daemon)
 
     exec_parser = subparsers.add_parser("exec", help="Выполнить одну команду через активный relay.")
     exec_parser.add_argument("remote_command", help="Неинтерактивная команда для удалённого сервера.")
     exec_parser.set_defaults(handler=exec_cmd)
+
+    sudo_exec_parser = subparsers.add_parser(
+        "sudo-exec",
+        help="Выполнить одну неинтерактивную команду через sudo в активном relay.",
+    )
+    sudo_exec_parser.add_argument("remote_command", help="Неинтерактивная команда для удалённого сервера без префикса sudo.")
+    sudo_exec_parser.set_defaults(handler=sudo_exec_cmd)
 
     stop_parser = subparsers.add_parser("stop", help="Корректно остановить активный daemon.")
     stop_parser.set_defaults(handler=stop)
