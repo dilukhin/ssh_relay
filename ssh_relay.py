@@ -4,12 +4,13 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
 
 Примеры:
   py ssh_relay.py daemon --host 198.51.100.42 --user donpedro
+  py ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i ~/.ssh/id_ed25519
   py ssh_relay.py exec "hostname"
   py ssh_relay.py status
   py ssh_relay.py stop
 """
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 import argparse
 import atexit
@@ -273,11 +274,35 @@ def check_existing_session() -> bool:
 
 
 def daemon(args: argparse.Namespace) -> int:
+    if args.ask_key_passphrase and not args.identity_file:
+        print("Параметр --ask-key-passphrase допустим только вместе с --identity-file.", file=sys.stderr)
+        return 2
+
     if check_existing_session():
         return 1
 
-    paramiko = load_paramiko()
-    password = getpass.getpass(f"SSH-пароль для {args.user}@{args.host}: ")
+    identity_file: str | None = None
+    password: str | None = None
+    passphrase: str | None = None
+    if args.identity_file:
+        identity_path = Path(args.identity_file).expanduser()
+        if not identity_path.is_file():
+            print(f"Файл ключа или сертификата не найден: {identity_path}", file=sys.stderr)
+            return 1
+        identity_file = str(identity_path)
+
+    try:
+        paramiko = load_paramiko()
+    except RelayError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if identity_file:
+        if args.ask_key_passphrase:
+            passphrase = getpass.getpass(f"Passphrase SSH-ключа для {args.user}@{args.host}: ")
+    else:
+        password = getpass.getpass(f"SSH-пароль для {args.user}@{args.host}: ")
+
     client = paramiko.SSHClient()
     try:
         if args.known_hosts:
@@ -290,6 +315,8 @@ def daemon(args: argparse.Namespace) -> int:
             port=args.port,
             username=args.user,
             password=password,
+            key_filename=identity_file,
+            passphrase=passphrase,
             look_for_keys=False,
             allow_agent=False,
             timeout=10,
@@ -297,13 +324,21 @@ def daemon(args: argparse.Namespace) -> int:
     except Exception as exc:
         client.close()
         print(f"Не удалось установить SSH-соединение: {exc}", file=sys.stderr)
-        print(
-            "Проверьте доступность сервера, пароль и наличие подтверждённого ключа в known_hosts.",
-            file=sys.stderr,
-        )
+        if identity_file:
+            print(
+                "Проверьте доступность сервера, файл ключа или сертификата, его passphrase "
+                "и наличие подтверждённого ключа сервера в known_hosts.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Проверьте доступность сервера, пароль и наличие подтверждённого ключа сервера в known_hosts.",
+                file=sys.stderr,
+            )
         return 1
     finally:
-        password = ""
+        password = None
+        passphrase = None
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -481,6 +516,19 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.add_argument("--host", required=True, help="Имя или адрес SSH-сервера.")
     daemon_parser.add_argument("--port", type=parse_port, default=22, help="Порт SSH-сервера, по умолчанию 22.")
     daemon_parser.add_argument("--user", "-u", default=getpass.getuser(), help="Имя SSH-пользователя.")
+    daemon_parser.add_argument(
+        "--identity-file",
+        "-i",
+        help=(
+            "Путь к приватному SSH-ключу или OpenSSH-сертификату *-cert.pub; "
+            "если не задан, запрашивается SSH-пароль."
+        ),
+    )
+    daemon_parser.add_argument(
+        "--ask-key-passphrase",
+        action="store_true",
+        help="Запросить passphrase для зашифрованного ключа, указанного через --identity-file.",
+    )
     daemon_parser.add_argument(
         "--known-hosts",
         help="Путь к проверенному файлу known_hosts; по умолчанию используется ~/.ssh/known_hosts.",
