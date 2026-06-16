@@ -7,17 +7,19 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
   py ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i ~/.ssh/id_ed25519
   py ssh_relay.py exec "hostname"
   py ssh_relay.py download /tmp/result.txt ./result.txt
+  py ssh_relay.py upload ./config.json /tmp/config.json
   py ssh_relay.py status
   py ssh_relay.py stop
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 import argparse
 import atexit
 import getpass
 import json
 import os
+import posixpath
 import re
 import shlex
 import socket
@@ -35,6 +37,8 @@ MAX_MESSAGE_SIZE = 32 * 1024 * 1024
 DEFAULT_COMMAND_TIMEOUT = 120
 DEFAULT_DOWNLOAD_TIMEOUT = 300
 DEFAULT_DOWNLOAD_MAX_SIZE = 64 * 1024 * 1024
+DEFAULT_UPLOAD_TIMEOUT = 300
+DEFAULT_UPLOAD_MAX_SIZE = 64 * 1024 * 1024
 REQUIRED_SESSION_FIELDS = {
     "host": str,
     "port": int,
@@ -522,6 +526,205 @@ def download_remote_file(
                 pass
 
 
+def remote_parent_directory(remote_path: str) -> str:
+    """Возвращает родительский каталог POSIX-пути на удалённой стороне."""
+    stripped = remote_path.rstrip("/")
+    if not stripped:
+        raise RelayError("Удалённый путь должен указывать на файл, а не на корень файловой системы.")
+    name = posixpath.basename(stripped)
+    if not name or name in {".", ".."}:
+        raise RelayError("Удалённый путь должен указывать на файл с допустимым именем.")
+    parent = posixpath.dirname(stripped)
+    return parent or "."
+
+
+def ensure_remote_directory(sftp: Any, remote_directory: str) -> None:
+    """Создаёт родительские каталоги на удалённой стороне через SFTP."""
+    if remote_directory in {"", "."}:
+        return
+    normalized = posixpath.normpath(remote_directory)
+    if normalized == "/":
+        return
+
+    current = "/" if normalized.startswith("/") else ""
+    for part in normalized.strip("/").split("/"):
+        if not part or part == ".":
+            continue
+        current = posixpath.join(current, part) if current else part
+        try:
+            attrs = sftp.stat(current)
+            mode = getattr(attrs, "st_mode", 0)
+            if mode and not stat.S_ISDIR(mode):
+                raise RelayError(f"Удалённый путь {current} существует, но не является каталогом.")
+        except RelayError:
+            raise
+        except OSError:
+            try:
+                sftp.mkdir(current)
+            except OSError as exc:
+                raise RelayError(f"Не удалось создать удалённый каталог: {current}") from exc
+
+
+def remote_temporary_path(remote_path: str) -> str:
+    """Возвращает временный POSIX-путь рядом с удалённым целевым файлом."""
+    stripped = remote_path.rstrip("/")
+    parent = remote_parent_directory(stripped)
+    name = posixpath.basename(stripped)
+    temporary_name = f".{name}.ssh-relay-{uuid.uuid4().hex}.tmp"
+    if parent in {"", "."}:
+        return temporary_name
+    return posixpath.join(parent, temporary_name)
+
+
+def upload_local_file(
+    client: Any,
+    local_path: str,
+    remote_path: str,
+    *,
+    overwrite: bool,
+    create_dirs: bool,
+    max_size: int,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Загружает один обычный локальный файл через SFTP на удалённый сервер."""
+    if not local_path.strip():
+        raise RelayError("Передан пустой путь локального файла.")
+    if not remote_path.strip():
+        raise RelayError("Передан пустой путь удалённого файла.")
+    if remote_path.endswith("/"):
+        raise RelayError("Удалённый путь должен указывать на файл, а не на каталог.")
+    if "\x00" in remote_path:
+        raise RelayError("Удалённый путь содержит недопустимый нулевой символ.")
+
+    source = Path(local_path).expanduser()
+    if not source.is_absolute():
+        raise RelayError("Локальный путь должен быть абсолютным.")
+    if not source.exists():
+        raise RelayError(f"Локальный файл не найден: {source}")
+    if not source.is_file():
+        raise RelayError("Локальный путь должен указывать на обычный файл. Загрузка каталогов не поддерживается.")
+
+    try:
+        local_size = source.stat().st_size
+    except OSError as exc:
+        raise RelayError(f"Не удалось прочитать параметры локального файла: {source}") from exc
+    if local_size > max_size:
+        raise RelayError(
+            f"Размер локального файла {format_bytes(local_size)} превышает лимит "
+            f"{format_bytes(max_size)}. Перезапустите daemon с большим --upload-max-size, "
+            "если это безопасно."
+        )
+
+    remote_target = remote_path.rstrip("/")
+    remote_parent = remote_parent_directory(remote_target)
+    temporary = remote_temporary_path(remote_target)
+    started = time.monotonic()
+
+    try:
+        sftp = client.open_sftp()
+    except Exception as exc:
+        raise RelayError("Не удалось открыть SFTP-канал через активную SSH-сессию.") from exc
+
+    sent = 0
+    try:
+        if create_dirs:
+            ensure_remote_directory(sftp, remote_parent)
+        else:
+            try:
+                attrs = sftp.stat(remote_parent)
+                mode = getattr(attrs, "st_mode", 0)
+                if mode and not stat.S_ISDIR(mode):
+                    raise RelayError("Удалённый родительский путь существует, но не является каталогом.")
+            except RelayError:
+                raise
+            except OSError as exc:
+                raise RelayError(
+                    "Удалённый каталог назначения не существует. Укажите --create-dirs или создайте его вручную."
+                ) from exc
+
+        try:
+            existing = sftp.stat(remote_target)
+            mode = getattr(existing, "st_mode", 0)
+            if mode and stat.S_ISDIR(mode):
+                raise RelayError("Удалённый путь указывает на каталог, а не на файл.")
+            if mode and not stat.S_ISREG(mode):
+                raise RelayError("Удалённый путь существует, но не является обычным файлом.")
+            if not overwrite:
+                raise RelayError("Удалённый файл уже существует. Укажите --overwrite для перезаписи.")
+        except RelayError:
+            raise
+        except OSError:
+            pass
+
+        try:
+            sftp.stat(temporary)
+        except OSError:
+            pass
+        else:
+            raise RelayError("Временный удалённый файл уже существует. Повторите команду.")
+
+        try:
+            with source.open("rb") as local_file, sftp.open(temporary, "wb") as remote_file:
+                while True:
+                    chunk = local_file.read(BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    sent += len(chunk)
+                    if sent > max_size:
+                        raise RelayError(f"Загрузка остановлена: отправлено больше лимита {format_bytes(max_size)}.")
+                    if time.monotonic() - started > timeout_seconds:
+                        raise RelayError(
+                            f"Превышено время загрузки файла: {timeout_seconds} с. "
+                            "Relay предназначен для коротких контролируемых передач."
+                        )
+                    remote_file.write(chunk)
+                remote_file.flush()
+        except RelayError:
+            raise
+        except OSError as exc:
+            raise RelayError(f"Ошибка при чтении или загрузке файла: {exc}") from exc
+
+        try:
+            sftp.stat(remote_target)
+            target_exists = True
+        except OSError:
+            target_exists = False
+        if target_exists and not overwrite:
+            raise RelayError("Удалённый файл появился во время загрузки. Повторите команду с --overwrite при необходимости.")
+
+        if overwrite:
+            try:
+                sftp.posix_rename(temporary, remote_target)
+            except AttributeError:
+                try:
+                    sftp.remove(remote_target)
+                except OSError:
+                    pass
+                sftp.rename(temporary, remote_target)
+            except OSError:
+                try:
+                    sftp.remove(remote_target)
+                except OSError:
+                    pass
+                sftp.rename(temporary, remote_target)
+        else:
+            sftp.rename(temporary, remote_target)
+
+        return {
+            "ok": True,
+            "local_path": str(source),
+            "remote_path": remote_target,
+            "bytes_uploaded": sent,
+        }
+    finally:
+        try:
+            sftp.remove(temporary)
+        except OSError:
+            pass
+        finally:
+            sftp.close()
+
+
 def session_display_name(session: dict[str, Any]) -> str:
     return str(session.get("name") or DEFAULT_SESSION_NAME)
 
@@ -662,6 +865,8 @@ def daemon(args: argparse.Namespace) -> int:
         "command_timeout": args.command_timeout,
         "download_timeout": args.download_timeout,
         "download_max_size": args.download_max_size,
+        "upload_timeout": args.upload_timeout,
+        "upload_max_size": args.upload_max_size,
     }
     try:
         session_path = write_session(session_name, session)
@@ -716,7 +921,7 @@ def daemon(args: argparse.Namespace) -> int:
                     reply({"ok": True, "status": "stopping"})
                     stop_event.set()
                     return
-                if action not in {"exec", "sudo_exec", "download"}:
+                if action not in {"exec", "sudo_exec", "download", "upload"}:
                     reply({"ok": False, "protocol_error": "Неизвестное действие relay."})
                     return
                 if action == "sudo_exec" and not args.enable_sudo:
@@ -746,6 +951,30 @@ def daemon(args: argparse.Namespace) -> int:
                             create_dirs=create_dirs,
                             max_size=args.download_max_size,
                             timeout_seconds=args.download_timeout,
+                        )
+                    reply(result)
+                    return
+
+                if action == "upload":
+                    local_path = request.get("local_path")
+                    remote_path = request.get("remote_path")
+                    overwrite = request.get("overwrite")
+                    create_dirs = request.get("create_dirs")
+                    if not isinstance(local_path, str) or not isinstance(remote_path, str):
+                        reply({"ok": False, "protocol_error": "Для загрузки нужны локальный и удалённый путь."})
+                        return
+                    if not isinstance(overwrite, bool) or not isinstance(create_dirs, bool):
+                        reply({"ok": False, "protocol_error": "Некорректные параметры загрузки."})
+                        return
+                    with command_lock:
+                        result = upload_local_file(
+                            client,
+                            local_path,
+                            remote_path,
+                            overwrite=overwrite,
+                            create_dirs=create_dirs,
+                            max_size=args.upload_max_size,
+                            timeout_seconds=args.upload_timeout,
                         )
                     reply(result)
                     return
@@ -863,6 +1092,37 @@ def download_cmd(args: argparse.Namespace) -> int:
     print(f"Скачано: {format_bytes(bytes_downloaded)}")
     print(f"Удалённый файл: {result.get('remote_path', args.remote_path)}")
     print(f"Локальный файл: {result.get('local_path', local_path)}")
+    return 0
+
+
+def upload_cmd(args: argparse.Namespace) -> int:
+    try:
+        session_name = validate_session_name(args.name)
+        session = read_session(session_name)
+        local_path = Path(args.local_path).expanduser().resolve(strict=False)
+        response_timeout = int(session.get("upload_timeout", DEFAULT_UPLOAD_TIMEOUT)) + 10
+        result = request_daemon(
+            session,
+            "upload",
+            response_timeout=response_timeout,
+            local_path=str(local_path),
+            remote_path=args.remote_path,
+            overwrite=bool(args.overwrite),
+            create_dirs=bool(args.create_dirs),
+        )
+    except RelayError as exc:
+        remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if not result.get("ok"):
+        print(f"Ошибка relay: {result.get('protocol_error', 'неизвестная ошибка')}", file=sys.stderr)
+        return 1
+
+    bytes_uploaded = int(result.get("bytes_uploaded", 0))
+    print(f"Загружено: {format_bytes(bytes_uploaded)}")
+    print(f"Локальный файл: {result.get('local_path', local_path)}")
+    print(f"Удалённый файл: {result.get('remote_path', args.remote_path)}")
     return 0
 
 
@@ -1047,6 +1307,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Предельный размер одного скачиваемого файла, по умолчанию {format_bytes(DEFAULT_DOWNLOAD_MAX_SIZE)}.",
     )
     daemon_parser.add_argument(
+        "--upload-timeout",
+        type=parse_positive_seconds,
+        default=DEFAULT_UPLOAD_TIMEOUT,
+        help=f"Предельное время одной загрузки файла в секундах, по умолчанию {DEFAULT_UPLOAD_TIMEOUT}.",
+    )
+    daemon_parser.add_argument(
+        "--upload-max-size",
+        type=parse_size_bytes,
+        default=DEFAULT_UPLOAD_MAX_SIZE,
+        help=f"Предельный размер одного загружаемого файла, по умолчанию {format_bytes(DEFAULT_UPLOAD_MAX_SIZE)}.",
+    )
+    daemon_parser.add_argument(
         "--enable-sudo",
         action="store_true",
         help="Включить явный режим sudo с ручным вводом sudo-пароля в терминале daemon.",
@@ -1073,6 +1345,14 @@ def build_parser() -> argparse.ArgumentParser:
     download_parser.add_argument("--overwrite", action="store_true", help="Перезаписать локальный файл, если он уже существует.")
     download_parser.add_argument("--create-dirs", action="store_true", help="Создать локальный каталог назначения, если он отсутствует.")
     download_parser.set_defaults(handler=download_cmd)
+
+    upload_parser = subparsers.add_parser("upload", help="Загрузить один файл на удалённый сервер через активный relay.")
+    add_session_name_argument(upload_parser)
+    upload_parser.add_argument("local_path", help="Путь локального файла для загрузки.")
+    upload_parser.add_argument("remote_path", help="Удалённый путь для сохранения файла.")
+    upload_parser.add_argument("--overwrite", action="store_true", help="Перезаписать удалённый файл, если он уже существует.")
+    upload_parser.add_argument("--create-dirs", action="store_true", help="Создать удалённый каталог назначения, если он отсутствует.")
+    upload_parser.set_defaults(handler=upload_cmd)
 
     stop_parser = subparsers.add_parser("stop", help="Корректно остановить активный daemon.")
     add_session_name_argument(stop_parser)
