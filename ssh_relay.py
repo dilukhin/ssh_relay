@@ -6,11 +6,12 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
   py ssh_relay.py daemon --host 198.51.100.42 --user donpedro
   py ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i ~/.ssh/id_ed25519
   py ssh_relay.py exec "hostname"
+  py ssh_relay.py download /tmp/result.txt ./result.txt
   py ssh_relay.py status
   py ssh_relay.py stop
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 import argparse
 import atexit
@@ -20,6 +21,7 @@ import os
 import re
 import shlex
 import socket
+import stat
 import sys
 import threading
 import time
@@ -31,6 +33,8 @@ BUFFER_SIZE = 64 * 1024
 MAX_OUTPUT_SIZE = 4 * 1024 * 1024
 MAX_MESSAGE_SIZE = 32 * 1024 * 1024
 DEFAULT_COMMAND_TIMEOUT = 120
+DEFAULT_DOWNLOAD_TIMEOUT = 300
+DEFAULT_DOWNLOAD_MAX_SIZE = 64 * 1024 * 1024
 REQUIRED_SESSION_FIELDS = {
     "host": str,
     "port": int,
@@ -92,6 +96,57 @@ def parse_positive_seconds(value: str) -> int:
     if seconds <= 0:
         raise argparse.ArgumentTypeError("время должно быть положительным числом секунд")
     return seconds
+
+
+def parse_size_bytes(value: str) -> int:
+    """Разбирает размер в байтах с необязательным суффиксом K/M/G."""
+    cleaned = value.strip().replace(" ", "")
+    match = re.fullmatch(r"(\d+)([A-Za-zА-Яа-я]*)", cleaned)
+    if not match:
+        raise argparse.ArgumentTypeError("размер должен быть числом байт или значением с суффиксом K, M или G")
+
+    number = int(match.group(1))
+    suffix = match.group(2).lower()
+    multipliers = {
+        "": 1,
+        "b": 1,
+        "byte": 1,
+        "bytes": 1,
+        "б": 1,
+        "байт": 1,
+        "байта": 1,
+        "байтов": 1,
+        "k": 1024,
+        "kb": 1024,
+        "kib": 1024,
+        "к": 1024,
+        "кб": 1024,
+        "m": 1024 * 1024,
+        "mb": 1024 * 1024,
+        "mib": 1024 * 1024,
+        "м": 1024 * 1024,
+        "мб": 1024 * 1024,
+        "g": 1024 * 1024 * 1024,
+        "gb": 1024 * 1024 * 1024,
+        "gib": 1024 * 1024 * 1024,
+        "г": 1024 * 1024 * 1024,
+        "гб": 1024 * 1024 * 1024,
+    }
+    if suffix not in multipliers:
+        raise argparse.ArgumentTypeError("поддерживаются только суффиксы K, M или G")
+    size = number * multipliers[suffix]
+    if size <= 0:
+        raise argparse.ArgumentTypeError("размер должен быть положительным")
+    return size
+
+
+def format_bytes(size: int) -> str:
+    """Возвращает компактное человекочитаемое представление размера."""
+    units = ((1024 * 1024 * 1024, "ГиБ"), (1024 * 1024, "МиБ"), (1024, "КиБ"))
+    for factor, suffix in units:
+        if size >= factor and size % factor == 0:
+            return f"{size // factor} {suffix}"
+    return f"{size} байт"
 
 
 SESSION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -251,15 +306,22 @@ def send_message(conn: socket.socket, message: dict[str, Any]) -> None:
     conn.sendall(json.dumps(message, ensure_ascii=False).encode("utf-8"))
 
 
-def request_daemon(session: dict[str, Any], action: str, **payload: Any) -> dict[str, Any]:
+def request_daemon(
+    session: dict[str, Any],
+    action: str,
+    *,
+    response_timeout: float | None = 5,
+    **payload: Any,
+) -> dict[str, Any]:
     request = {"auth_token": session["auth_token"], "action": action, **payload}
     try:
         with socket.create_connection(("127.0.0.1", session["daemon_port"]), timeout=5) as sock:
             sock.sendall(json.dumps(request, ensure_ascii=False).encode("utf-8"))
             sock.shutdown(socket.SHUT_WR)
+            sock.settimeout(response_timeout)
             return read_message(sock)
     except (ConnectionError, TimeoutError, socket.timeout, OSError) as exc:
-        raise RelayError("Daemon недоступен.") from exc
+        raise RelayError("Daemon недоступен или не ответил вовремя.") from exc
 
 
 def load_paramiko():
@@ -353,6 +415,111 @@ def execute_sudo_command(
         timeout_seconds,
         stdin_data=(sudo_password + "\n").encode("utf-8"),
     )
+
+
+def download_remote_file(
+    client: Any,
+    remote_path: str,
+    local_path: str,
+    *,
+    overwrite: bool,
+    create_dirs: bool,
+    max_size: int,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Скачивает один обычный удалённый файл через SFTP в локальный файл."""
+    if not remote_path.strip():
+        raise RelayError("Передан пустой путь удалённого файла.")
+    if not local_path.strip():
+        raise RelayError("Передан пустой локальный путь для сохранения файла.")
+
+    target = Path(local_path).expanduser()
+    if not target.is_absolute():
+        raise RelayError("Локальный путь должен быть абсолютным.")
+    if not target.name:
+        raise RelayError("Локальный путь должен указывать на файл, а не на корень диска или файловой системы.")
+    if target.exists() and target.is_dir():
+        raise RelayError("Локальный путь указывает на каталог, а не на файл.")
+    if target.exists() and not overwrite:
+        raise RelayError("Локальный файл уже существует. Укажите --overwrite для перезаписи.")
+
+    parent = target.parent
+    if create_dirs:
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise RelayError(f"Не удалось создать локальный каталог для скачивания: {parent}") from exc
+    elif not parent.is_dir():
+        raise RelayError("Локальный каталог для сохранения не существует. Укажите --create-dirs или создайте его вручную.")
+
+    temporary = target.with_name(f".{target.name}.ssh-relay-{uuid.uuid4().hex}.tmp")
+    started = time.monotonic()
+    try:
+        sftp = client.open_sftp()
+    except Exception as exc:
+        raise RelayError("Не удалось открыть SFTP-канал через активную SSH-сессию.") from exc
+    received = 0
+    try:
+        try:
+            remote_stat = sftp.stat(remote_path)
+        except OSError as exc:
+            raise RelayError(f"Удалённый файл не найден или недоступен: {remote_path}") from exc
+
+        mode = getattr(remote_stat, "st_mode", 0)
+        if stat.S_ISDIR(mode):
+            raise RelayError("Удалённый путь указывает на каталог. Скачивание каталогов не поддерживается.")
+        if mode and not stat.S_ISREG(mode):
+            raise RelayError("Удалённый путь не является обычным файлом. Скачивание специальных файлов не поддерживается.")
+
+        remote_size = int(getattr(remote_stat, "st_size", 0) or 0)
+        if remote_size > max_size:
+            raise RelayError(
+                f"Размер удалённого файла {format_bytes(remote_size)} превышает лимит "
+                f"{format_bytes(max_size)}. Перезапустите daemon с большим --download-max-size, "
+                "если это безопасно."
+            )
+
+        try:
+            with sftp.open(remote_path, "rb") as remote_file, temporary.open("xb") as output:
+                while True:
+                    chunk = remote_file.read(BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    received += len(chunk)
+                    if received > max_size:
+                        raise RelayError(
+                            f"Скачивание остановлено: получено больше лимита {format_bytes(max_size)}."
+                        )
+                    if time.monotonic() - started > timeout_seconds:
+                        raise RelayError(
+                            f"Превышено время скачивания файла: {timeout_seconds} с. "
+                            "Relay предназначен для коротких контролируемых передач."
+                        )
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+        except RelayError:
+            raise
+        except OSError as exc:
+            raise RelayError(f"Ошибка при скачивании или записи файла: {exc}") from exc
+
+        if target.exists() and not overwrite:
+            raise RelayError("Локальный файл появился во время скачивания. Повторите команду с --overwrite при необходимости.")
+        os.replace(temporary, target)
+        return {
+            "ok": True,
+            "remote_path": remote_path,
+            "local_path": str(target),
+            "bytes_downloaded": received,
+        }
+    finally:
+        try:
+            sftp.close()
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def session_display_name(session: dict[str, Any]) -> str:
@@ -492,6 +659,9 @@ def daemon(args: argparse.Namespace) -> int:
         "auth_token": auth_token,
         "pid": os.getpid(),
         "sudo_enabled": bool(args.enable_sudo),
+        "command_timeout": args.command_timeout,
+        "download_timeout": args.download_timeout,
+        "download_max_size": args.download_max_size,
     }
     try:
         session_path = write_session(session_name, session)
@@ -546,7 +716,7 @@ def daemon(args: argparse.Namespace) -> int:
                     reply({"ok": True, "status": "stopping"})
                     stop_event.set()
                     return
-                if action not in {"exec", "sudo_exec"}:
+                if action not in {"exec", "sudo_exec", "download"}:
                     reply({"ok": False, "protocol_error": "Неизвестное действие relay."})
                     return
                 if action == "sudo_exec" and not args.enable_sudo:
@@ -554,6 +724,30 @@ def daemon(args: argparse.Namespace) -> int:
                         "ok": False,
                         "protocol_error": "Режим sudo не включён. Перезапустите daemon с параметром --enable-sudo.",
                     })
+                    return
+
+                if action == "download":
+                    remote_path = request.get("remote_path")
+                    local_path = request.get("local_path")
+                    overwrite = request.get("overwrite")
+                    create_dirs = request.get("create_dirs")
+                    if not isinstance(remote_path, str) or not isinstance(local_path, str):
+                        reply({"ok": False, "protocol_error": "Для скачивания нужны удалённый и локальный путь."})
+                        return
+                    if not isinstance(overwrite, bool) or not isinstance(create_dirs, bool):
+                        reply({"ok": False, "protocol_error": "Некорректные параметры скачивания."})
+                        return
+                    with command_lock:
+                        result = download_remote_file(
+                            client,
+                            remote_path,
+                            local_path,
+                            overwrite=overwrite,
+                            create_dirs=create_dirs,
+                            max_size=args.download_max_size,
+                            timeout_seconds=args.download_timeout,
+                        )
+                    reply(result)
                     return
 
                 command = request.get("command")
@@ -617,7 +811,8 @@ def exec_cmd(args: argparse.Namespace) -> int:
     try:
         session_name = validate_session_name(args.name)
         session = read_session(session_name)
-        result = request_daemon(session, "exec", command=args.remote_command)
+        response_timeout = int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)) + 10
+        result = request_daemon(session, "exec", command=args.remote_command, response_timeout=response_timeout)
     except RelayError as exc:
         remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
         print(str(exc), file=sys.stderr)
@@ -630,13 +825,45 @@ def sudo_exec_cmd(args: argparse.Namespace) -> int:
     try:
         session_name = validate_session_name(args.name)
         session = read_session(session_name)
-        result = request_daemon(session, "sudo_exec", command=args.remote_command)
+        response_timeout = int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)) + 10
+        result = request_daemon(session, "sudo_exec", command=args.remote_command, response_timeout=response_timeout)
     except RelayError as exc:
         remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
         print(str(exc), file=sys.stderr)
         return 1
 
     return print_command_result(result)
+
+
+def download_cmd(args: argparse.Namespace) -> int:
+    try:
+        session_name = validate_session_name(args.name)
+        session = read_session(session_name)
+        local_path = Path(args.local_path).expanduser().resolve(strict=False)
+        response_timeout = int(session.get("download_timeout", DEFAULT_DOWNLOAD_TIMEOUT)) + 10
+        result = request_daemon(
+            session,
+            "download",
+            response_timeout=response_timeout,
+            remote_path=args.remote_path,
+            local_path=str(local_path),
+            overwrite=bool(args.overwrite),
+            create_dirs=bool(args.create_dirs),
+        )
+    except RelayError as exc:
+        remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if not result.get("ok"):
+        print(f"Ошибка relay: {result.get('protocol_error', 'неизвестная ошибка')}", file=sys.stderr)
+        return 1
+
+    bytes_downloaded = int(result.get("bytes_downloaded", 0))
+    print(f"Скачано: {format_bytes(bytes_downloaded)}")
+    print(f"Удалённый файл: {result.get('remote_path', args.remote_path)}")
+    print(f"Локальный файл: {result.get('local_path', local_path)}")
+    return 0
 
 
 def stop_one_session(name: str) -> int:
@@ -808,6 +1035,18 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Предельное время одной команды в секундах, по умолчанию {DEFAULT_COMMAND_TIMEOUT}.",
     )
     daemon_parser.add_argument(
+        "--download-timeout",
+        type=parse_positive_seconds,
+        default=DEFAULT_DOWNLOAD_TIMEOUT,
+        help=f"Предельное время одного скачивания в секундах, по умолчанию {DEFAULT_DOWNLOAD_TIMEOUT}.",
+    )
+    daemon_parser.add_argument(
+        "--download-max-size",
+        type=parse_size_bytes,
+        default=DEFAULT_DOWNLOAD_MAX_SIZE,
+        help=f"Предельный размер одного скачиваемого файла, по умолчанию {format_bytes(DEFAULT_DOWNLOAD_MAX_SIZE)}.",
+    )
+    daemon_parser.add_argument(
         "--enable-sudo",
         action="store_true",
         help="Включить явный режим sudo с ручным вводом sudo-пароля в терминале daemon.",
@@ -826,6 +1065,14 @@ def build_parser() -> argparse.ArgumentParser:
     add_session_name_argument(sudo_exec_parser)
     sudo_exec_parser.add_argument("remote_command", help="Неинтерактивная команда для удалённого сервера без префикса sudo.")
     sudo_exec_parser.set_defaults(handler=sudo_exec_cmd)
+
+    download_parser = subparsers.add_parser("download", help="Скачать один файл с удалённого сервера через активный relay.")
+    add_session_name_argument(download_parser)
+    download_parser.add_argument("remote_path", help="Путь удалённого файла для скачивания.")
+    download_parser.add_argument("local_path", help="Локальный путь для сохранения файла.")
+    download_parser.add_argument("--overwrite", action="store_true", help="Перезаписать локальный файл, если он уже существует.")
+    download_parser.add_argument("--create-dirs", action="store_true", help="Создать локальный каталог назначения, если он отсутствует.")
+    download_parser.set_defaults(handler=download_cmd)
 
     stop_parser = subparsers.add_parser("stop", help="Корректно остановить активный daemon.")
     add_session_name_argument(stop_parser)

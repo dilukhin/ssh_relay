@@ -4,19 +4,20 @@
 
 Основной сценарий: пользователь вручную запускает один или несколько `daemon`, проходя SSH-аутентификацию паролем либо заданным ключом/сертификатом, после чего CLI-агент, в частности OpenCode, выполняет удалённые команды через локальный вызов `exec` или явно включённый `sudo-exec`, не используя прямой SSH и не запрашивая SSH-учётные данные повторно.
 
-Текущая версия: `0.3.0`.
+Текущая версия: `0.4.0`.
 
 ## Возможности
 
 * открытие одной или нескольких именованных SSH-сессий по паролю, приватному SSH-ключу либо OpenSSH-сертификату и их использование до ручной остановки;
 * выполнение одной удалённой команды за вызов `exec`;
 * явный режим `sudo` через `daemon --enable-sudo` и отдельную команду `sudo-exec`;
+* скачивание одного обычного удалённого файла через активную SSH-сессию командой `download`;
 * проверка активной сессии через аутентифицированный запрос `status`;
 * проверка всех известных сессий через `status --all` и просмотр списка через `list`;
 * корректная остановка daemon через аутентифицированный запрос `stop`;
 * прослушивание только локального адреса `127.0.0.1`;
 * обязательная проверка SSH host key через `known_hosts`;
-* ограничение вывода команды размером 4 МиБ и ограничение времени выполнения команды.
+* ограничение вывода команды размером 4 МиБ, ограничение времени выполнения команды, а также лимиты размера и времени для скачивания файлов.
 
 ## Ограничения
 
@@ -27,11 +28,13 @@ Relay предназначен только для коротких неинте
 * интерактивный ввод в удалённую команду;
 * обычный пропуск `sudo` через `exec` с запросом пароля;
 * редакторы, интерактивные shell, `top`, `less`, `passwd`, команды с повторными запросами ввода;
-* передача файлов через SCP/SFTP;
-* параллельное выполнение удалённых команд;
+* загрузка локальных файлов на удалённый сервер;
+* скачивание каталогов, рекурсивное копирование, SCP-режим и скачивание специальных файлов;
+* `sudo-download`: команда `download` скачивает только файлы, доступные текущему SSH-пользователю через SFTP;
+* параллельное выполнение удалённых команд и скачиваний;
 * длительные задачи и команды с большим выводом.
 
-Команды выполняются последовательно. Псевдотерминал для удалённых команд не создаётся. Если команда выдаёт более 4 МиБ данных либо работает дольше установленного лимита, relay завершает её с диагностическим сообщением.
+Команды и скачивания выполняются последовательно. Псевдотерминал для удалённых команд не создаётся. Если команда выдаёт более 4 МиБ данных либо работает дольше установленного лимита, relay завершает её с диагностическим сообщением. Если файл превышает лимит скачивания либо скачивается дольше разрешённого времени, relay останавливает операцию и удаляет временный локальный файл.
 
 `sudo-exec` не делает relay интерактивным. Sudo-пароль передаётся только внутренне из памяти daemon в stdin удалённой команды `sudo -S`; обычный `exec` stdin от пользователя не принимает.
 
@@ -71,7 +74,7 @@ py .\ssh_relay.py --help
 Ожидаемый вывод версии:
 
 ```text
-ssh_relay 0.3.0
+ssh_relay 0.4.0
 ```
 
 ## Подготовка `known_hosts`
@@ -91,9 +94,10 @@ ssh-keygen -lf "$env:USERPROFILE\.ssh\known_hosts"
 ## Команды
 
 ```text
-py .\ssh_relay.py daemon [--name NAME] --host HOST --user USER [--port PORT] [-i PATH] [--ask-key-passphrase] [--known-hosts PATH] [--command-timeout SECONDS] [--enable-sudo]
+py .\ssh_relay.py daemon [--name NAME] --host HOST --user USER [--port PORT] [-i PATH] [--ask-key-passphrase] [--known-hosts PATH] [--command-timeout SECONDS] [--download-timeout SECONDS] [--download-max-size SIZE] [--enable-sudo]
 py .\ssh_relay.py exec [--name NAME] "COMMAND"
 py .\ssh_relay.py sudo-exec [--name NAME] "COMMAND"
+py .\ssh_relay.py download [--name NAME] [--overwrite] [--create-dirs] REMOTE_PATH LOCAL_PATH
 py .\ssh_relay.py status [--name NAME] [--all]
 py .\ssh_relay.py stop [--name NAME] [--all]
 py .\ssh_relay.py list
@@ -144,6 +148,14 @@ py .\ssh_relay.py daemon --host 198.51.100.42 --port 2222 --user donpedro --know
 ```powershell
 py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro --command-timeout 30
 ```
+
+Для скачивания файлов по умолчанию действует лимит 300 секунд и 64 МиБ на один файл. Лимиты задаются при запуске daemon:
+
+```powershell
+py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro --download-timeout 120 --download-max-size 16M
+```
+
+Размер можно задавать числом байт либо с суффиксом `K`, `M` или `G`.
 
 ### `daemon --enable-sudo`
 
@@ -199,6 +211,7 @@ py .\ssh_relay.py daemon --name rootbox --host 198.51.100.44 --user donpedro --e
 py .\ssh_relay.py exec --name prod "hostname"
 py .\ssh_relay.py exec -n test "hostname"
 py .\ssh_relay.py sudo-exec --name rootbox "whoami"
+py .\ssh_relay.py download --name prod "/var/log/app.log" ".\downloads\app.log" --create-dirs
 py .\ssh_relay.py status --name prod
 py .\ssh_relay.py status --all
 py .\ssh_relay.py list
@@ -245,6 +258,27 @@ py .\ssh_relay.py sudo-exec --name prod "systemctl restart nginx"
 
 Для регулярной эксплуатации безопаснее настроить ограниченный `NOPASSWD` в `sudoers` только для заранее разрешённых команд и использовать `sudo -n` в обычном `exec`. `sudo-exec` — временный ручной режим для доверенного локального пользователя и доверенного сервера.
 
+### `download`
+
+Скачивает один обычный файл с удалённого сервера в локальный файл через SFTP внутри уже открытой SSH-сессии:
+
+```powershell
+py .\ssh_relay.py download --name prod "/var/log/app.log" ".\downloads\app.log" --create-dirs
+py .\ssh_relay.py download --name prod "/tmp/result.json" ".\result.json" --overwrite
+```
+
+В `cmd.exe` пример выглядит так:
+
+```cmd
+py .\ssh_relay.py download --name prod "/var/log/app.log" ".\downloads\app.log" --create-dirs
+```
+
+Команда `download` не использует прямой `ssh`, `scp` или `sftp` из командной строки. Запрос отправляется локальному daemon по `127.0.0.1` с токеном сессии, а daemon скачивает файл через SFTP по уже открытому SSH-соединению. Содержимое файла не кодируется в JSON и не проходит через stdout команды `exec`: daemon пишет локальный файл напрямую во временный файл рядом с целевым путём, затем атомарно переименовывает его в целевой файл.
+
+По умолчанию существующий локальный файл не перезаписывается. Для перезаписи нужен явный параметр `--overwrite`. Если локальный каталог назначения ещё не существует, используйте `--create-dirs` либо создайте каталог вручную.
+
+Поддерживается только скачивание обычных файлов. Каталоги, рекурсивное копирование, специальные файлы и загрузка локальных файлов на сервер не поддерживаются. Файл должен быть доступен текущему SSH-пользователю через SFTP. Для скачивания файла, доступного только root, сначала подготовьте читаемую временную копию на сервере отдельной контролируемой командой, например через `sudo-exec`, затем скачайте эту копию и удалите её.
+
 ### `status`
 
 Проверяет не только наличие файла сессии, но и ответ работающего daemon с корректным токеном доступа:
@@ -261,7 +295,7 @@ py .\ssh_relay.py status --all
 Сессия: default
 Активна: donpedro@198.51.100.42:22
 Локальный порт: 54321
-Версия relay: 0.3.0
+Версия relay: 0.4.0
 Режим sudo: включён
 ```
 
@@ -279,8 +313,8 @@ py .\ssh_relay.py list
 
 ```text
 Имя      Состояние   SSH                         Sudo   Порт relay   Версия
-default  активна     donpedro@198.51.100.42:22   выкл.  54321        0.3.0
-prod     активна     donpedro@198.51.100.43:22   вкл.   54322        0.3.0
+default  активна     donpedro@198.51.100.42:22   выкл.  54321        0.4.0
+prod     активна     donpedro@198.51.100.43:22   вкл.   54322        0.4.0
 old      недоступна  donpedro@198.51.100.44:22   ?      54323        0.2.0
 ```
 
@@ -346,6 +380,10 @@ py .\ssh_relay.py exec --name prod "<remote-command>"
 cd C:\Tools\ssh-relay
 py .\ssh_relay.py sudo-exec --name prod "<remote-command>"
 
+Для скачивания одного файла с сервера используй:
+cd C:\Tools\ssh-relay
+py .\ssh_relay.py download --name prod "<remote-path>" "<local-path>"
+
 До выполнения рабочей задачи проверь relay:
 py .\ssh_relay.py status --name prod
 py .\ssh_relay.py exec --name prod "hostname && whoami && pwd"
@@ -353,7 +391,8 @@ py .\ssh_relay.py exec --name prod "hostname && whoami && pwd"
 Не запускай интерактивные команды.
 Не запускай команды, которые ожидают ввод пароля.
 Не запускай длительные команды и команды с большим выводом.
-Если потребуется передача файлов, сначала сообщи, что текущий relay этого не поддерживает.
+Не скачивай большие файлы, каталоги и специальные файлы.
+Если нужна загрузка файла на сервер или рекурсивная передача каталога, сначала сообщи, что текущий relay этого не поддерживает.
 ```
 
 ## Пример рабочей сессии
@@ -373,6 +412,7 @@ py .\ssh_relay.py status --name prod
 py .\ssh_relay.py exec --name prod "whoami"
 py .\ssh_relay.py sudo-exec --name prod "whoami"
 py .\ssh_relay.py exec --name prod "cd /opt/project && git status --short"
+py .\ssh_relay.py download --name prod "/tmp/report.txt" ".\downloads\report.txt" --create-dirs
 py .\ssh_relay.py stop --name prod
 ```
 
@@ -383,9 +423,10 @@ py .\ssh_relay.py stop --name prod
 * Приватный SSH-ключ не копируется в session-файл; его защита и права доступа остаются ответственностью пользователя.
 * Токен сессии не выводится в сообщения и хранится в пользовательском файле сессии.
 * В режиме sudo доступ к session-файлу следует рассматривать как доступ к открытому root-каналу через доверенный daemon.
-* Relay принимает локальные запросы только на `127.0.0.1` и проверяет токен для `exec`, `sudo-exec`, `status` и `stop`.
+* Relay принимает локальные запросы только на `127.0.0.1` и проверяет токен для `exec`, `sudo-exec`, `download`, `status` и `stop`.
 * SSH-сервер должен быть заранее доверен через проверенный `known_hosts`; автоматическое принятие неизвестного host key не используется.
 * Возможность выполнения произвольной удалённой shell-команды является назначением relay; расширять её без оценки угроз не следует.
+* `download` даёт владельцу токена возможность записать локальный файл с правами процесса daemon. Не передавайте session-файл и токен недоверенным процессам.
 * Для постоянной эксплуатации предпочтительнее ограниченный `NOPASSWD` в `sudoers` под конкретные команды, а не хранение sudo-пароля в памяти relay.
 
 ## Минимальная ручная проверка
@@ -398,6 +439,7 @@ py .\ssh_relay.py --version
 py .\ssh_relay.py --help
 py .\ssh_relay.py daemon --help
 py .\ssh_relay.py sudo-exec --help
+py .\ssh_relay.py download --help
 py .\ssh_relay.py status --help
 py .\ssh_relay.py stop --help
 py .\ssh_relay.py list --help
@@ -426,6 +468,9 @@ py .\ssh_relay.py exec --name prod "whoami"
 py .\ssh_relay.py sudo-exec --name prod "whoami"
 py .\ssh_relay.py sudo-exec --name prod "sh -c 'printf stdout-ok; printf stderr-ok >&2; exit 7'"
 $LASTEXITCODE
+py .\ssh_relay.py exec --name prod "printf download-ok > /tmp/ssh-relay-download-test.txt"
+py .\ssh_relay.py download --name prod "/tmp/ssh-relay-download-test.txt" ".\downloads\ssh-relay-download-test.txt" --create-dirs --overwrite
+Get-Content .\downloads\ssh-relay-download-test.txt
 py .\ssh_relay.py stop --name prod
 ```
 
@@ -436,6 +481,7 @@ py .\ssh_relay.py stop --name prod
 * stdout и stderr удалённой команды проходят раздельно;
 * код завершения удалённой команды возвращается вызывающему процессу;
 * `status` показывает включённый режим sudo;
+* `download` скачивает тестовый файл в локальный каталог `downloads`;
 * `stop` завершает только активный daemon через токен, а не по PID из файла.
 
 Проверка возврата кода в `cmd.exe` или командной строке Far Manager выполняется одной строкой, чтобы `%ERRORLEVEL%` не потерялся при запуске нового экземпляра командного процессора:
@@ -453,6 +499,7 @@ cmd /V:ON /C "py .\ssh_relay.py sudo-exec --name prod ^"sh -c 'exit 7'^" & echo 
 ## Возможные дальнейшие доработки
 
 * отдельная команда регистрации и показа fingerprint SSH-сервера с явным подтверждением пользователя;
-* передача файлов отдельным контролируемым механизмом;
+* загрузка файлов на сервер отдельным контролируемым механизмом;
+* рекурсивное скачивание каталогов с явными лимитами и фильтрами;
 * настройка ограниченного sudo-профиля с `sudo -n` для заранее разрешённых команд;
-* дополнительные автоматизированные тесты протокола daemon/exec/sudo-exec/status/stop.
+* дополнительные автоматизированные тесты протокола daemon/exec/sudo-exec/download/status/stop.
