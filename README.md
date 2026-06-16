@@ -1,17 +1,18 @@
 # ssh_relay
 
-`ssh_relay.py` — локальный SSH-relay для выполнения коротких неинтерактивных команд через одну заранее открытую SSH-сессию.
+`ssh_relay.py` — локальный SSH-relay для выполнения коротких неинтерактивных команд через одну или несколько заранее открытых именованных SSH-сессий.
 
-Основной сценарий: пользователь один раз вручную запускает `daemon`, проходя SSH-аутентификацию паролем либо заданным ключом/сертификатом, после чего CLI-агент, в частности OpenCode, выполняет удалённые команды через локальный вызов `exec` или явно включённый `sudo-exec`, не используя прямой SSH и не запрашивая SSH-учётные данные повторно.
+Основной сценарий: пользователь вручную запускает один или несколько `daemon`, проходя SSH-аутентификацию паролем либо заданным ключом/сертификатом, после чего CLI-агент, в частности OpenCode, выполняет удалённые команды через локальный вызов `exec` или явно включённый `sudo-exec`, не используя прямой SSH и не запрашивая SSH-учётные данные повторно.
 
-Текущая версия: `0.2.0`.
+Текущая версия: `0.3.0`.
 
 ## Возможности
 
-* открытие одной SSH-сессии по паролю, приватному SSH-ключу либо OpenSSH-сертификату и её использование до ручной остановки;
+* открытие одной или нескольких именованных SSH-сессий по паролю, приватному SSH-ключу либо OpenSSH-сертификату и их использование до ручной остановки;
 * выполнение одной удалённой команды за вызов `exec`;
 * явный режим `sudo` через `daemon --enable-sudo` и отдельную команду `sudo-exec`;
 * проверка активной сессии через аутентифицированный запрос `status`;
+* проверка всех известных сессий через `status --all` и просмотр списка через `list`;
 * корректная остановка daemon через аутентифицированный запрос `stop`;
 * прослушивание только локального адреса `127.0.0.1`;
 * обязательная проверка SSH host key через `known_hosts`;
@@ -70,7 +71,7 @@ py .\ssh_relay.py --help
 Ожидаемый вывод версии:
 
 ```text
-ssh_relay 0.2.0
+ssh_relay 0.3.0
 ```
 
 ## Подготовка `known_hosts`
@@ -90,11 +91,12 @@ ssh-keygen -lf "$env:USERPROFILE\.ssh\known_hosts"
 ## Команды
 
 ```text
-py .\ssh_relay.py daemon --host HOST --user USER [--port PORT] [-i PATH] [--ask-key-passphrase] [--known-hosts PATH] [--command-timeout SECONDS] [--enable-sudo]
-py .\ssh_relay.py exec "COMMAND"
-py .\ssh_relay.py sudo-exec "COMMAND"
-py .\ssh_relay.py status
-py .\ssh_relay.py stop
+py .\ssh_relay.py daemon [--name NAME] --host HOST --user USER [--port PORT] [-i PATH] [--ask-key-passphrase] [--known-hosts PATH] [--command-timeout SECONDS] [--enable-sudo]
+py .\ssh_relay.py exec [--name NAME] "COMMAND"
+py .\ssh_relay.py sudo-exec [--name NAME] "COMMAND"
+py .\ssh_relay.py status [--name NAME] [--all]
+py .\ssh_relay.py stop [--name NAME] [--all]
+py .\ssh_relay.py list
 ```
 
 ### `daemon`
@@ -148,7 +150,7 @@ py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro --command-timeout 
 Режим sudo включается только явно при запуске daemon:
 
 ```powershell
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro --enable-sudo
+py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro --enable-sudo
 ```
 
 То же самое при входе по ключу:
@@ -173,14 +175,49 @@ Relay слушает локальный адрес 127.0.0.1:54321
 
 Окно терминала с daemon должно оставаться открытым до конца работы.
 
+### Именованные сессии
+
+По умолчанию используется сессия `default`, поэтому команды без `--name` тоже работают:
+
+```powershell
+py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro
+py .\ssh_relay.py exec "hostname"
+py .\ssh_relay.py stop
+```
+
+Для нескольких одновременных daemon задавайте имя явно. Имя используется только для выбора локального session-файла; каждый daemon по-прежнему слушает свой локальный порт на `127.0.0.1`:
+
+```powershell
+py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro
+py .\ssh_relay.py daemon --name test --host 198.51.100.43 --user donpedro
+py .\ssh_relay.py daemon --name rootbox --host 198.51.100.44 --user donpedro --enable-sudo
+```
+
+Команды к конкретной сессии:
+
+```powershell
+py .\ssh_relay.py exec --name prod "hostname"
+py .\ssh_relay.py exec -n test "hostname"
+py .\ssh_relay.py sudo-exec --name rootbox "whoami"
+py .\ssh_relay.py status --name prod
+py .\ssh_relay.py status --all
+py .\ssh_relay.py list
+py .\ssh_relay.py stop --name prod
+py .\ssh_relay.py stop --all
+```
+
+Допустимое имя сессии: от 1 до 64 символов, только латинские буквы, цифры, точка, дефис и подчёркивание. Символы `/`, `\`, `:`, пробелы и `..` запрещены, чтобы имя нельзя было использовать для выхода за пределы каталога session-файлов.
+
+Если session-файл с таким именем уже существует, `daemon --name NAME` сначала проверяет daemon через токен. Если daemon активен, запуск отклоняется. Если daemon недоступен, устаревший session-файл удаляется и запуск продолжается.
+
 ### `exec`
 
 Выполняет одну команду через активную SSH-сессию:
 
 ```powershell
 py .\ssh_relay.py exec "hostname"
-py .\ssh_relay.py exec "whoami"
-py .\ssh_relay.py exec "cd /opt/project && git status --short"
+py .\ssh_relay.py exec --name prod "whoami"
+py .\ssh_relay.py exec -n prod "cd /opt/project && git status --short"
 ```
 
 Код завершения удалённой команды возвращается вызывающему процессу. `stdout` удалённой команды выводится в `stdout`, `stderr` — в `stderr`; наличие текста в `stderr` само по себе не является ошибкой relay.
@@ -193,7 +230,7 @@ py .\ssh_relay.py exec "cd /opt/project && git status --short"
 
 ```powershell
 py .\ssh_relay.py sudo-exec "whoami"
-py .\ssh_relay.py sudo-exec "systemctl restart nginx"
+py .\ssh_relay.py sudo-exec --name prod "systemctl restart nginx"
 ```
 
 `sudo-exec` доступен только если текущий daemon был запущен с параметром `--enable-sudo`. Если режим sudo не включён, команда вернёт ошибку:
@@ -214,18 +251,40 @@ py .\ssh_relay.py sudo-exec "systemctl restart nginx"
 
 ```powershell
 py .\ssh_relay.py status
+py .\ssh_relay.py status --name prod
+py .\ssh_relay.py status --all
+```
+
+Пример вывода одной сессии:
+
+```text
+Сессия: default
+Активна: donpedro@198.51.100.42:22
+Локальный порт: 54321
+Версия relay: 0.3.0
+Режим sudo: включён
+```
+
+Если session-файл устарел и daemon недоступен, файл удаляется, а команда завершается с ошибкой.
+
+### `list`
+
+Показывает все известные session-файлы и проверяет доступность соответствующих daemon:
+
+```powershell
+py .\ssh_relay.py list
 ```
 
 Пример вывода:
 
 ```text
-Активна: donpedro@198.51.100.42:22
-Локальный порт: 54321
-Версия relay: 0.2.0
-Режим sudo: включён
+Имя      Состояние   SSH                         Sudo   Порт relay   Версия
+default  активна     donpedro@198.51.100.42:22   выкл.  54321        0.3.0
+prod     активна     donpedro@198.51.100.43:22   вкл.   54322        0.3.0
+old      недоступна  donpedro@198.51.100.44:22   ?      54323        0.2.0
 ```
 
-Если session-файл устарел и daemon недоступен, файл удаляется, а команда завершается с ошибкой.
+`list` ничего не удаляет. Устаревшие session-файлы удаляются при обращении к конкретной сессии через `status --name`, `exec`, `sudo-exec` или `stop`.
 
 ### `stop`
 
@@ -233,24 +292,28 @@ py .\ssh_relay.py status
 
 ```powershell
 py .\ssh_relay.py stop
+py .\ssh_relay.py stop --name prod
+py .\ssh_relay.py stop --all
 ```
 
 `stop` не завершает процесс по PID из файла сессии, поэтому устаревший файл не может привести к принудительному завершению постороннего процесса. Daemon также можно остановить клавишами `Ctrl+C` в его терминале.
 
-## Файл сессии
+## Файлы сессий
 
 Файл сессии содержит локальный токен доступа к открытой SSH-сессии. SSH-пароль, passphrase ключа, приватный ключ и sudo-пароль в него не записываются.
 
-В режиме sudo файл сессии становится особенно чувствительным: токен даёт доступ к открытому локальному daemon, который способен выполнять root-команды на удалённом сервере. Такой файл нельзя копировать, публиковать, передавать агентам без необходимости или помещать в Git.
+В режиме sudo файл сессии становится особенно чувствительным: токен даёт доступ к открытому локальному daemon, который способен выполнять root-команды на удалённом сервере. При множественных сессиях чувствительным считается весь каталог `sessions`. Такой файл нельзя копировать, публиковать, передавать агентам без необходимости или помещать в Git.
 
 Расположение файла больше не зависит от рабочего каталога:
 
-* Windows: `%LOCALAPPDATA%\ssh_relay\.ssh_relay_session.json`;
-* Linux: `${XDG_STATE_HOME:-~/.local/state}/ssh_relay/.ssh_relay_session.json`.
+* Windows: `%LOCALAPPDATA%\ssh_relay\sessions\<name>.json`;
+* Linux: `${XDG_STATE_HOME:-~/.local/state}/ssh_relay/sessions/<name>.json`.
 
-На Linux каталог создаётся с правами `0700`, файл — с правами `0600`. На Windows файл размещается в пользовательском каталоге `%LOCALAPPDATA%`, доступ к которому должен контролироваться правами текущей учётной записи.
+Старый одиночный файл `%LOCALAPPDATA%\ssh_relay\.ssh_relay_session.json` или `${XDG_STATE_HOME:-~/.local/state}/ssh_relay/.ssh_relay_session.json` читается только как legacy-сессия `default`, если нового `sessions/default.json` ещё нет. Новые daemon всегда записывают session-файлы в каталог `sessions`.
 
-Файл `.ssh_relay_session.json` от ранней реализации, если он остался в каталоге проекта, больше не используется и должен быть удалён.
+На Linux каталог состояния и каталог `sessions` создаются с правами `0700`, файлы сессий — с правами `0600`. На Windows файл размещается в пользовательском каталоге `%LOCALAPPDATA%`, доступ к которому должен контролироваться правами текущей учётной записи.
+
+Файл `.ssh_relay_session.json` от ранней реализации в каталоге проекта больше не используется и должен быть удалён.
 
 ## Использование с OpenCode
 
@@ -271,21 +334,21 @@ py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i "$env:USERPROFI
 После запуска для OpenCode можно использовать следующую инструкцию:
 
 ```text
-Удалённый сервер доступен через уже запущенный локальный SSH relay.
+Удалённый сервер prod доступен через уже запущенный локальный SSH relay.
 
 Не используй прямые вызовы ssh и не запрашивай пароль.
 
 Для обычных команд используй:
 cd C:\Tools\ssh-relay
-py .\ssh_relay.py exec "<remote-command>"
+py .\ssh_relay.py exec --name prod "<remote-command>"
 
 Для команд, которым нужны права root, используй:
 cd C:\Tools\ssh-relay
-py .\ssh_relay.py sudo-exec "<remote-command>"
+py .\ssh_relay.py sudo-exec --name prod "<remote-command>"
 
 До выполнения рабочей задачи проверь relay:
-py .\ssh_relay.py status
-py .\ssh_relay.py exec "hostname && whoami && pwd"
+py .\ssh_relay.py status --name prod
+py .\ssh_relay.py exec --name prod "hostname && whoami && pwd"
 
 Не запускай интерактивные команды.
 Не запускай команды, которые ожидают ввод пароля.
@@ -299,18 +362,18 @@ py .\ssh_relay.py exec "hostname && whoami && pwd"
 
 ```powershell
 cd C:\Tools\ssh-relay
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro --enable-sudo
+py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro --enable-sudo
 ```
 
 Второй терминал:
 
 ```powershell
 cd C:\Tools\ssh-relay
-py .\ssh_relay.py status
-py .\ssh_relay.py exec "whoami"
-py .\ssh_relay.py sudo-exec "whoami"
-py .\ssh_relay.py exec "cd /opt/project && git status --short"
-py .\ssh_relay.py stop
+py .\ssh_relay.py status --name prod
+py .\ssh_relay.py exec --name prod "whoami"
+py .\ssh_relay.py sudo-exec --name prod "whoami"
+py .\ssh_relay.py exec --name prod "cd /opt/project && git status --short"
+py .\ssh_relay.py stop --name prod
 ```
 
 ## Замечания по безопасности
@@ -335,6 +398,9 @@ py .\ssh_relay.py --version
 py .\ssh_relay.py --help
 py .\ssh_relay.py daemon --help
 py .\ssh_relay.py sudo-exec --help
+py .\ssh_relay.py status --help
+py .\ssh_relay.py stop --help
+py .\ssh_relay.py list --help
 ```
 
 С тестовым сервером после проверки host key запустите новый daemon в выбранном режиме аутентификации. Перед проверкой изменённого `daemon` обязательно остановите старую сессию, если она работала.
@@ -342,7 +408,7 @@ py .\ssh_relay.py sudo-exec --help
 Вход по паролю с sudo-режимом:
 
 ```powershell
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro --enable-sudo
+py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro --enable-sudo
 ```
 
 Вход по ключу с sudo-режимом в другом запуске daemon:
@@ -354,12 +420,13 @@ py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i "$env:USERPROFI
 Проверка в PowerShell после запуска daemon:
 
 ```powershell
-py .\ssh_relay.py status
-py .\ssh_relay.py exec "whoami"
-py .\ssh_relay.py sudo-exec "whoami"
-py .\ssh_relay.py sudo-exec "sh -c 'printf stdout-ok; printf stderr-ok >&2; exit 7'"
+py .\ssh_relay.py status --name prod
+py .\ssh_relay.py list
+py .\ssh_relay.py exec --name prod "whoami"
+py .\ssh_relay.py sudo-exec --name prod "whoami"
+py .\ssh_relay.py sudo-exec --name prod "sh -c 'printf stdout-ok; printf stderr-ok >&2; exit 7'"
 $LASTEXITCODE
-py .\ssh_relay.py stop
+py .\ssh_relay.py stop --name prod
 ```
 
 Ожидаемо:
@@ -374,7 +441,7 @@ py .\ssh_relay.py stop
 Проверка возврата кода в `cmd.exe` или командной строке Far Manager выполняется одной строкой, чтобы `%ERRORLEVEL%` не потерялся при запуске нового экземпляра командного процессора:
 
 ```cmd
-cmd /V:ON /C "py .\ssh_relay.py sudo-exec ^"sh -c 'exit 7'^" & echo Exit code: !ERRORLEVEL!"
+cmd /V:ON /C "py .\ssh_relay.py sudo-exec --name prod ^"sh -c 'exit 7'^" & echo Exit code: !ERRORLEVEL!"
 ```
 
 В Far Manager нельзя полагаться на отдельную следующую команду `echo %ERRORLEVEL%`: она может выполняться в новом экземпляре командного процессора и показывать `0`.
@@ -386,7 +453,6 @@ cmd /V:ON /C "py .\ssh_relay.py sudo-exec ^"sh -c 'exit 7'^" & echo Exit code: !
 ## Возможные дальнейшие доработки
 
 * отдельная команда регистрации и показа fingerprint SSH-сервера с явным подтверждением пользователя;
-* поддержка нескольких именованных relay-сессий;
 * передача файлов отдельным контролируемым механизмом;
 * настройка ограниченного sudo-профиля с `sudo -n` для заранее разрешённых команд;
 * дополнительные автоматизированные тесты протокола daemon/exec/sudo-exec/status/stop.

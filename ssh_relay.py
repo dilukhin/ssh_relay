@@ -10,13 +10,14 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
   py ssh_relay.py stop
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 import argparse
 import atexit
 import getpass
 import json
 import os
+import re
 import shlex
 import socket
 import sys
@@ -93,39 +94,82 @@ def parse_positive_seconds(value: str) -> int:
     return seconds
 
 
-def session_file_path() -> Path:
-    """Возвращает фиксированное пользовательское расположение файла сессии."""
+SESSION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+DEFAULT_SESSION_NAME = "default"
+
+
+def state_directory() -> Path:
+    """Возвращает фиксированный пользовательский каталог состояния relay."""
     if os.name == "nt":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     else:
         base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-    return base / "ssh_relay" / ".ssh_relay_session.json"
+    return base / "ssh_relay"
 
 
-SESSION_FILE = session_file_path()
+def legacy_session_file_path() -> Path:
+    """Возвращает путь старого одиночного session-файла для совместимости."""
+    return state_directory() / ".ssh_relay_session.json"
+
+
+def sessions_directory() -> Path:
+    """Возвращает каталог именованных session-файлов."""
+    return state_directory() / "sessions"
+
+
+def validate_session_name(name: str) -> str:
+    """Проверяет имя сессии перед использованием в имени файла."""
+    if not SESSION_NAME_PATTERN.fullmatch(name):
+        raise RelayError(
+            "Недопустимое имя сессии. Используйте 1-64 символа: латинские буквы, цифры, точка, дефис или подчёркивание."
+        )
+    if name in {".", ".."}:
+        raise RelayError("Недопустимое имя сессии.")
+    return name
+
+
+def session_file_path(name: str) -> Path:
+    """Возвращает путь нового именованного session-файла."""
+    name = validate_session_name(name)
+    return sessions_directory() / f"{name}.json"
+
+
+def existing_session_file_path(name: str) -> Path:
+    """Возвращает существующий session-файл с учётом legacy default-сессии."""
+    current = session_file_path(name)
+    if current.exists():
+        return current
+    legacy = legacy_session_file_path()
+    if name == DEFAULT_SESSION_NAME and legacy.exists():
+        return legacy
+    return current
 
 
 def prepare_session_directory() -> None:
-    SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    state_directory().mkdir(parents=True, exist_ok=True)
+    sessions_directory().mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
-        os.chmod(SESSION_FILE.parent, 0o700)
+        os.chmod(state_directory(), 0o700)
+        os.chmod(sessions_directory(), 0o700)
 
 
-def remove_session_file(expected_token: str | None = None) -> None:
-    """Удаляет файл только текущей сессии, если задан ожидаемый токен."""
+def remove_session_file(name: str, expected_token: str | None = None) -> None:
+    """Удаляет файл только указанной сессии, если задан ожидаемый токен."""
     try:
-        if expected_token is not None and SESSION_FILE.exists():
-            current = read_session()
+        path = existing_session_file_path(name)
+        if expected_token is not None and path.exists():
+            current = read_session(name)
             if current["auth_token"] != expected_token:
                 return
-        SESSION_FILE.unlink(missing_ok=True)
+        path.unlink(missing_ok=True)
     except (OSError, RelayError):
         pass
 
 
-def write_session(session: dict[str, Any]) -> None:
+def write_session(name: str, session: dict[str, Any]) -> Path:
     prepare_session_directory()
-    temporary = SESSION_FILE.with_suffix(".tmp")
+    path = session_file_path(name)
+    temporary = path.with_suffix(".tmp")
     data = json.dumps(session, ensure_ascii=False, indent=2)
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
     fd = os.open(temporary, flags, 0o600)
@@ -134,31 +178,51 @@ def write_session(session: dict[str, Any]) -> None:
             output.write(data)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, SESSION_FILE)
+        os.replace(temporary, path)
         if os.name != "nt":
-            os.chmod(SESSION_FILE, 0o600)
+            os.chmod(path, 0o600)
+        if name == DEFAULT_SESSION_NAME:
+            legacy_session_file_path().unlink(missing_ok=True)
     finally:
         try:
             temporary.unlink(missing_ok=True)
         except OSError:
             pass
+    return path
 
 
-def read_session() -> dict[str, Any]:
-    if not SESSION_FILE.exists():
-        raise RelayError("Активная сессия не найдена. Сначала запустите команду daemon.")
+def read_session(name: str) -> dict[str, Any]:
+    path = existing_session_file_path(name)
+    if not path.exists():
+        raise RelayError(f"Сессия {name} не найдена. Сначала запустите команду daemon --name {name}.")
     try:
-        with SESSION_FILE.open("r", encoding="utf-8") as source:
+        with path.open("r", encoding="utf-8") as source:
             session = json.load(source)
     except (OSError, json.JSONDecodeError) as exc:
-        raise RelayError(f"Файл сессии повреждён или недоступен: {SESSION_FILE}") from exc
+        raise RelayError(f"Файл сессии повреждён или недоступен: {path}") from exc
 
     if not isinstance(session, dict):
-        raise RelayError(f"Файл сессии имеет неверный формат: {SESSION_FILE}")
+        raise RelayError(f"Файл сессии имеет неверный формат: {path}")
     for field, expected_type in REQUIRED_SESSION_FIELDS.items():
         if not isinstance(session.get(field), expected_type):
             raise RelayError(f"Файл сессии имеет неверный формат: отсутствует поле {field}.")
+    session.setdefault("name", name)
+    session["_session_file_path"] = str(path)
     return session
+
+
+def iter_session_names() -> list[str]:
+    """Возвращает имена всех известных session-файлов."""
+    names: set[str] = set()
+    directory = sessions_directory()
+    if directory.exists():
+        for item in directory.glob("*.json"):
+            candidate = item.stem
+            if SESSION_NAME_PATTERN.fullmatch(candidate):
+                names.add(candidate)
+    if legacy_session_file_path().exists():
+        names.add(DEFAULT_SESSION_NAME)
+    return sorted(names)
 
 
 def read_message(sock: socket.socket) -> dict[str, Any]:
@@ -195,7 +259,7 @@ def request_daemon(session: dict[str, Any], action: str, **payload: Any) -> dict
             sock.shutdown(socket.SHUT_WR)
             return read_message(sock)
     except (ConnectionError, TimeoutError, socket.timeout, OSError) as exc:
-        raise RelayError("Daemon недоступен. Файл устаревшей сессии будет удалён.") from exc
+        raise RelayError("Daemon недоступен.") from exc
 
 
 def load_paramiko():
@@ -291,30 +355,45 @@ def execute_sudo_command(
     )
 
 
-def check_existing_session() -> bool:
-    if not SESSION_FILE.exists():
+def session_display_name(session: dict[str, Any]) -> str:
+    return str(session.get("name") or DEFAULT_SESSION_NAME)
+
+
+def format_session_target(session: dict[str, Any]) -> str:
+    return f"{session['user']}@{session['host']}:{session['port']}"
+
+
+def check_existing_session(name: str) -> bool:
+    path = existing_session_file_path(name)
+    if not path.exists():
         return False
     try:
-        session = read_session()
+        session = read_session(name)
         result = request_daemon(session, "status")
         if result.get("ok"):
             print(
-                f"Уже существует активная сессия: {session['user']}@{session['host']}:{session['port']}.",
+                f"Сессия {name} уже активна: {format_session_target(session)}.",
                 file=sys.stderr,
             )
-            print("Сначала завершите её командой stop.", file=sys.stderr)
+            print(f"Сначала завершите её командой: stop --name {name}", file=sys.stderr)
             return True
     except RelayError:
-        remove_session_file()
+        remove_session_file(name)
     return False
 
 
 def daemon(args: argparse.Namespace) -> int:
+    try:
+        session_name = validate_session_name(args.name)
+    except RelayError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     if args.ask_key_passphrase and not args.identity_file:
         print("Параметр --ask-key-passphrase допустим только вместе с --identity-file.", file=sys.stderr)
         return 2
 
-    if check_existing_session():
+    if check_existing_session(session_name):
         return 1
 
     identity_file: str | None = None
@@ -403,6 +482,8 @@ def daemon(args: argparse.Namespace) -> int:
     auth_token = str(uuid.uuid4())
     daemon_port = server.getsockname()[1]
     session = {
+        "schema_version": 2,
+        "name": session_name,
         "version": __version__,
         "host": args.host,
         "port": args.port,
@@ -413,7 +494,7 @@ def daemon(args: argparse.Namespace) -> int:
         "sudo_enabled": bool(args.enable_sudo),
     }
     try:
-        write_session(session)
+        session_path = write_session(session_name, session)
     except OSError as exc:
         server.close()
         client.close()
@@ -430,7 +511,7 @@ def daemon(args: argparse.Namespace) -> int:
             return
         cleanup_done = True
         sudo_password = None
-        remove_session_file(auth_token)
+        remove_session_file(session_name, auth_token)
         client.close()
 
     atexit.register(cleanup)
@@ -458,6 +539,7 @@ def daemon(args: argparse.Namespace) -> int:
                         "status": "active",
                         "version": __version__,
                         "sudo_enabled": bool(args.enable_sudo),
+                        "name": session_name,
                     })
                     return
                 if action == "stop":
@@ -499,10 +581,11 @@ def daemon(args: argparse.Namespace) -> int:
                 reply({"ok": False, "protocol_error": f"Внутренняя ошибка daemon: {exc}"})
 
     print(f"SSH-соединение установлено: {args.user}@{args.host}:{args.port}")
+    print(f"Имя сессии: {session_name}")
     print(f"Relay слушает локальный адрес 127.0.0.1:{daemon_port}")
-    print(f"Файл сессии: {SESSION_FILE}")
+    print(f"Файл сессии: {session_path}")
     print(f"Режим sudo: {'включён' if args.enable_sudo else 'выключен'}")
-    print("Для завершения нажмите Ctrl+C или выполните команду stop.")
+    print(f"Для завершения нажмите Ctrl+C или выполните команду: stop --name {session_name}")
 
     try:
         while not stop_event.is_set():
@@ -519,15 +602,7 @@ def daemon(args: argparse.Namespace) -> int:
     return 0
 
 
-def exec_cmd(args: argparse.Namespace) -> int:
-    try:
-        session = read_session()
-        result = request_daemon(session, "exec", command=args.remote_command)
-    except RelayError as exc:
-        remove_session_file()
-        print(str(exc), file=sys.stderr)
-        return 1
-
+def print_command_result(result: dict[str, Any]) -> int:
     if not result.get("ok"):
         print(f"Ошибка relay: {result.get('protocol_error', 'неизвестная ошибка')}", file=sys.stderr)
         return 1
@@ -536,62 +611,163 @@ def exec_cmd(args: argparse.Namespace) -> int:
     if result.get("stderr"):
         sys.stderr.write(result["stderr"])
     return int(result.get("exit_code", 1))
+
+
+def exec_cmd(args: argparse.Namespace) -> int:
+    try:
+        session_name = validate_session_name(args.name)
+        session = read_session(session_name)
+        result = request_daemon(session, "exec", command=args.remote_command)
+    except RelayError as exc:
+        remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    return print_command_result(result)
 
 
 def sudo_exec_cmd(args: argparse.Namespace) -> int:
     try:
-        session = read_session()
+        session_name = validate_session_name(args.name)
+        session = read_session(session_name)
         result = request_daemon(session, "sudo_exec", command=args.remote_command)
     except RelayError as exc:
-        remove_session_file()
+        remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
         print(str(exc), file=sys.stderr)
         return 1
 
-    if not result.get("ok"):
-        print(f"Ошибка relay: {result.get('protocol_error', 'неизвестная ошибка')}", file=sys.stderr)
-        return 1
-    if result.get("stdout"):
-        sys.stdout.write(result["stdout"])
-    if result.get("stderr"):
-        sys.stderr.write(result["stderr"])
-    return int(result.get("exit_code", 1))
+    return print_command_result(result)
 
 
-def stop(_: argparse.Namespace) -> int:
+def stop_one_session(name: str) -> int:
     try:
-        session = read_session()
+        session = read_session(name)
         result = request_daemon(session, "stop")
     except RelayError as exc:
-        remove_session_file()
-        print(str(exc), file=sys.stderr)
-        print("Файл неактивной сессии удалён; завершение daemon не подтверждено.", file=sys.stderr)
+        remove_session_file(name)
+        print(f"{name}: {exc}", file=sys.stderr)
+        print(f"{name}: файл неактивной сессии удалён; завершение daemon не подтверждено.", file=sys.stderr)
         return 1
 
     if not result.get("ok"):
-        print(f"Не удалось остановить relay: {result.get('protocol_error', 'неизвестная ошибка')}", file=sys.stderr)
+        print(f"{name}: не удалось остановить relay: {result.get('protocol_error', 'неизвестная ошибка')}", file=sys.stderr)
         return 1
-    print("Команда завершения отправлена активному daemon.")
+    print(f"{name}: команда завершения отправлена активному daemon.")
     return 0
 
 
-def status(_: argparse.Namespace) -> int:
+def stop(args: argparse.Namespace) -> int:
+    if args.all:
+        names = iter_session_names()
+        if not names:
+            print("Известные сессии не найдены.")
+            return 0
+        exit_code = 0
+        for name in names:
+            if stop_one_session(name) != 0:
+                exit_code = 1
+        return exit_code
     try:
-        session = read_session()
-        result = request_daemon(session, "status")
+        name = validate_session_name(args.name)
     except RelayError as exc:
-        if SESSION_FILE.exists():
-            remove_session_file()
         print(str(exc), file=sys.stderr)
-        return 1
+        return 2
+    return stop_one_session(name)
 
-    if not result.get("ok") or result.get("status") != "active":
-        print("Daemon не подтвердил активную сессию.", file=sys.stderr)
-        return 1
-    print(f"Активна: {session['user']}@{session['host']}:{session['port']}")
+
+def print_status(name: str, session: dict[str, Any], result: dict[str, Any]) -> None:
+    print(f"Сессия: {name}")
+    print(f"Активна: {format_session_target(session)}")
     print(f"Локальный порт: {session['daemon_port']}")
     print(f"Версия relay: {result.get('version', session['version'])}")
     print(f"Режим sudo: {'включён' if result.get('sudo_enabled') else 'выключен'}")
+    print(f"Файл сессии: {session.get('_session_file_path', existing_session_file_path(name))}")
+
+
+def status_one_session(name: str, *, cleanup_stale: bool) -> int:
+    try:
+        session = read_session(name)
+        result = request_daemon(session, "status")
+    except RelayError as exc:
+        if cleanup_stale:
+            remove_session_file(name)
+        print(f"{name}: {exc}", file=sys.stderr)
+        return 1
+
+    if not result.get("ok") or result.get("status") != "active":
+        print(f"{name}: daemon не подтвердил активную сессию.", file=sys.stderr)
+        return 1
+    print_status(name, session, result)
     return 0
+
+
+def status(args: argparse.Namespace) -> int:
+    if args.all:
+        names = iter_session_names()
+        if not names:
+            print("Известные сессии не найдены.")
+            return 0
+        exit_code = 0
+        first = True
+        for name in names:
+            if not first:
+                print()
+            first = False
+            if status_one_session(name, cleanup_stale=False) != 0:
+                exit_code = 1
+        return exit_code
+    try:
+        name = validate_session_name(args.name)
+    except RelayError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    return status_one_session(name, cleanup_stale=True)
+
+
+def list_sessions(_: argparse.Namespace) -> int:
+    names = iter_session_names()
+    if not names:
+        print("Известные сессии не найдены.")
+        return 0
+
+    print("Имя\tСостояние\tSSH\tSudo\tПорт relay\tВерсия")
+    exit_code = 0
+    for name in names:
+        try:
+            session = read_session(name)
+            result = request_daemon(session, "status")
+            if result.get("ok") and result.get("status") == "active":
+                state = "активна"
+                sudo = "вкл." if result.get("sudo_enabled") else "выкл."
+                version = str(result.get("version", session["version"]))
+            else:
+                state = "ошибка"
+                sudo = "?"
+                version = str(session["version"])
+                exit_code = 1
+            print(f"{name}\t{state}\t{format_session_target(session)}\t{sudo}\t{session['daemon_port']}\t{version}")
+        except RelayError:
+            exit_code = 1
+            try:
+                session = read_session(name)
+                target = format_session_target(session)
+                port = session.get("daemon_port", "?")
+                version = session.get("version", "?")
+            except RelayError:
+                target = "?"
+                port = "?"
+                version = "?"
+            print(f"{name}\tнедоступна\t{target}\t?\t{port}\t{version}")
+    return exit_code
+
+
+def add_session_name_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--name",
+        "-n",
+        default=DEFAULT_SESSION_NAME,
+        help=f"Имя relay-сессии, по умолчанию {DEFAULT_SESSION_NAME}.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -604,6 +780,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser = subparsers.add_parser(
         "daemon", help="Открыть SSH-сессию и запустить локальный relay."
     )
+    add_session_name_argument(daemon_parser)
     daemon_parser.add_argument("--host", required=True, help="Имя или адрес SSH-сервера.")
     daemon_parser.add_argument("--port", type=parse_port, default=22, help="Порт SSH-сервера, по умолчанию 22.")
     daemon_parser.add_argument("--user", "-u", default=getpass.getuser(), help="Имя SSH-пользователя.")
@@ -638,6 +815,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.set_defaults(handler=daemon)
 
     exec_parser = subparsers.add_parser("exec", help="Выполнить одну команду через активный relay.")
+    add_session_name_argument(exec_parser)
     exec_parser.add_argument("remote_command", help="Неинтерактивная команда для удалённого сервера.")
     exec_parser.set_defaults(handler=exec_cmd)
 
@@ -645,14 +823,22 @@ def build_parser() -> argparse.ArgumentParser:
         "sudo-exec",
         help="Выполнить одну неинтерактивную команду через sudo в активном relay.",
     )
+    add_session_name_argument(sudo_exec_parser)
     sudo_exec_parser.add_argument("remote_command", help="Неинтерактивная команда для удалённого сервера без префикса sudo.")
     sudo_exec_parser.set_defaults(handler=sudo_exec_cmd)
 
     stop_parser = subparsers.add_parser("stop", help="Корректно остановить активный daemon.")
+    add_session_name_argument(stop_parser)
+    stop_parser.add_argument("--all", action="store_true", help="Остановить все известные relay-сессии через их токены.")
     stop_parser.set_defaults(handler=stop)
 
     status_parser = subparsers.add_parser("status", help="Проверить активную сессию daemon.")
+    add_session_name_argument(status_parser)
+    status_parser.add_argument("--all", action="store_true", help="Проверить все известные relay-сессии.")
     status_parser.set_defaults(handler=status)
+
+    list_parser = subparsers.add_parser("list", help="Показать все известные relay-сессии.")
+    list_parser.set_defaults(handler=list_sessions)
     return parser
 
 
