@@ -95,8 +95,8 @@ ssh-keygen -lf "$env:USERPROFILE\.ssh\known_hosts"
 
 ```text
 py .\ssh_relay.py daemon [--name NAME] --host HOST --user USER [--port PORT] [-i PATH] [--ask-key-passphrase] [--known-hosts PATH] [--command-timeout SECONDS] [--download-timeout SECONDS] [--download-max-size SIZE] [--upload-timeout SECONDS] [--upload-max-size SIZE] [--enable-sudo]
-py .\ssh_relay.py exec [--name NAME] "COMMAND"
-py .\ssh_relay.py sudo-exec [--name NAME] "COMMAND"
+py .\ssh_relay.py exec [--name NAME] [--risky] [--receipt-path REMOTE_JSONL] "COMMAND"
+py .\ssh_relay.py sudo-exec [--name NAME] [--risky] [--receipt-path REMOTE_JSONL] "COMMAND"
 py .\ssh_relay.py download [--name NAME] [--overwrite] [--create-dirs] REMOTE_PATH LOCAL_PATH
 py .\ssh_relay.py upload [--name NAME] [--overwrite] [--create-dirs] LOCAL_PATH REMOTE_PATH
 py .\ssh_relay.py status [--name NAME] [--all]
@@ -239,6 +239,20 @@ py .\ssh_relay.py exec -n prod "cd /opt/project && git status --short"
 
 Не запускайте через `exec` редакторы, оболочки, `top`, запросы пароля, длительные процессы либо чтение больших логов целиком.
 
+Если команда меняет состояние удалённого хоста, добавьте `--risky`. После успешного завершения команды с кодом `0` relay запишет JSONL receipt на сам удалённый хост:
+
+```powershell
+py .\ssh_relay.py exec --name prod --risky "mkdir -p ~/work/app"
+```
+
+По умолчанию receipt пишется в `~/.local/state/agent-safe/changes.jsonl`. Путь можно переопределить:
+
+```powershell
+py .\ssh_relay.py exec --name prod --risky --receipt-path "/tmp/agent-safe-changes.jsonl" "touch /tmp/example"
+```
+
+Если основная команда завершилась с ненулевым кодом, receipt не записывается. Если основная команда успешна, но receipt записать не удалось, relay возвращает ошибку, чтобы вызывающий агент не пропустил отсутствие аудита.
+
 ### `sudo-exec`
 
 Выполняет одну команду через `sudo` в активном relay:
@@ -246,6 +260,7 @@ py .\ssh_relay.py exec -n prod "cd /opt/project && git status --short"
 ```powershell
 py .\ssh_relay.py sudo-exec "whoami"
 py .\ssh_relay.py sudo-exec --name prod "systemctl restart nginx"
+py .\ssh_relay.py sudo-exec --name prod --risky --receipt-path "/var/lib/agent-safe/changes.jsonl" "systemctl restart nginx"
 ```
 
 `sudo-exec` доступен только если текущий daemon был запущен с параметром `--enable-sudo`. Если режим sudo не включён, команда вернёт ошибку:
@@ -257,6 +272,8 @@ py .\ssh_relay.py sudo-exec --name prod "systemctl restart nginx"
 Команду передавайте без внешнего префикса `sudo`: relay сам формирует удалённый запуск вида `sudo -S -p '' -- sh -c ...` и экранирует пользовательскую shell-строку через `shlex.quote()`.
 
 `sudo-exec` предназначен только для коротких неинтерактивных команд. Не используйте его для редакторов, интерактивных shell, `top`, команд с повторными запросами ввода, длительных процессов и команд с большим выводом.
+
+С `--risky` receipt-команда выполняется через тот же sudo-механизм, поэтому для системного журнала удобно использовать путь вроде `/var/lib/agent-safe/changes.jsonl`.
 
 Для регулярной эксплуатации безопаснее настроить ограниченный `NOPASSWD` в `sudoers` только для заранее разрешённых команд и использовать `sudo -n` в обычном `exec`. `sudo-exec` — временный ручной режим для доверенного локального пользователя и доверенного сервера.
 
@@ -378,9 +395,17 @@ py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i "$env:USERPROFI
 cd C:\Tools\ssh-relay
 py .\ssh_relay.py exec --name prod "<remote-command>"
 
+Для команд, которые меняют состояние хоста, используй:
+cd C:\Tools\ssh-relay
+py .\ssh_relay.py exec --name prod --risky "<remote-command>"
+
 Для команд, которым нужны права root, используй:
 cd C:\Tools\ssh-relay
 py .\ssh_relay.py sudo-exec --name prod "<remote-command>"
+
+Для root-команд, которые меняют состояние хоста, используй:
+cd C:\Tools\ssh-relay
+py .\ssh_relay.py sudo-exec --name prod --risky --receipt-path "/var/lib/agent-safe/changes.jsonl" "<remote-command>"
 
 Для скачивания одного файла с сервера используй:
 cd C:\Tools\ssh-relay
@@ -441,6 +466,7 @@ py .\ssh_relay.py --version
 py .\ssh_relay.py --help
 py .\ssh_relay.py daemon --help
 py .\ssh_relay.py sudo-exec --help
+py .\ssh_relay.py exec --help
 py .\ssh_relay.py download --help
 py .\ssh_relay.py upload --help
 py .\ssh_relay.py status --help
@@ -471,6 +497,8 @@ py .\ssh_relay.py exec --name prod "whoami"
 py .\ssh_relay.py sudo-exec --name prod "whoami"
 py .\ssh_relay.py sudo-exec --name prod "sh -c 'printf stdout-ok; printf stderr-ok >&2; exit 7'"
 $LASTEXITCODE
+py .\ssh_relay.py exec --name prod --risky "touch /tmp/ssh-relay-risky-test.txt"
+py .\ssh_relay.py exec --name prod "tail -n 1 ~/.local/state/agent-safe/changes.jsonl"
 py .\ssh_relay.py exec --name prod "printf download-ok > /tmp/ssh-relay-download-test.txt"
 py .\ssh_relay.py download --name prod "/tmp/ssh-relay-download-test.txt" ".\downloads\ssh-relay-download-test.txt" --create-dirs --overwrite
 Get-Content .\downloads\ssh-relay-download-test.txt
