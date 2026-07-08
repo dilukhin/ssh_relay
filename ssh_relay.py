@@ -39,6 +39,7 @@ DEFAULT_DOWNLOAD_TIMEOUT = 300
 DEFAULT_DOWNLOAD_MAX_SIZE = 64 * 1024 * 1024
 DEFAULT_UPLOAD_TIMEOUT = 300
 DEFAULT_UPLOAD_MAX_SIZE = 64 * 1024 * 1024
+DEFAULT_RISKY_RECEIPT_PATH = "~/.local/state/agent-safe/changes.jsonl"
 REQUIRED_SESSION_FIELDS = {
     "host": str,
     "port": int,
@@ -419,6 +420,70 @@ def execute_sudo_command(
         timeout_seconds,
         stdin_data=(sudo_password + "\n").encode("utf-8"),
     )
+
+
+def quote_posix_path(path: str) -> str:
+    """Экранирует POSIX-путь, сохраняя расширение ~/ на удалённой стороне."""
+    if path == "~":
+        return '"$HOME"'
+    if path.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(path[2:])
+    return shlex.quote(path)
+
+
+def build_risky_receipt_command(
+    *,
+    path: str,
+    session: dict[str, Any],
+    action: str,
+    command: str,
+    sudo: bool,
+) -> str:
+    """Формирует POSIX shell-команду для JSONL-записи о risky-изменении на удалённом хосте."""
+    if not path.strip():
+        raise RelayError("Путь receipt-файла не должен быть пустым.")
+    payload = {
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "tool": "ssh_relay",
+        "session": session_display_name(session),
+        "target": format_session_target(session),
+        "action": action,
+        "sudo": sudo,
+        "command": command,
+        "status": "done",
+    }
+    line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    directory = posixpath.dirname(path.rstrip("/")) or "."
+    return f"mkdir -p {quote_posix_path(directory)} && printf '%s\\n' {shlex.quote(line)} >> {quote_posix_path(path)}"
+
+
+def execute_risky_receipt(
+    client: Any,
+    *,
+    session: dict[str, Any],
+    action: str,
+    command: str,
+    sudo: bool,
+    receipt_path: str,
+    timeout_seconds: int,
+    sudo_password: str | None,
+) -> dict[str, Any]:
+    receipt_command = build_risky_receipt_command(
+        path=receipt_path,
+        session=session,
+        action=action,
+        command=command,
+        sudo=sudo,
+    )
+    if sudo:
+        if sudo_password is None:
+            raise RelayError("Нельзя записать sudo receipt: sudo-пароль отсутствует в памяти daemon.")
+        result = execute_sudo_command(client, receipt_command, timeout_seconds, sudo_password)
+    else:
+        result = execute_remote_command(client, receipt_command, timeout_seconds)
+    result["receipt_command"] = receipt_command
+    result["receipt_path"] = receipt_path
+    return result
 
 
 def download_remote_file(
@@ -983,6 +1048,14 @@ def daemon(args: argparse.Namespace) -> int:
                 if not isinstance(command, str) or not command.strip():
                     reply({"ok": False, "protocol_error": "Передана пустая удалённая команда."})
                     return
+                risky = request.get("risky", False)
+                receipt_path = request.get("receipt_path", DEFAULT_RISKY_RECEIPT_PATH)
+                if not isinstance(risky, bool):
+                    reply({"ok": False, "protocol_error": "Некорректный флаг risky."})
+                    return
+                if not isinstance(receipt_path, str) or not receipt_path.strip():
+                    reply({"ok": False, "protocol_error": "Некорректный путь risky receipt."})
+                    return
 
                 with command_lock:
                     if action == "sudo_exec":
@@ -995,6 +1068,28 @@ def daemon(args: argparse.Namespace) -> int:
                             result = execute_sudo_command(client, command, args.command_timeout, sudo_password)
                     else:
                         result = execute_remote_command(client, command, args.command_timeout)
+                    if result.get("ok") and result.get("exit_code") == 0 and risky:
+                        receipt = execute_risky_receipt(
+                            client,
+                            session=session,
+                            action=action,
+                            command=command,
+                            sudo=(action == "sudo_exec"),
+                            receipt_path=receipt_path,
+                            timeout_seconds=args.command_timeout,
+                            sudo_password=sudo_password,
+                        )
+                        result["risky_receipt"] = {
+                            "path": receipt.get("receipt_path"),
+                            "exit_code": receipt.get("exit_code"),
+                        }
+                        if receipt.get("exit_code") != 0:
+                            result = {
+                                "ok": False,
+                                "protocol_error": "Удалённая команда выполнена, но risky receipt записать не удалось.",
+                                "command_result": result,
+                                "receipt_result": receipt,
+                            }
                 reply(result)
             except (socket.timeout, TimeoutError):
                 reply({"ok": False, "protocol_error": "Истекло время ожидания локального запроса."})
@@ -1041,7 +1136,14 @@ def exec_cmd(args: argparse.Namespace) -> int:
         session_name = validate_session_name(args.name)
         session = read_session(session_name)
         response_timeout = int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)) + 10
-        result = request_daemon(session, "exec", command=args.remote_command, response_timeout=response_timeout)
+        result = request_daemon(
+            session,
+            "exec",
+            command=args.remote_command,
+            risky=bool(args.risky),
+            receipt_path=args.receipt_path,
+            response_timeout=response_timeout,
+        )
     except RelayError as exc:
         remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
         print(str(exc), file=sys.stderr)
@@ -1055,7 +1157,14 @@ def sudo_exec_cmd(args: argparse.Namespace) -> int:
         session_name = validate_session_name(args.name)
         session = read_session(session_name)
         response_timeout = int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)) + 10
-        result = request_daemon(session, "sudo_exec", command=args.remote_command, response_timeout=response_timeout)
+        result = request_daemon(
+            session,
+            "sudo_exec",
+            command=args.remote_command,
+            risky=bool(args.risky),
+            receipt_path=args.receipt_path,
+            response_timeout=response_timeout,
+        )
     except RelayError as exc:
         remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
         print(str(exc), file=sys.stderr)
@@ -1327,6 +1436,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     exec_parser = subparsers.add_parser("exec", help="Выполнить одну команду через активный relay.")
     add_session_name_argument(exec_parser)
+    exec_parser.add_argument(
+        "--risky",
+        action="store_true",
+        help="После успешной команды записать JSONL receipt об изменении на удалённом хосте.",
+    )
+    exec_parser.add_argument(
+        "--receipt-path",
+        default=DEFAULT_RISKY_RECEIPT_PATH,
+        help=f"Удалённый JSONL-файл для --risky, по умолчанию {DEFAULT_RISKY_RECEIPT_PATH}.",
+    )
     exec_parser.add_argument("remote_command", help="Неинтерактивная команда для удалённого сервера.")
     exec_parser.set_defaults(handler=exec_cmd)
 
@@ -1335,6 +1454,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Выполнить одну неинтерактивную команду через sudo в активном relay.",
     )
     add_session_name_argument(sudo_exec_parser)
+    sudo_exec_parser.add_argument(
+        "--risky",
+        action="store_true",
+        help="После успешной sudo-команды записать JSONL receipt об изменении на удалённом хосте.",
+    )
+    sudo_exec_parser.add_argument(
+        "--receipt-path",
+        default=DEFAULT_RISKY_RECEIPT_PATH,
+        help=f"Удалённый JSONL-файл для --risky, по умолчанию {DEFAULT_RISKY_RECEIPT_PATH}.",
+    )
     sudo_exec_parser.add_argument("remote_command", help="Неинтерактивная команда для удалённого сервера без префикса sudo.")
     sudo_exec_parser.set_defaults(handler=sudo_exec_cmd)
 
