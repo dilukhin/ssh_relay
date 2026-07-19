@@ -12,10 +12,11 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
   py ssh_relay.py stop
 """
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 import argparse
 import atexit
+import base64
 import getpass
 import json
 import os
@@ -24,6 +25,7 @@ import re
 import shlex
 import socket
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -33,7 +35,7 @@ from typing import Any
 
 BUFFER_SIZE = 64 * 1024
 MAX_OUTPUT_SIZE = 4 * 1024 * 1024
-MAX_MESSAGE_SIZE = 32 * 1024 * 1024
+MAX_MESSAGE_SIZE = 96 * 1024 * 1024
 DEFAULT_COMMAND_TIMEOUT = 120
 DEFAULT_DOWNLOAD_TIMEOUT = 300
 DEFAULT_DOWNLOAD_MAX_SIZE = 64 * 1024 * 1024
@@ -457,6 +459,13 @@ def build_risky_receipt_command(
     return f"mkdir -p {quote_posix_path(directory)} && printf '%s\\n' {shlex.quote(line)} >> {quote_posix_path(path)}"
 
 
+def normalize_remote_sftp_path(remote_path: str) -> str:
+    """Нормализует Windows-style путь для SFTP, не меняя POSIX-пути."""
+    if "\\" in remote_path:
+        return remote_path.replace("\\", "/")
+    return remote_path
+
+
 def execute_risky_receipt(
     client: Any,
     *,
@@ -502,6 +511,7 @@ def download_remote_file(
     if not local_path.strip():
         raise RelayError("Передан пустой локальный путь для сохранения файла.")
 
+    remote_source = normalize_remote_sftp_path(remote_path)
     target = Path(local_path).expanduser()
     if not target.is_absolute():
         raise RelayError("Локальный путь должен быть абсолютным.")
@@ -530,9 +540,9 @@ def download_remote_file(
     received = 0
     try:
         try:
-            remote_stat = sftp.stat(remote_path)
+            remote_stat = sftp.stat(remote_source)
         except OSError as exc:
-            raise RelayError(f"Удалённый файл не найден или недоступен: {remote_path}") from exc
+            raise RelayError(f"Удалённый файл не найден или недоступен: {remote_source}") from exc
 
         mode = getattr(remote_stat, "st_mode", 0)
         if stat.S_ISDIR(mode):
@@ -549,7 +559,7 @@ def download_remote_file(
             )
 
         try:
-            with sftp.open(remote_path, "rb") as remote_file, temporary.open("xb") as output:
+            with sftp.open(remote_source, "rb") as remote_file, temporary.open("xb") as output:
                 while True:
                     chunk = remote_file.read(BUFFER_SIZE)
                     if not chunk:
@@ -577,7 +587,7 @@ def download_remote_file(
         os.replace(temporary, target)
         return {
             "ok": True,
-            "remote_path": remote_path,
+            "remote_path": remote_source,
             "local_path": str(target),
             "bytes_downloaded": received,
         }
@@ -641,9 +651,10 @@ def remote_temporary_path(remote_path: str) -> str:
     return posixpath.join(parent, temporary_name)
 
 
-def upload_local_file(
+def upload_file_content(
     client: Any,
     local_path: str,
+    content: bytes,
     remote_path: str,
     *,
     overwrite: bool,
@@ -651,7 +662,7 @@ def upload_local_file(
     max_size: int,
     timeout_seconds: int,
 ) -> dict[str, Any]:
-    """Загружает один обычный локальный файл через SFTP на удалённый сервер."""
+    """Загружает переданное клиентом содержимое файла через SFTP на удалённый сервер."""
     if not local_path.strip():
         raise RelayError("Передан пустой путь локального файла.")
     if not remote_path.strip():
@@ -661,18 +672,7 @@ def upload_local_file(
     if "\x00" in remote_path:
         raise RelayError("Удалённый путь содержит недопустимый нулевой символ.")
 
-    source = Path(local_path).expanduser()
-    if not source.is_absolute():
-        raise RelayError("Локальный путь должен быть абсолютным.")
-    if not source.exists():
-        raise RelayError(f"Локальный файл не найден: {source}")
-    if not source.is_file():
-        raise RelayError("Локальный путь должен указывать на обычный файл. Загрузка каталогов не поддерживается.")
-
-    try:
-        local_size = source.stat().st_size
-    except OSError as exc:
-        raise RelayError(f"Не удалось прочитать параметры локального файла: {source}") from exc
+    local_size = len(content)
     if local_size > max_size:
         raise RelayError(
             f"Размер локального файла {format_bytes(local_size)} превышает лимит "
@@ -680,7 +680,7 @@ def upload_local_file(
             "если это безопасно."
         )
 
-    remote_target = remote_path.rstrip("/")
+    remote_target = normalize_remote_sftp_path(remote_path).rstrip("/")
     remote_parent = remote_parent_directory(remote_target)
     temporary = remote_temporary_path(remote_target)
     started = time.monotonic()
@@ -729,11 +729,9 @@ def upload_local_file(
             raise RelayError("Временный удалённый файл уже существует. Повторите команду.")
 
         try:
-            with source.open("rb") as local_file, sftp.open(temporary, "wb") as remote_file:
-                while True:
-                    chunk = local_file.read(BUFFER_SIZE)
-                    if not chunk:
-                        break
+            with sftp.open(temporary, "wb") as remote_file:
+                for offset in range(0, local_size, BUFFER_SIZE):
+                    chunk = content[offset:offset + BUFFER_SIZE]
                     sent += len(chunk)
                     if sent > max_size:
                         raise RelayError(f"Загрузка остановлена: отправлено больше лимита {format_bytes(max_size)}.")
@@ -777,7 +775,7 @@ def upload_local_file(
 
         return {
             "ok": True,
-            "local_path": str(source),
+            "local_path": local_path,
             "remote_path": remote_target,
             "bytes_uploaded": sent,
         }
@@ -796,6 +794,65 @@ def session_display_name(session: dict[str, Any]) -> str:
 
 def format_session_target(session: dict[str, Any]) -> str:
     return f"{session['user']}@{session['host']}:{session['port']}"
+
+
+def start_detached_daemon(args: argparse.Namespace) -> int:
+    """Запускает daemon в отдельном процессе и ждёт появления активной сессии."""
+    if not args.identity_file:
+        print("--detach поддерживается только вместе с --identity-file, чтобы не скрывать password prompt.", file=sys.stderr)
+        return 2
+    if args.ask_key_passphrase:
+        print("--detach несовместим с --ask-key-passphrase.", file=sys.stderr)
+        return 2
+    if args.enable_sudo:
+        print("--detach несовместим с --enable-sudo, потому что sudo-пароль вводится интерактивно.", file=sys.stderr)
+        return 2
+
+    session_name = validate_session_name(args.name)
+    if check_existing_session(session_name):
+        return 1
+
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "daemon",
+        "--name", session_name,
+        "--host", args.host,
+        "--port", str(args.port),
+        "--user", args.user,
+        "--identity-file", args.identity_file,
+        "--command-timeout", str(args.command_timeout),
+        "--download-timeout", str(args.download_timeout),
+        "--download-max-size", str(args.download_max_size),
+        "--upload-timeout", str(args.upload_timeout),
+        "--upload-max-size", str(args.upload_max_size),
+    ]
+    if args.known_hosts:
+        command.extend(["--known-hosts", args.known_hosts])
+
+    log_path = Path(args.detach_log).expanduser() if args.detach_log else state_directory() / f"{session_name}.daemon.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("ab") as log:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(command, stdout=log, stderr=log, stdin=subprocess.DEVNULL, creationflags=creationflags)
+
+    deadline = time.monotonic() + 15
+    last_error = "daemon не успел создать активную сессию."
+    while time.monotonic() < deadline:
+        try:
+            session = read_session(session_name)
+            result = request_daemon(session, "status")
+            if result.get("ok") and result.get("status") == "active":
+                print(f"Сессия {session_name} запущена в фоне: {format_session_target(session)}")
+                print(f"Лог daemon: {log_path}")
+                return 0
+        except RelayError as exc:
+            last_error = str(exc)
+        time.sleep(0.5)
+
+    print(f"Не удалось подтвердить запуск detached daemon: {last_error}", file=sys.stderr)
+    print(f"Проверьте лог: {log_path}", file=sys.stderr)
+    return 1
 
 
 def check_existing_session(name: str) -> bool:
@@ -818,6 +875,9 @@ def check_existing_session(name: str) -> bool:
 
 
 def daemon(args: argparse.Namespace) -> int:
+    if getattr(args, "detach", False):
+        return start_detached_daemon(args)
+
     try:
         session_name = validate_session_name(args.name)
     except RelayError as exc:
@@ -1023,18 +1083,28 @@ def daemon(args: argparse.Namespace) -> int:
                 if action == "upload":
                     local_path = request.get("local_path")
                     remote_path = request.get("remote_path")
+                    content_b64 = request.get("content_b64")
                     overwrite = request.get("overwrite")
                     create_dirs = request.get("create_dirs")
                     if not isinstance(local_path, str) or not isinstance(remote_path, str):
                         reply({"ok": False, "protocol_error": "Для загрузки нужны локальный и удалённый путь."})
                         return
+                    if not isinstance(content_b64, str):
+                        reply({"ok": False, "protocol_error": "Для загрузки нужно содержимое файла."})
+                        return
                     if not isinstance(overwrite, bool) or not isinstance(create_dirs, bool):
                         reply({"ok": False, "protocol_error": "Некорректные параметры загрузки."})
                         return
+                    try:
+                        content = base64.b64decode(content_b64.encode("ascii"), validate=True)
+                    except (ValueError, UnicodeEncodeError):
+                        reply({"ok": False, "protocol_error": "Содержимое загружаемого файла повреждено."})
+                        return
                     with command_lock:
-                        result = upload_local_file(
+                        result = upload_file_content(
                             client,
                             local_path,
+                            content,
                             remote_path,
                             overwrite=overwrite,
                             create_dirs=create_dirs,
@@ -1209,12 +1279,23 @@ def upload_cmd(args: argparse.Namespace) -> int:
         session_name = validate_session_name(args.name)
         session = read_session(session_name)
         local_path = Path(args.local_path).expanduser().resolve(strict=False)
+        if not local_path.is_file():
+            raise RelayError(f"Локальный файл не найден или не является обычным файлом: {local_path}")
+        local_size = local_path.stat().st_size
+        max_size = int(session.get("upload_max_size", DEFAULT_UPLOAD_MAX_SIZE))
+        if local_size > max_size:
+            raise RelayError(
+                f"Размер локального файла {format_bytes(local_size)} превышает лимит "
+                f"{format_bytes(max_size)}. Перезапустите daemon с большим --upload-max-size, если это безопасно."
+            )
+        content_b64 = base64.b64encode(local_path.read_bytes()).decode("ascii")
         response_timeout = int(session.get("upload_timeout", DEFAULT_UPLOAD_TIMEOUT)) + 10
         result = request_daemon(
             session,
             "upload",
             response_timeout=response_timeout,
             local_path=str(local_path),
+            content_b64=content_b64,
             remote_path=args.remote_path,
             overwrite=bool(args.overwrite),
             create_dirs=bool(args.create_dirs),
@@ -1431,6 +1512,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-sudo",
         action="store_true",
         help="Включить явный режим sudo с ручным вводом sudo-пароля в терминале daemon.",
+    )
+    daemon_parser.add_argument(
+        "--detach",
+        action="store_true",
+        help="Запустить daemon в отдельном фоне и дождаться активной сессии. Требует --identity-file без passphrase prompt и без sudo.",
+    )
+    daemon_parser.add_argument(
+        "--detach-log",
+        help="Путь к лог-файлу detached daemon; по умолчанию используется каталог состояния ssh_relay.",
     )
     daemon_parser.set_defaults(handler=daemon)
 

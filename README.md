@@ -94,7 +94,7 @@ ssh-keygen -lf "$env:USERPROFILE\.ssh\known_hosts"
 ## Команды
 
 ```text
-py .\ssh_relay.py daemon [--name NAME] --host HOST --user USER [--port PORT] [-i PATH] [--ask-key-passphrase] [--known-hosts PATH] [--command-timeout SECONDS] [--download-timeout SECONDS] [--download-max-size SIZE] [--upload-timeout SECONDS] [--upload-max-size SIZE] [--enable-sudo]
+py .\ssh_relay.py daemon [--name NAME] --host HOST --user USER [--port PORT] [-i PATH] [--ask-key-passphrase] [--known-hosts PATH] [--command-timeout SECONDS] [--download-timeout SECONDS] [--download-max-size SIZE] [--upload-timeout SECONDS] [--upload-max-size SIZE] [--enable-sudo] [--detach] [--detach-log PATH]
 py .\ssh_relay.py exec [--name NAME] [--risky] [--receipt-path REMOTE_JSONL] "COMMAND"
 py .\ssh_relay.py sudo-exec [--name NAME] [--risky] [--receipt-path REMOTE_JSONL] "COMMAND"
 py .\ssh_relay.py download [--name NAME] [--overwrite] [--create-dirs] REMOTE_PATH LOCAL_PATH
@@ -188,6 +188,14 @@ Relay слушает локальный адрес 127.0.0.1:54321
 
 Окно терминала с daemon должно оставаться открытым до конца работы.
 
+Для временной автоматизации без интерактивного ввода можно запустить daemon в фоне:
+
+```powershell
+py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro -i "$env:USERPROFILE\.ssh\id_ed25519" --detach
+```
+
+`--detach` требует `--identity-file` без запроса passphrase и несовместим с `--enable-sudo`, потому что скрытый процесс не должен ждать интерактивный ввод пароля. Команда возвращается только после подтверждения активной relay-сессии или ошибки. Лог по умолчанию пишется в каталог состояния `ssh_relay`; путь можно задать через `--detach-log`.
+
 ### Именованные сессии
 
 По умолчанию используется сессия `default`, поэтому команды без `--name` тоже работают:
@@ -214,6 +222,7 @@ py .\ssh_relay.py exec -n test "hostname"
 py .\ssh_relay.py sudo-exec --name rootbox "whoami"
 py .\ssh_relay.py download --name prod "/var/log/app.log" ".\downloads\app.log" --create-dirs
 py .\ssh_relay.py upload --name prod ".\config.json" "/tmp/config.json" --overwrite
+py .\ssh_relay.py upload --name win ".\tool.ps1" "C:\Windows\Temp\tool.ps1" --overwrite
 py .\ssh_relay.py status --name prod
 py .\ssh_relay.py status --all
 py .\ssh_relay.py list
@@ -453,8 +462,10 @@ py .\ssh_relay.py stop --name prod
 * Relay принимает локальные запросы только на `127.0.0.1` и проверяет токен для `exec`, `sudo-exec`, `download`, `upload`, `status` и `stop`.
 * SSH-сервер должен быть заранее доверен через проверенный `known_hosts`; автоматическое принятие неизвестного host key не используется.
 * Возможность выполнения произвольной удалённой shell-команды является назначением relay; расширять её без оценки угроз не следует.
-* `download` даёт владельцу токена возможность записать локальный файл с правами процесса daemon. `upload` даёт владельцу токена возможность прочитать локальный файл с правами процесса daemon и записать его на сервер через SFTP. Не передавайте session-файл и токен недоверенным процессам.
+* `download` даёт владельцу токена возможность записать локальный файл с правами процесса daemon. `upload` даёт владельцу токена возможность прочитать локальный файл с правами CLI-процесса и записать его на сервер через SFTP. Не передавайте session-файл и токен недоверенным процессам.
 * Для постоянной эксплуатации предпочтительнее ограниченный `NOPASSWD` в `sudoers` под конкретные команды, а не хранение sudo-пароля в памяти relay.
+
+Начиная с `0.5.1`, `upload` читает локальный файл в CLI-процессе и передаёт содержимое активному daemon. Это корректно работает, когда daemon запущен в другом рабочем каталоге или detached. Windows-style удалённые пути с обратными слэшами нормализуются для SFTP, например `C:\Windows\Temp\tool.ps1` передаётся как `C:/Windows/Temp/tool.ps1`.
 
 ## Минимальная ручная проверка
 
