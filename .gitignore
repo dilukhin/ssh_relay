@@ -1,2 +1,9 @@
 __pycache__/
 *.pyc
+.agent-safety/
+*.pyo
+*.log
+.env
+private_secrets.json
+.venv/
+venv/

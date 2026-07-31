@@ -12,12 +12,13 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
   py ssh_relay.py stop
 """
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 import argparse
 import atexit
 import base64
 import getpass
+import hashlib
 import json
 import os
 import posixpath
@@ -42,6 +43,13 @@ DEFAULT_DOWNLOAD_MAX_SIZE = 64 * 1024 * 1024
 DEFAULT_UPLOAD_TIMEOUT = 300
 DEFAULT_UPLOAD_MAX_SIZE = 64 * 1024 * 1024
 DEFAULT_RISKY_RECEIPT_PATH = "~/.local/state/agent-safe/changes.jsonl"
+MACHINE_EXIT_NOT_STARTED = 10
+MACHINE_EXIT_COMMAND_FAILED = 11
+MACHINE_EXIT_PARTIAL_SUCCESS = 12
+MACHINE_EXIT_UNKNOWN = 13
+TRANSACTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 REQUIRED_SESSION_FIELDS = {
     "host": str,
     "port": int,
@@ -55,6 +63,34 @@ REQUIRED_SESSION_FIELDS = {
 
 class RelayError(Exception):
     """Ожидаемая ошибка relay, предназначенная для вывода пользователю."""
+
+
+class DaemonRequestError(RelayError):
+    """Ошибка локального протокола с признаком возможной отправки запроса daemon."""
+
+    def __init__(self, message: str, *, request_sent: bool, error_code: str) -> None:
+        super().__init__(message)
+        self.request_sent = request_sent
+        self.error_code = error_code
+
+
+class RemoteCommandError(RelayError):
+    """Ошибка выполнения с признаком возможного запуска удалённой команды."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_code: str,
+        command_started: bool,
+        stdout: str = "",
+        stderr: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.command_started = command_started
+        self.stdout = stdout
+        self.stderr = stderr
 
 
 class RussianArgumentParser(argparse.ArgumentParser):
@@ -145,6 +181,123 @@ def parse_size_bytes(value: str) -> int:
     if size <= 0:
         raise argparse.ArgumentTypeError("размер должен быть положительным")
     return size
+
+
+def _validate_no_controls(value: str, *, field_name: str, max_length: int, allow_space: bool = True) -> str:
+    if len(value) > max_length:
+        raise argparse.ArgumentTypeError(f"{field_name}: длина не должна превышать {max_length} символов")
+    for char in value:
+        code = ord(char)
+        if code == 0 or code == 127 or code < 32:
+            if allow_space and char == " ":
+                continue
+            raise argparse.ArgumentTypeError(f"{field_name}: управляющие символы запрещены")
+    return value
+
+
+def parse_transaction_id(value: str) -> str:
+    if not TRANSACTION_ID_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            "идентификатор транзакции должен содержать 1-128 символов: латинские буквы, цифры, точку, двоеточие, дефис или подчёркивание"
+        )
+    return value
+
+
+def parse_change_target(value: str) -> str:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("target изменения не должен быть пустым")
+    return _validate_no_controls(value, field_name="target изменения", max_length=1024)
+
+
+def parse_change_description(value: str) -> str:
+    if not value.strip():
+        raise argparse.ArgumentTypeError("описание изменения не должно быть пустым")
+    return _validate_no_controls(value, field_name="описание изменения", max_length=512)
+
+
+def parse_receipt_path(value: str) -> str:
+    try:
+        return validate_receipt_path(value)
+    except RelayError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def validate_receipt_path(value: str) -> str:
+    if not value.strip():
+        raise RelayError("Путь receipt-файла не должен быть пустым.")
+    if len(value) > 4096:
+        raise RelayError("Путь receipt-файла слишком длинный.")
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise RelayError("Путь receipt-файла содержит управляющие символы.")
+    return value
+
+
+def validate_transaction_id(value: str) -> str:
+    if not TRANSACTION_ID_PATTERN.fullmatch(value):
+        raise RelayError("Некорректный transaction_id.")
+    return value
+
+
+def validate_change_target(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        return parse_change_target(value)
+    except argparse.ArgumentTypeError as exc:
+        raise RelayError(str(exc)) from exc
+
+
+def validate_change_description(value: str) -> str:
+    try:
+        return parse_change_description(value)
+    except argparse.ArgumentTypeError as exc:
+        raise RelayError(str(exc)) from exc
+
+
+def utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def canonical_json_bytes(value: dict[str, Any]) -> bytes:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def sha256_prefixed(data: bytes) -> str:
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def command_hash(command: str) -> str:
+    return sha256_prefixed(command.encode("utf-8"))
+
+
+def supports_operation_protocol(version: object) -> bool:
+    """Проверяет поддержку машинного протокола v1 без требования точного patch."""
+    if not isinstance(version, str):
+        return False
+    match = VERSION_PATTERN.fullmatch(version)
+    current = VERSION_PATTERN.fullmatch(__version__)
+    if match is None or current is None:
+        return False
+    major, minor, _ = (int(part) for part in match.groups())
+    current_major, current_minor, _ = (int(part) for part in current.groups())
+    return major == current_major and minor >= current_minor
+
+
+def stored_receipt_hash(payload: dict[str, Any]) -> str:
+    """Проверяет self-hash новой записи либо вычисляет anchor для receipt 0.5.x."""
+    value = payload.get("receipt_hash")
+    if isinstance(value, str) and HASH_PATTERN.fullmatch(value):
+        body = dict(payload)
+        body.pop("receipt_hash", None)
+        expected = sha256_prefixed(canonical_json_bytes(body))
+        if value != expected:
+            raise RelayError("Последняя запись risky receipt имеет неверный receipt_hash; команда не запускалась.")
+        return value
+    if payload.get("tool") == "ssh_relay" and payload.get("status") == "done" and isinstance(payload.get("command"), str):
+        # Старые записи 0.5.x не имели self-hash. Их канонический hash становится
+        # однократным anchor при продолжении журнала в формате 0.6.0.
+        return sha256_prefixed(canonical_json_bytes(payload))
+    raise RelayError("Последняя запись risky receipt не содержит проверяемый receipt_hash; команда не запускалась.")
 
 
 def format_bytes(size: int) -> str:
@@ -321,14 +474,37 @@ def request_daemon(
     **payload: Any,
 ) -> dict[str, Any]:
     request = {"auth_token": session["auth_token"], "action": action, **payload}
+    request_sent = False
     try:
         with socket.create_connection(("127.0.0.1", session["daemon_port"]), timeout=5) as sock:
+            # После установления соединения ошибка отправки трактуется консервативно:
+            # daemon мог получить полный запрос до локальной ошибки сокета.
+            request_sent = True
             sock.sendall(json.dumps(request, ensure_ascii=False).encode("utf-8"))
             sock.shutdown(socket.SHUT_WR)
             sock.settimeout(response_timeout)
-            return read_message(sock)
+            try:
+                return read_message(sock)
+            except RelayError as exc:
+                raise DaemonRequestError(
+                    "Daemon вернул повреждённый или неполный ответ; результат операции неизвестен.",
+                    request_sent=True,
+                    error_code="response_invalid",
+                ) from exc
+    except DaemonRequestError:
+        raise
     except (ConnectionError, TimeoutError, socket.timeout, OSError) as exc:
-        raise RelayError("Daemon недоступен или не ответил вовремя.") from exc
+        if request_sent:
+            raise DaemonRequestError(
+                "Запрос отправлен daemon, но ответ не получен; результат операции неизвестен.",
+                request_sent=True,
+                error_code="daemon_response_lost",
+            ) from exc
+        raise DaemonRequestError(
+            "Daemon недоступен; удалённая команда не отправлялась.",
+            request_sent=False,
+            error_code="daemon_unavailable",
+        ) from exc
 
 
 def load_paramiko():
@@ -346,17 +522,20 @@ def execute_remote_command(
     stdin_data: bytes | None = None,
 ) -> dict[str, Any]:
     """Выполняет команду без PTY, одновременно вычитывая stdout и stderr."""
-    channel = client.get_transport().open_session(timeout=10)
-    channel.exec_command(command)
-    if stdin_data is not None:
-        channel.sendall(stdin_data)
-    channel.shutdown_write()
+    channel = None
+    command_started = False
     output: list[bytes] = []
     errors: list[bytes] = []
-    total_size = 0
-    started = time.monotonic()
-
     try:
+        channel = client.get_transport().open_session(timeout=10)
+        command_started = True
+        channel.exec_command(command)
+        if stdin_data is not None:
+            channel.sendall(stdin_data)
+        channel.shutdown_write()
+        total_size = 0
+        started = time.monotonic()
+
         while True:
             read_any = False
             while channel.recv_ready():
@@ -371,16 +550,22 @@ def execute_remote_command(
                 read_any = True
 
             if total_size > MAX_OUTPUT_SIZE:
-                raise RelayError(
-                    "Вывод удалённой команды превышает допустимый размер 4 МиБ. "
-                    "Используйте фильтрацию или запись результата в файл на сервере."
+                raise RemoteCommandError(
+                    "Вывод удалённой команды превышает допустимый размер 4 МиБ; результат команды неизвестен.",
+                    error_code="output_limit_exceeded",
+                    command_started=True,
+                    stdout=b"".join(output).decode("utf-8", errors="replace"),
+                    stderr=b"".join(errors).decode("utf-8", errors="replace"),
                 )
             if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
                 break
             if time.monotonic() - started > timeout_seconds:
-                raise RelayError(
-                    f"Превышено время выполнения команды: {timeout_seconds} с. "
-                    "Relay предназначен для коротких команд."
+                raise RemoteCommandError(
+                    f"Превышено время выполнения команды: {timeout_seconds} с; результат команды неизвестен.",
+                    error_code="command_timeout",
+                    command_started=True,
+                    stdout=b"".join(output).decode("utf-8", errors="replace"),
+                    stderr=b"".join(errors).decode("utf-8", errors="replace"),
                 )
             if not read_any:
                 time.sleep(0.01)
@@ -392,8 +577,25 @@ def execute_remote_command(
             "stderr": b"".join(errors).decode("utf-8", errors="replace"),
             "exit_code": exit_code,
         }
+    except RemoteCommandError:
+        raise
+    except Exception as exc:
+        if command_started:
+            raise RemoteCommandError(
+                "SSH-канал завершился до получения достоверного результата команды.",
+                error_code="command_result_unknown",
+                command_started=True,
+                stdout=b"".join(output).decode("utf-8", errors="replace"),
+                stderr=b"".join(errors).decode("utf-8", errors="replace"),
+            ) from exc
+        raise RemoteCommandError(
+            "Не удалось открыть канал для удалённой команды; команда не запускалась.",
+            error_code="command_not_started",
+            command_started=False,
+        ) from exc
     finally:
-        channel.close()
+        if channel is not None:
+            channel.close()
 
 
 def verify_sudo_password(client: Any, sudo_password: str, timeout_seconds: int) -> None:
@@ -433,32 +635,6 @@ def quote_posix_path(path: str) -> str:
     return shlex.quote(path)
 
 
-def build_risky_receipt_command(
-    *,
-    path: str,
-    session: dict[str, Any],
-    action: str,
-    command: str,
-    sudo: bool,
-) -> str:
-    """Формирует POSIX shell-команду для JSONL-записи о risky-изменении на удалённом хосте."""
-    if not path.strip():
-        raise RelayError("Путь receipt-файла не должен быть пустым.")
-    payload = {
-        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "tool": "ssh_relay",
-        "session": session_display_name(session),
-        "target": format_session_target(session),
-        "action": action,
-        "sudo": sudo,
-        "command": command,
-        "status": "done",
-    }
-    line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    directory = posixpath.dirname(path.rstrip("/")) or "."
-    return f"mkdir -p {quote_posix_path(directory)} && printf '%s\\n' {shlex.quote(line)} >> {quote_posix_path(path)}"
-
-
 def normalize_remote_sftp_path(remote_path: str) -> str:
     """Нормализует Windows-style путь для SFTP, не меняя POSIX-пути."""
     if "\\" in remote_path:
@@ -466,33 +642,468 @@ def normalize_remote_sftp_path(remote_path: str) -> str:
     return remote_path
 
 
-def execute_risky_receipt(
+def execute_auxiliary_command(
+    client: Any,
+    command: str,
+    *,
+    sudo: bool,
+    timeout_seconds: int,
+    sudo_password: str | None,
+) -> dict[str, Any]:
+    if sudo:
+        if sudo_password is None:
+            raise RelayError("Режим sudo недоступен: sudo-пароль отсутствует в памяти daemon.")
+        return execute_sudo_command(client, command, timeout_seconds, sudo_password)
+    return execute_remote_command(client, command, timeout_seconds)
+
+
+def read_previous_receipt_hash(
+    client: Any,
+    *,
+    receipt_path: str,
+    sudo: bool,
+    timeout_seconds: int,
+    sudo_password: str | None,
+) -> str | None:
+    """Проверяет последнюю запись журнала до запуска изменяющей команды."""
+    path = validate_receipt_path(receipt_path)
+    quoted = quote_posix_path(path)
+    command = (
+        f"if [ -L {quoted} ]; then exit 4; "
+        f"elif [ ! -e {quoted} ] || [ ! -s {quoted} ]; then exit 3; "
+        f"else tail -n 1 -- {quoted}; fi"
+    )
+    result = execute_auxiliary_command(
+        client,
+        command,
+        sudo=sudo,
+        timeout_seconds=timeout_seconds,
+        sudo_password=sudo_password,
+    )
+    exit_code = int(result.get("exit_code", 1))
+    if exit_code == 3:
+        return None
+    if exit_code == 4:
+        raise RelayError("Путь risky receipt является символической ссылкой; команда не запускалась.")
+    if exit_code != 0:
+        raise RelayError("Не удалось прочитать последнюю запись risky receipt до выполнения команды.")
+    line = str(result.get("stdout", "")).rstrip("\r\n")
+    if not line:
+        raise RelayError("Последняя строка risky receipt пуста; команда не запускалась.")
+    try:
+        payload = json.loads(line.splitlines()[-1])
+    except json.JSONDecodeError as exc:
+        raise RelayError("Последняя запись risky receipt повреждена; команда не запускалась.") from exc
+    if not isinstance(payload, dict):
+        raise RelayError("Последняя запись risky receipt имеет неверный формат; команда не запускалась.")
+    return stored_receipt_hash(payload)
+
+
+def ensure_transaction_id_unused(
+    client: Any,
+    *,
+    receipt_path: str,
+    transaction_id: str,
+    sudo: bool,
+    timeout_seconds: int,
+    sudo_password: str | None,
+) -> None:
+    """Отклоняет risky-операцию, если transaction_id уже есть в новом журнале."""
+    path = validate_receipt_path(receipt_path)
+    validate_transaction_id(transaction_id)
+    quoted_path = quote_posix_path(path)
+    needle = '"transaction_id":' + json.dumps(transaction_id, ensure_ascii=False)
+    command = (
+        f"if [ -L {quoted_path} ]; then exit 4; "
+        f"elif [ ! -e {quoted_path} ] || [ ! -s {quoted_path} ]; then exit 0; "
+        f"elif grep -F -q -- {shlex.quote(needle)} {quoted_path}; then exit 5; "
+        f"else code=$?; [ \"$code\" -eq 1 ] && exit 0; exit 6; fi"
+    )
+    result = execute_auxiliary_command(
+        client,
+        command,
+        sudo=sudo,
+        timeout_seconds=timeout_seconds,
+        sudo_password=sudo_password,
+    )
+    exit_code = int(result.get("exit_code", 1))
+    if exit_code == 0:
+        return
+    if exit_code == 4:
+        raise RelayError("Путь risky receipt является символической ссылкой; команда не запускалась.")
+    if exit_code == 5:
+        raise RelayError("transaction_id уже присутствует в risky receipt; команда не запускалась.")
+    raise RelayError("Не удалось проверить уникальность transaction_id; команда не запускалась.")
+
+
+def build_risky_receipt_payload(
+    *,
+    session: dict[str, Any],
+    action: str,
+    transaction_id: str,
+    receipt_id: str,
+    change_target: str | None,
+    change_description: str,
+    command_hash_value: str,
+    command_exit_code: int,
+    previous_receipt_hash: str | None,
+    timestamp_utc: str,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "timestamp_utc": timestamp_utc,
+        "tool": "ssh_relay",
+        "tool_version": __version__,
+        "session": session_display_name(session),
+        "remote_host": session["host"],
+        "remote_port": session["port"],
+        "remote_user": session["user"],
+        "action": action,
+        "sudo": action == "sudo-exec",
+        "transaction_id": transaction_id,
+        "receipt_id": receipt_id,
+        "change_target": change_target,
+        "change_description": change_description,
+        "command_status": "succeeded",
+        "command_hash": command_hash_value,
+        "command_exit_code": command_exit_code,
+        "previous_receipt_hash": previous_receipt_hash,
+    }
+    payload["receipt_hash"] = sha256_prefixed(canonical_json_bytes(payload))
+    return payload
+
+
+def write_risky_receipt(
+    client: Any,
+    *,
+    receipt_path: str,
+    payload: dict[str, Any],
+    sudo: bool,
+    timeout_seconds: int,
+    sudo_password: str | None,
+) -> tuple[str, str | None]:
+    """Добавляет receipt и проверяет последнюю строку; возвращает status и диагностику."""
+    path = validate_receipt_path(receipt_path)
+    line = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    directory = posixpath.dirname(path.rstrip("/")) or "."
+    quoted_path = quote_posix_path(path)
+    command = (
+        "umask 077 && "
+        f"mkdir -p {quote_posix_path(directory)} && "
+        f"if [ -L {quoted_path} ]; then exit 4; fi && "
+        f"touch {quoted_path} && chmod 600 -- {quoted_path} && "
+        f"printf '%s\\n' {shlex.quote(line)} >> {quoted_path}"
+    )
+    try:
+        append_result = execute_auxiliary_command(
+            client,
+            command,
+            sudo=sudo,
+            timeout_seconds=timeout_seconds,
+            sudo_password=sudo_password,
+        )
+    except RemoteCommandError as exc:
+        if exc.command_started:
+            return "unknown", "Подтверждение записи receipt не получено."
+        return "failed", "Команда записи receipt не была запущена."
+    except RelayError as exc:
+        return "failed", str(exc)
+    append_exit_code = int(append_result.get("exit_code", 1))
+    if append_exit_code == 4:
+        return "failed", "Путь risky receipt является символической ссылкой."
+    if append_exit_code != 0:
+        return "failed", "Удалённая команда записи receipt завершилась ошибкой."
+
+    verify_command = f"tail -n 1 -- {quote_posix_path(path)}"
+    try:
+        verify_result = execute_auxiliary_command(
+            client,
+            verify_command,
+            sudo=sudo,
+            timeout_seconds=timeout_seconds,
+            sudo_password=sudo_password,
+        )
+    except RemoteCommandError:
+        return "unknown", "Receipt мог быть записан, но контрольное чтение не завершилось."
+    except RelayError:
+        return "unknown", "Receipt мог быть записан, но контрольное чтение не выполнено."
+    if int(verify_result.get("exit_code", 1)) != 0:
+        return "unknown", "Receipt мог быть записан, но контрольное чтение завершилось ошибкой."
+    verified_line = str(verify_result.get("stdout", "")).rstrip("\r\n")
+    try:
+        verified = json.loads(verified_line.splitlines()[-1]) if verified_line else None
+    except json.JSONDecodeError:
+        verified = None
+    if not isinstance(verified, dict):
+        return "unknown", "Последняя запись receipt после добавления имеет неверный формат."
+    if verified.get("receipt_id") != payload["receipt_id"] or verified.get("receipt_hash") != payload["receipt_hash"]:
+        return "unknown", "Не удалось подтвердить, что последняя запись принадлежит текущей транзакции."
+    try:
+        verified_hash = stored_receipt_hash(verified)
+    except RelayError:
+        return "unknown", "Контрольная запись receipt не прошла проверку hash."
+    if verified_hash != payload["receipt_hash"]:
+        return "unknown", "Контрольный hash receipt не совпадает с ожидаемым."
+    return "written", None
+
+
+def machine_result_base(
+    *,
+    session: dict[str, Any] | None,
+    action: str,
+    risky: bool,
+    transaction_id: str,
+    transaction_id_source: str,
+    change_target: str | None,
+    change_description: str,
+    receipt_path: str | None,
+    command_hash_value: str,
+    started_at_utc: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "tool": "ssh_relay",
+        "tool_version": __version__,
+        "action": action,
+        "operation_status": "not_started",
+        "session": session_display_name(session) if session else None,
+        "remote_host": session.get("host") if session else None,
+        "remote_port": session.get("port") if session else None,
+        "remote_user": session.get("user") if session else None,
+        "sudo": action == "sudo-exec",
+        "risky": risky,
+        "transaction_id": transaction_id,
+        "transaction_id_source": transaction_id_source,
+        "change_target": change_target,
+        "change_description": change_description,
+        "command_status": "not_started",
+        "command_exit_code": None,
+        "command_hash": command_hash_value,
+        "receipt_status": "not_attempted" if risky else "not_requested",
+        "receipt_path": receipt_path if risky else None,
+        "receipt_id": str(uuid.uuid4()) if risky else None,
+        "receipt_hash": None,
+        "previous_receipt_hash": None,
+        "partial_success": False,
+        "stdout": "",
+        "stderr": "",
+        "output_encoding": "utf-8-replace",
+        "error_code": None,
+        "error_stage": None,
+        "error_message": None,
+        "started_at_utc": started_at_utc,
+        "finished_at_utc": None,
+    }
+
+
+def finish_machine_result(
+    result: dict[str, Any],
+    *,
+    operation_status: str,
+    error_code: str | None = None,
+    error_stage: str | None = None,
+    error_message: str | None = None,
+) -> dict[str, Any]:
+    result["operation_status"] = operation_status
+    result["error_code"] = error_code
+    result["error_stage"] = error_stage
+    result["error_message"] = error_message
+    result["partial_success"] = (
+        result.get("command_status") == "succeeded"
+        and result.get("receipt_status") in {"failed", "unknown"}
+    )
+    result["finished_at_utc"] = utc_now()
+    return result
+
+
+def execute_command_operation(
     client: Any,
     *,
     session: dict[str, Any],
     action: str,
     command: str,
-    sudo: bool,
+    risky: bool,
     receipt_path: str,
+    transaction_id: str,
+    transaction_id_source: str,
+    change_target: str | None,
+    change_description: str,
     timeout_seconds: int,
     sudo_password: str | None,
 ) -> dict[str, Any]:
-    receipt_command = build_risky_receipt_command(
-        path=receipt_path,
+    sudo = action == "sudo-exec"
+    result = machine_result_base(
         session=session,
         action=action,
-        command=command,
-        sudo=sudo,
+        risky=risky,
+        transaction_id=transaction_id,
+        transaction_id_source=transaction_id_source,
+        change_target=change_target,
+        change_description=change_description,
+        receipt_path=receipt_path,
+        command_hash_value=command_hash(command),
+        started_at_utc=utc_now(),
     )
-    if sudo:
-        if sudo_password is None:
-            raise RelayError("Нельзя записать sudo receipt: sudo-пароль отсутствует в памяти daemon.")
-        result = execute_sudo_command(client, receipt_command, timeout_seconds, sudo_password)
-    else:
-        result = execute_remote_command(client, receipt_command, timeout_seconds)
-    result["receipt_command"] = receipt_command
-    result["receipt_path"] = receipt_path
-    return result
+
+    if sudo and sudo_password is None:
+        return finish_machine_result(
+            result,
+            operation_status="not_started",
+            error_code="sudo_disabled",
+            error_stage="daemon",
+            error_message="Режим sudo недоступен: sudo-пароль отсутствует в памяти daemon.",
+        )
+
+    if risky:
+        try:
+            result["previous_receipt_hash"] = read_previous_receipt_hash(
+                client,
+                receipt_path=receipt_path,
+                sudo=sudo,
+                timeout_seconds=timeout_seconds,
+                sudo_password=sudo_password,
+            )
+            ensure_transaction_id_unused(
+                client,
+                receipt_path=receipt_path,
+                transaction_id=transaction_id,
+                sudo=sudo,
+                timeout_seconds=timeout_seconds,
+                sudo_password=sudo_password,
+            )
+        except (RelayError, RemoteCommandError) as exc:
+            error_code = "transaction_id_exists" if "уже присутствует" in str(exc) else "receipt_preflight_failed"
+            return finish_machine_result(
+                result,
+                operation_status="not_started",
+                error_code=error_code,
+                error_stage="receipt",
+                error_message=str(exc),
+            )
+
+    try:
+        if sudo:
+            command_result = execute_sudo_command(client, command, timeout_seconds, sudo_password or "")
+        else:
+            command_result = execute_remote_command(client, command, timeout_seconds)
+    except RemoteCommandError as exc:
+        result["stdout"] = exc.stdout
+        result["stderr"] = exc.stderr
+        if exc.command_started:
+            result["command_status"] = "unknown"
+            return finish_machine_result(
+                result,
+                operation_status="unknown",
+                error_code=exc.error_code,
+                error_stage="command",
+                error_message=str(exc),
+            )
+        return finish_machine_result(
+            result,
+            operation_status="not_started",
+            error_code=exc.error_code,
+            error_stage="command",
+            error_message=str(exc),
+        )
+
+    result["stdout"] = str(command_result.get("stdout", ""))
+    result["stderr"] = str(command_result.get("stderr", ""))
+    exit_code = int(command_result.get("exit_code", 1))
+    result["command_exit_code"] = exit_code
+    if exit_code != 0:
+        result["command_status"] = "failed"
+        return finish_machine_result(
+            result,
+            operation_status="command_failed",
+            error_code="command_failed",
+            error_stage="command",
+            error_message=f"Удалённая команда завершилась с кодом {exit_code}.",
+        )
+
+    result["command_status"] = "succeeded"
+    if not risky:
+        result["receipt_status"] = "not_requested"
+        return finish_machine_result(result, operation_status="succeeded")
+
+    receipt_payload = build_risky_receipt_payload(
+        session=session,
+        action=action,
+        transaction_id=transaction_id,
+        receipt_id=str(result["receipt_id"]),
+        change_target=change_target,
+        change_description=change_description,
+        command_hash_value=str(result["command_hash"]),
+        command_exit_code=exit_code,
+        previous_receipt_hash=result.get("previous_receipt_hash"),
+        timestamp_utc=utc_now(),
+    )
+    result["receipt_hash"] = receipt_payload["receipt_hash"]
+    status, diagnostic = write_risky_receipt(
+        client,
+        receipt_path=receipt_path,
+        payload=receipt_payload,
+        sudo=sudo,
+        timeout_seconds=timeout_seconds,
+        sudo_password=sudo_password,
+    )
+    result["receipt_status"] = status
+    if status == "written":
+        return finish_machine_result(result, operation_status="succeeded")
+    return finish_machine_result(
+        result,
+        operation_status="partial_success",
+        error_code="receipt_write_failed" if status == "failed" else "receipt_status_unknown",
+        error_stage="receipt",
+        error_message=diagnostic or "Статус receipt неизвестен.",
+    )
+
+
+def legacy_operation_response(result: dict[str, Any]) -> dict[str, Any]:
+    """Преобразует новый результат в формат CLI 0.5.x для совместимости."""
+    status = result.get("operation_status")
+    if status in {"succeeded", "command_failed"}:
+        return {
+            "ok": True,
+            "stdout": result.get("stdout", ""),
+            "stderr": result.get("stderr", ""),
+            "exit_code": result.get("command_exit_code", 1),
+            "risky_receipt": {
+                "path": result.get("receipt_path"),
+                "receipt_id": result.get("receipt_id"),
+                "receipt_hash": result.get("receipt_hash"),
+            } if result.get("risky") and result.get("receipt_status") == "written" else None,
+        }
+    if status == "partial_success":
+        return {
+            "ok": False,
+            "protocol_error": (
+                "Удалённая команда выполнена, но risky receipt не подтверждён. "
+                "Состояние хоста изменено; требуется проверка."
+            ),
+            "command_result": {
+                "ok": True,
+                "stdout": result.get("stdout", ""),
+                "stderr": result.get("stderr", ""),
+                "exit_code": result.get("command_exit_code", 0),
+            },
+        }
+    return {
+        "ok": False,
+        "protocol_error": result.get("error_message") or "Операция relay не выполнена.",
+    }
+
+
+def machine_exit_code(result: dict[str, Any]) -> int:
+    status = result.get("operation_status")
+    if status == "succeeded":
+        return 0
+    if status == "command_failed":
+        return MACHINE_EXIT_COMMAND_FAILED
+    if status == "partial_success":
+        return MACHINE_EXIT_PARTIAL_SUCCESS
+    if status == "unknown":
+        return MACHINE_EXIT_UNKNOWN
+    return MACHINE_EXIT_NOT_STARTED
 
 
 def download_remote_file(
@@ -855,6 +1466,7 @@ def start_detached_daemon(args: argparse.Namespace) -> int:
     return 1
 
 
+
 def check_existing_session(name: str) -> bool:
     path = existing_session_file_path(name)
     if not path.exists():
@@ -869,6 +1481,15 @@ def check_existing_session(name: str) -> bool:
             )
             print(f"Сначала завершите её командой: stop --name {name}", file=sys.stderr)
             return True
+    except DaemonRequestError as exc:
+        if exc.request_sent:
+            print(
+                f"Состояние сессии {name} неизвестно: запрос status был отправлен, но ответ не получен. "
+                "Session-файл сохранён; новый daemon с этим именем не запускается.",
+                file=sys.stderr,
+            )
+            return True
+        remove_session_file(name)
     except RelayError:
         remove_session_file(name)
     return False
@@ -1049,12 +1670,6 @@ def daemon(args: argparse.Namespace) -> int:
                 if action not in {"exec", "sudo_exec", "download", "upload"}:
                     reply({"ok": False, "protocol_error": "Неизвестное действие relay."})
                     return
-                if action == "sudo_exec" and not args.enable_sudo:
-                    reply({
-                        "ok": False,
-                        "protocol_error": "Режим sudo не включён. Перезапустите daemon с параметром --enable-sudo.",
-                    })
-                    return
 
                 if action == "download":
                     remote_path = request.get("remote_path")
@@ -1115,58 +1730,82 @@ def daemon(args: argparse.Namespace) -> int:
                     return
 
                 command = request.get("command")
+                risky = request.get("risky", False)
+                receipt_path = request.get("receipt_path", DEFAULT_RISKY_RECEIPT_PATH)
+                transaction_id = request.get("transaction_id")
+                transaction_id_source = request.get("transaction_id_source")
+                change_target = request.get("change_target")
+                change_description = request.get("change_description", "Удалённое изменение")
+                machine_mode = request.get("machine_mode", False)
+                protocol_version = request.get("operation_protocol_version")
+                if protocol_version is not None and protocol_version != 1:
+                    reply({"ok": False, "protocol_error": "Неподдерживаемая версия протокола операции."})
+                    return
+                legacy_request = protocol_version is None
+                if legacy_request:
+                    transaction_id = str(uuid.uuid4())
+                    transaction_id_source = "relay"
+                    change_target = None
+                    change_description = "Удалённое изменение"
+                    machine_mode = False
+
                 if not isinstance(command, str) or not command.strip():
                     reply({"ok": False, "protocol_error": "Передана пустая удалённая команда."})
                     return
-                risky = request.get("risky", False)
-                receipt_path = request.get("receipt_path", DEFAULT_RISKY_RECEIPT_PATH)
-                if not isinstance(risky, bool):
-                    reply({"ok": False, "protocol_error": "Некорректный флаг risky."})
+                if not isinstance(risky, bool) or not isinstance(machine_mode, bool):
+                    reply({"ok": False, "protocol_error": "Некорректные флаги операции."})
                     return
-                if not isinstance(receipt_path, str) or not receipt_path.strip():
+                if not isinstance(receipt_path, str):
                     reply({"ok": False, "protocol_error": "Некорректный путь risky receipt."})
                     return
+                if not isinstance(transaction_id, str) or not isinstance(transaction_id_source, str):
+                    reply({"ok": False, "protocol_error": "Не передан корректный transaction_id."})
+                    return
+                if change_target is not None and not isinstance(change_target, str):
+                    reply({"ok": False, "protocol_error": "Некорректный target изменения."})
+                    return
+                if not isinstance(change_description, str):
+                    reply({"ok": False, "protocol_error": "Некорректное описание изменения."})
+                    return
+                try:
+                    validate_transaction_id(transaction_id)
+                    validate_receipt_path(receipt_path)
+                    change_target = validate_change_target(change_target)
+                    change_description = validate_change_description(change_description)
+                except RelayError as exc:
+                    reply({"ok": False, "protocol_error": str(exc)})
+                    return
+                if transaction_id_source not in {"caller", "relay"}:
+                    reply({"ok": False, "protocol_error": "Некорректный источник transaction_id."})
+                    return
 
+                cli_action = "sudo-exec" if action == "sudo_exec" else "exec"
                 with command_lock:
-                    if action == "sudo_exec":
-                        if sudo_password is None:
-                            result = {
-                                "ok": False,
-                                "protocol_error": "Режим sudo недоступен: sudo-пароль отсутствует в памяти daemon.",
-                            }
-                        else:
-                            result = execute_sudo_command(client, command, args.command_timeout, sudo_password)
-                    else:
-                        result = execute_remote_command(client, command, args.command_timeout)
-                    if result.get("ok") and result.get("exit_code") == 0 and risky:
-                        receipt = execute_risky_receipt(
-                            client,
-                            session=session,
-                            action=action,
-                            command=command,
-                            sudo=(action == "sudo_exec"),
-                            receipt_path=receipt_path,
-                            timeout_seconds=args.command_timeout,
-                            sudo_password=sudo_password,
-                        )
-                        result["risky_receipt"] = {
-                            "path": receipt.get("receipt_path"),
-                            "exit_code": receipt.get("exit_code"),
-                        }
-                        if receipt.get("exit_code") != 0:
-                            result = {
-                                "ok": False,
-                                "protocol_error": "Удалённая команда выполнена, но risky receipt записать не удалось.",
-                                "command_result": result,
-                                "receipt_result": receipt,
-                            }
-                reply(result)
+                    result = execute_command_operation(
+                        client,
+                        session=session,
+                        action=cli_action,
+                        command=command,
+                        risky=risky,
+                        receipt_path=receipt_path,
+                        transaction_id=transaction_id,
+                        transaction_id_source=transaction_id_source,
+                        change_target=change_target,
+                        change_description=change_description,
+                        timeout_seconds=args.command_timeout,
+                        sudo_password=sudo_password,
+                    )
+                if protocol_version == 1:
+                    reply(result)
+                else:
+                    reply(legacy_operation_response(result))
             except (socket.timeout, TimeoutError):
                 reply({"ok": False, "protocol_error": "Истекло время ожидания локального запроса."})
             except RelayError as exc:
                 reply({"ok": False, "protocol_error": str(exc)})
-            except Exception as exc:
-                reply({"ok": False, "protocol_error": f"Внутренняя ошибка daemon: {exc}"})
+            except Exception:
+                reply({"ok": False, "protocol_error": "Внутренняя ошибка daemon."})
+
 
     print(f"SSH-соединение установлено: {args.user}@{args.host}:{args.port}")
     print(f"Имя сессии: {session_name}")
@@ -1190,57 +1829,182 @@ def daemon(args: argparse.Namespace) -> int:
     return 0
 
 
-def print_command_result(result: dict[str, Any]) -> int:
+def print_legacy_command_result(result: dict[str, Any]) -> int:
     if not result.get("ok"):
         print(f"Ошибка relay: {result.get('protocol_error', 'неизвестная ошибка')}", file=sys.stderr)
         return 1
     if result.get("stdout"):
-        sys.stdout.write(result["stdout"])
+        sys.stdout.write(str(result["stdout"]))
     if result.get("stderr"):
-        sys.stderr.write(result["stderr"])
+        sys.stderr.write(str(result["stderr"]))
     return int(result.get("exit_code", 1))
 
 
-def exec_cmd(args: argparse.Namespace) -> int:
+def print_command_result(result: dict[str, Any]) -> int:
+    if result.get("stdout"):
+        sys.stdout.write(str(result["stdout"]))
+    if result.get("stderr"):
+        sys.stderr.write(str(result["stderr"]))
+
+    status = result.get("operation_status")
+    if status == "succeeded":
+        return int(result.get("command_exit_code") or 0)
+    if status == "command_failed":
+        return int(result.get("command_exit_code") or 1)
+    message = str(result.get("error_message") or "Неизвестная ошибка relay.")
+    if status == "partial_success":
+        print(
+            f"Ошибка relay: удалённая команда выполнена успешно, но receipt не подтверждён. {message} "
+            "Состояние хоста изменено; требуется проверка.",
+            file=sys.stderr,
+        )
+    elif status == "unknown":
+        print(f"Ошибка relay: результат удалённой команды неизвестен. {message}", file=sys.stderr)
+    else:
+        print(f"Ошибка relay: {message}", file=sys.stderr)
+    return 1
+
+
+def print_machine_result(result: dict[str, Any]) -> int:
+    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    return machine_exit_code(result)
+
+
+def local_machine_failure(
+    *,
+    session: dict[str, Any] | None,
+    action: str,
+    risky: bool,
+    transaction_id: str,
+    transaction_id_source: str,
+    change_target: str | None,
+    change_description: str,
+    receipt_path: str,
+    command: str,
+    unknown: bool,
+    error_code: str,
+    error_message: str,
+) -> dict[str, Any]:
+    result = machine_result_base(
+        session=session,
+        action=action,
+        risky=risky,
+        transaction_id=transaction_id,
+        transaction_id_source=transaction_id_source,
+        change_target=change_target,
+        change_description=change_description,
+        receipt_path=receipt_path,
+        command_hash_value=command_hash(command),
+        started_at_utc=utc_now(),
+    )
+    if unknown:
+        result["command_status"] = "unknown"
+        if risky:
+            result["receipt_status"] = "unknown"
+        return finish_machine_result(
+            result,
+            operation_status="unknown",
+            error_code=error_code,
+            error_stage="protocol",
+            error_message=error_message,
+        )
+    return finish_machine_result(
+        result,
+        operation_status="not_started",
+        error_code=error_code,
+        error_stage="session",
+        error_message=error_message,
+    )
+
+
+def run_exec_command(args: argparse.Namespace, *, daemon_action: str, cli_action: str) -> int:
+    transaction_id = args.transaction_id or str(uuid.uuid4())
+    transaction_id_source = "caller" if args.transaction_id else "relay"
+    change_description = args.change_description or "Удалённое изменение"
+    session: dict[str, Any] | None = None
     try:
         session_name = validate_session_name(args.name)
         session = read_session(session_name)
+        if (args.risky or args.json) and not supports_operation_protocol(session.get("version")):
+            raise RelayError(
+                f"Активный daemon имеет версию {session.get('version')}, требуется {__version__} "
+                "или совместимая более новая minor/patch-версия. Перезапустите daemon перед выполнением операции."
+            )
         response_timeout = int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)) + 10
         result = request_daemon(
             session,
-            "exec",
+            daemon_action,
             command=args.remote_command,
             risky=bool(args.risky),
             receipt_path=args.receipt_path,
+            transaction_id=transaction_id,
+            transaction_id_source=transaction_id_source,
+            change_target=args.change_target,
+            change_description=change_description,
+            machine_mode=bool(args.json),
+            operation_protocol_version=1,
             response_timeout=response_timeout,
         )
+        if "operation_status" not in result:
+            if not args.json and not args.risky:
+                return print_legacy_command_result(result)
+            raise DaemonRequestError(
+                "Daemon вернул ответ устаревшего формата; результат операции неизвестен.",
+                request_sent=True,
+                error_code="response_invalid",
+            )
+    except DaemonRequestError as exc:
+        if not exc.request_sent and exc.error_code == "daemon_unavailable":
+            remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
+        if args.json:
+            failure = local_machine_failure(
+                session=session,
+                action=cli_action,
+                risky=bool(args.risky),
+                transaction_id=transaction_id,
+                transaction_id_source=transaction_id_source,
+                change_target=args.change_target,
+                change_description=change_description,
+                receipt_path=args.receipt_path,
+                command=args.remote_command,
+                unknown=exc.request_sent,
+                error_code=exc.error_code,
+                error_message=str(exc),
+            )
+            return print_machine_result(failure)
+        print(str(exc), file=sys.stderr)
+        return 1
     except RelayError as exc:
-        remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
+        if args.json:
+            failure = local_machine_failure(
+                session=session,
+                action=cli_action,
+                risky=bool(args.risky),
+                transaction_id=transaction_id,
+                transaction_id_source=transaction_id_source,
+                change_target=args.change_target,
+                change_description=change_description,
+                receipt_path=args.receipt_path,
+                command=args.remote_command,
+                unknown=False,
+                error_code="session_unavailable",
+                error_message=str(exc),
+            )
+            return print_machine_result(failure)
         print(str(exc), file=sys.stderr)
         return 1
 
+    if args.json:
+        return print_machine_result(result)
     return print_command_result(result)
+
+
+def exec_cmd(args: argparse.Namespace) -> int:
+    return run_exec_command(args, daemon_action="exec", cli_action="exec")
 
 
 def sudo_exec_cmd(args: argparse.Namespace) -> int:
-    try:
-        session_name = validate_session_name(args.name)
-        session = read_session(session_name)
-        response_timeout = int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)) + 10
-        result = request_daemon(
-            session,
-            "sudo_exec",
-            command=args.remote_command,
-            risky=bool(args.risky),
-            receipt_path=args.receipt_path,
-            response_timeout=response_timeout,
-        )
-    except RelayError as exc:
-        remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    return print_command_result(result)
+    return run_exec_command(args, daemon_action="sudo_exec", cli_action="sudo-exec")
 
 
 def download_cmd(args: argparse.Namespace) -> int:
@@ -1258,8 +2022,12 @@ def download_cmd(args: argparse.Namespace) -> int:
             overwrite=bool(args.overwrite),
             create_dirs=bool(args.create_dirs),
         )
+    except DaemonRequestError as exc:
+        if not exc.request_sent:
+            remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
+        print(str(exc), file=sys.stderr)
+        return 1
     except RelayError as exc:
-        remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -1300,8 +2068,12 @@ def upload_cmd(args: argparse.Namespace) -> int:
             overwrite=bool(args.overwrite),
             create_dirs=bool(args.create_dirs),
         )
+    except DaemonRequestError as exc:
+        if not exc.request_sent:
+            remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
+        print(str(exc), file=sys.stderr)
+        return 1
     except RelayError as exc:
-        remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -1320,10 +2092,21 @@ def stop_one_session(name: str) -> int:
     try:
         session = read_session(name)
         result = request_daemon(session, "stop")
+    except DaemonRequestError as exc:
+        print(f"{name}: {exc}", file=sys.stderr)
+        if exc.request_sent:
+            print(
+                f"{name}: команда stop могла быть получена daemon; session-файл сохранён до повторной проверки status.",
+                file=sys.stderr,
+            )
+        else:
+            remove_session_file(name)
+            print(f"{name}: файл достоверно недоступной сессии удалён.", file=sys.stderr)
+        return 1
     except RelayError as exc:
         remove_session_file(name)
         print(f"{name}: {exc}", file=sys.stderr)
-        print(f"{name}: файл неактивной сессии удалён; завершение daemon не подтверждено.", file=sys.stderr)
+        print(f"{name}: повреждённый или недоступный session-файл удалён.", file=sys.stderr)
         return 1
 
     if not result.get("ok"):
@@ -1365,6 +2148,13 @@ def status_one_session(name: str, *, cleanup_stale: bool) -> int:
     try:
         session = read_session(name)
         result = request_daemon(session, "status")
+    except DaemonRequestError as exc:
+        if cleanup_stale and not exc.request_sent:
+            remove_session_file(name)
+        print(f"{name}: {exc}", file=sys.stderr)
+        if exc.request_sent:
+            print(f"{name}: состояние неизвестно; session-файл сохранён.", file=sys.stderr)
+        return 1
     except RelayError as exc:
         if cleanup_stale:
             remove_session_file(name)
@@ -1447,6 +2237,49 @@ def add_session_name_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_exec_operation_arguments(parser: argparse.ArgumentParser, *, sudo: bool) -> None:
+    parser.add_argument(
+        "--risky",
+        action="store_true",
+        help="После успешной команды записать безопасный JSONL receipt об изменении на удалённом хосте.",
+    )
+    parser.add_argument(
+        "--receipt-path",
+        type=parse_receipt_path,
+        default=DEFAULT_RISKY_RECEIPT_PATH,
+        help=f"Удалённый JSONL-файл для --risky, по умолчанию {DEFAULT_RISKY_RECEIPT_PATH}.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Вывести один машиночитаемый JSON-объект вместо обычного stdout/stderr.",
+    )
+    parser.add_argument(
+        "--transaction-id",
+        type=parse_transaction_id,
+        help="Идентификатор внешней транзакции; если не задан, relay создаёт UUIDv4.",
+    )
+    parser.add_argument(
+        "--change-target",
+        type=parse_change_target,
+        help="Безопасное описание изменяемого объекта без секретов.",
+    )
+    parser.add_argument(
+        "--change-description",
+        type=parse_change_description,
+        help="Краткое безопасное описание изменения без секретов.",
+    )
+    parser.add_argument(
+        "remote_command",
+        help=(
+            "Неинтерактивная команда для удалённого сервера без префикса sudo."
+            if sudo
+            else "Неинтерактивная команда для удалённого сервера."
+        ),
+    )
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = RussianArgumentParser(
         description="Локальный SSH-relay для коротких неинтерактивных удалённых команд.",
@@ -1526,17 +2359,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     exec_parser = subparsers.add_parser("exec", help="Выполнить одну команду через активный relay.")
     add_session_name_argument(exec_parser)
-    exec_parser.add_argument(
-        "--risky",
-        action="store_true",
-        help="После успешной команды записать JSONL receipt об изменении на удалённом хосте.",
-    )
-    exec_parser.add_argument(
-        "--receipt-path",
-        default=DEFAULT_RISKY_RECEIPT_PATH,
-        help=f"Удалённый JSONL-файл для --risky, по умолчанию {DEFAULT_RISKY_RECEIPT_PATH}.",
-    )
-    exec_parser.add_argument("remote_command", help="Неинтерактивная команда для удалённого сервера.")
+    add_exec_operation_arguments(exec_parser, sudo=False)
     exec_parser.set_defaults(handler=exec_cmd)
 
     sudo_exec_parser = subparsers.add_parser(
@@ -1544,17 +2367,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Выполнить одну неинтерактивную команду через sudo в активном relay.",
     )
     add_session_name_argument(sudo_exec_parser)
-    sudo_exec_parser.add_argument(
-        "--risky",
-        action="store_true",
-        help="После успешной sudo-команды записать JSONL receipt об изменении на удалённом хосте.",
-    )
-    sudo_exec_parser.add_argument(
-        "--receipt-path",
-        default=DEFAULT_RISKY_RECEIPT_PATH,
-        help=f"Удалённый JSONL-файл для --risky, по умолчанию {DEFAULT_RISKY_RECEIPT_PATH}.",
-    )
-    sudo_exec_parser.add_argument("remote_command", help="Неинтерактивная команда для удалённого сервера без префикса sudo.")
+    add_exec_operation_arguments(sudo_exec_parser, sudo=True)
     sudo_exec_parser.set_defaults(handler=sudo_exec_cmd)
 
     download_parser = subparsers.add_parser("download", help="Скачать один файл с удалённого сервера через активный relay.")
