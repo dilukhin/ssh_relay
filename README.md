@@ -10,15 +10,16 @@
 
 - машиночитаемый режим `--json` для `exec` и `sudo-exec`;
 - идентификаторы `transaction_id` и `receipt_id`;
-- безопасный risky receipt без полной команды;
+- безопасный risky receipt без полного текста команды;
 - `command_hash`, `receipt_hash` и цепочка `previous_receipt_hash`;
 - отдельные результаты `command_failed`, `partial_success`, `not_started` и `unknown`;
 - явные `--change-target` и `--change-description`;
-- защита receipt-файла правами `0600` и отказ от записи через символическую ссылку;
-- совместимость нового daemon с обычными запросами CLI 0.5.x;
-- распознавание старой записи receipt 0.5.x как однократного начального anchor.
+- блокировка повторного подтверждённого `transaction_id`;
+- проверка последней записи receipt до запуска изменяющей команды;
+- защита receipt-файла правами `0600` и отказ от записи через конечную символическую ссылку;
+- совместимость нового daemon с обычными запросами CLI 0.5.x.
 
-Новые команды `inspect`, `exec-script` и `sudo-exec-script` в эту версию не входят.
+Команды `inspect`, `exec-script` и `sudo-exec-script` в версию 0.6.0 не входят.
 
 ## Возможности
 
@@ -41,15 +42,18 @@ Relay предназначен только для коротких неинте
 Не поддерживаются:
 
 - интерактивный stdin;
-- редакторы, интерактивные shell, `top`, `less`, `passwd`;
+- интерактивный shell, редакторы, `top`, `less`, `passwd`;
 - команды с запросом пароля;
 - длительные процессы и команды с большим выводом;
 - параллельное выполнение команд;
 - рекурсивная передача каталогов;
 - `sudo-download` и `sudo-upload`;
-- специальные файлы и SCP-режим.
+- специальные файлы и SCP-режим;
+- передача сложной команды через `--command-file` или `--command-stdin`.
 
 Псевдотерминал не создаётся. Максимальный суммарный stdout/stderr команды — 4 МиБ. Если timeout или лимит вывода сработал после запуска команды, результат считается `unknown`: удалённое состояние могло измениться.
+
+Сложные inline-команды с несколькими уровнями quoting, особенно в PowerShell 5.1, следует разбивать на короткие команды либо предварительно загружать как отдельный проверенный файл. Текущее состояние quoting-задач описано в [`UX_FINDINGS.md`](UX_FINDINGS.md).
 
 ## Требования и установка
 
@@ -80,7 +84,7 @@ py ssh_relay.py --help
 py ssh_relay.py exec --help
 ```
 
-Ожидаемая версия:
+Ожидаемый вывод версии:
 
 ```text
 ssh_relay 0.6.0
@@ -90,7 +94,7 @@ ssh_relay 0.6.0
 
 Relay использует `RejectPolicy` и не принимает неизвестный host key автоматически.
 
-`cmd.exe`:
+### cmd.exe
 
 ```cmd
 if not exist "%USERPROFILE%\.ssh" mkdir "%USERPROFILE%\.ssh"
@@ -98,7 +102,7 @@ ssh-keyscan -H 198.51.100.42 >> "%USERPROFILE%\.ssh\known_hosts"
 ssh-keygen -lf "%USERPROFILE%\.ssh\known_hosts"
 ```
 
-PowerShell:
+### PowerShell
 
 ```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.ssh" | Out-Null
@@ -147,7 +151,7 @@ py ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro -i "%USE
 py ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro --enable-sudo
 ```
 
-Daemon запрашивает sudo-пароль локально, проверяет его и хранит только в памяти процесса. Пароль не записывается в session-файл и не включается в протокол.
+Daemon запрашивает sudo-пароль локально, проверяет его и хранит только в памяти процесса. Пароль не записывается в session-файл и не включается в локальный протокол.
 
 Фоновый запуск по ключу:
 
@@ -157,16 +161,31 @@ py ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro -i "%USE
 
 `--detach` несовместим с `--ask-key-passphrase` и `--enable-sudo`.
 
-После замены `ssh_relay.py` работающий daemon обязательно нужно остановить и запустить заново. Session-файл версии 0.5.x не означает, что новый код уже работает в старом процессе.
+После замены `ssh_relay.py` работающий daemon обязательно нужно остановить и запустить заново. Наличие session-файла версии 0.6.0 не доказывает, что старый процесс уже использует новый код.
 
 ## Диагностика перед работой
+
+Если relay уже запущен, агент не должен использовать прямой `ssh`.
 
 ```cmd
 py ssh_relay.py status --name prod
 py ssh_relay.py exec --name prod "hostname && whoami && pwd"
 ```
 
-Если relay уже запущен, агент не должен использовать прямой `ssh`.
+Для PowerShell код завершения проверяется через `$LASTEXITCODE`:
+
+```powershell
+py ssh_relay.py status --name prod
+$LASTEXITCODE
+```
+
+Для `cmd.exe` код следует проверять в той же командной строке:
+
+```cmd
+py ssh_relay.py status --name prod & echo %ERRORLEVEL%
+```
+
+В Far Manager не следует выполнять `%ERRORLEVEL%` отдельной следующей командой: к этому моменту значение уже может относиться к другому процессу.
 
 ## Обычный текстовый режим
 
@@ -182,29 +201,29 @@ py ssh_relay.py exec --name prod "sh -c 'printf stdout-ok; printf stderr-ok >&2;
 - вызывающему процессу возвращается удалённый exit code;
 - ошибка relay возвращает код `1` с русской диагностикой.
 
-При `partial_success` текстовый режим возвращает `1`, но явно сообщает, что основная команда уже выполнена и требуется проверка.
+Если основная команда выполнена, но receipt не подтверждён, текстовый режим возвращает `1` и явно сообщает о частичном успехе.
 
 ## Risky-операция и безопасный receipt
 
-Пример:
+Пример обычной risky-операции:
 
 ```cmd
 py ssh_relay.py exec --name prod --risky --change-target "/tmp/example" --change-description "Создание тестового каталога" "mkdir -p /tmp/example"
 ```
 
-Путь по умолчанию:
+Путь receipt по умолчанию:
 
 ```text
 ~/.local/state/agent-safe/changes.jsonl
 ```
 
-Системный receipt для `sudo-exec`:
+Пример системного receipt для `sudo-exec`:
 
 ```cmd
 py ssh_relay.py sudo-exec --name prod --risky --receipt-path "/var/lib/agent-safe/changes.jsonl" --change-target "systemd:nginx.service" --change-description "Перезапуск службы" "systemctl restart nginx"
 ```
 
-Receipt содержит безопасные метаданные:
+Receipt содержит:
 
 - `transaction_id` и `receipt_id`;
 - имя сессии, host, port и SSH-пользователя;
@@ -216,7 +235,14 @@ Receipt содержит безопасные метаданные:
 
 Полный stdout/stderr в удалённый receipt не записывается.
 
-Перед изменяющей командой relay проверяет последнюю запись журнала и отсутствие уже записанного `transaction_id`. Повтор подтверждённой транзакции блокируется до запуска основной команды. Повреждённый self-hash блокирует запуск основной команды. Последняя запись формата 0.5.x, содержащая `tool=ssh_relay`, `status=done` и старое поле `command`, принимается только как однократный legacy anchor: её канонический SHA-256 становится `previous_receipt_hash` первой записи 0.6.0.
+Перед изменяющей командой relay:
+
+1. читает последнюю строку журнала;
+2. проверяет её `receipt_hash` либо принимает последнюю запись 0.5.x как однократный legacy anchor;
+3. ищет уже записанный `transaction_id`;
+4. только после успешного preflight запускает основную команду.
+
+Повтор подтверждённой транзакции блокируется до запуска основной команды. Повреждённая последняя запись также блокирует запуск.
 
 При записи relay:
 
@@ -225,9 +251,9 @@ Receipt содержит безопасные метаданные:
 - проверяет, что конечный путь не является символической ссылкой;
 - после append повторно читает последнюю строку и проверяет `receipt_id` и self-hash.
 
-Для системного receipt родительский каталог должен быть доверенным и недоступным для записи посторонним пользователям. Проверка конечной символической ссылки не устраняет гонки в недоверенном каталоге. Один daemon сериализует собственные операции, но сторонние параллельные писатели в тот же JSONL не поддерживаются и могут привести к `receipt_status=unknown`.
+Для системного receipt родительский каталог должен быть доверенным и недоступным для записи посторонним пользователям. Проверка конечной символической ссылки не устраняет гонки в недоверенном каталоге.
 
-Полноценной криптографической подписи нет. Hash-цепочка обнаруживает часть случаев изменения или перестановки журнала, но не защищает от владельца файла, который может пересчитать всю цепочку.
+Hash-цепочка не является цифровой подписью. Владелец файла может пересчитать всю цепочку.
 
 ## Машинный режим JSON
 
@@ -235,13 +261,13 @@ Receipt содержит безопасные метаданные:
 py ssh_relay.py exec --name prod --json --risky --transaction-id "agent-safe:tx-001" --change-target "/tmp/example" --change-description "Создание тестового каталога" "mkdir -p /tmp/example"
 ```
 
-В режиме `--json` stdout CLI содержит ровно один JSON-объект и перевод строки. Локальный stderr при штатно сформированном результате пуст. Удалённые stdout/stderr находятся в полях JSON.
+В режиме `--json` stdout CLI содержит ровно один JSON-объект и перевод строки. При штатно сформированном машинном результате локальный stderr пуст. Удалённые stdout/stderr находятся в полях JSON.
 
-Основные статусы:
+Основные значения `operation_status`:
 
 - `succeeded` — команда успешна; для risky receipt подтверждён;
 - `command_failed` — получен ненулевой удалённый exit code;
-- `partial_success` — команда успешна, но receipt имеет `failed` или `unknown`;
+- `partial_success` — команда успешна, но receipt имеет статус `failed` или `unknown`;
 - `not_started` — достоверно известно, что основная команда не запускалась;
 - `unknown` — relay не может достоверно определить результат команды.
 
@@ -271,7 +297,7 @@ py ssh_relay.py exec --name prod --json --risky --transaction-id "agent-safe:tx-
 }
 ```
 
-После кода `12` или `13` агент должен остановить последующие изменяющие операции и выполнить read-only verify, поиск receipt по идентификатору либо rollback по правилам `agent-safe`.
+После кода `12` или `13` агент должен остановить последующие изменяющие операции и выполнить read-only verify, поиск receipt по идентификатору либо rollback по правилам вызывающей системы.
 
 ## transaction_id
 
@@ -285,133 +311,92 @@ py ssh_relay.py exec --name prod --json --risky --transaction-id "agent-safe:tx-
 
 Если ID не передан, relay создаёт UUIDv4 и возвращает `transaction_id_source=relay`. Адаптер `agent-safe` должен передавать собственный ID заранее, чтобы он был известен даже при потере ответа.
 
-## Совместимость 0.5.x
-
-- новый daemon 0.6.0 принимает обычные запросы CLI 0.5.x и возвращает ответ старого формата;
-- для такого запроса daemon сам создаёт `transaction_id`;
-- новый CLI допускает обычную нерискованную команду через старый daemon;
-- `--risky` и `--json` перед отправкой команды требуют daemon с поддержкой протокола 0.6.0;
-- старый daemon нужно перезапустить перед проверкой новых режимов.
-
-## download и upload
+## Именованные сессии
 
 ```cmd
-py ssh_relay.py download --name prod "/var/log/app.log" ".\downloads\app.log" --create-dirs
-py ssh_relay.py upload --name prod ".\config.json" "/tmp/config.json" --overwrite
+py ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro
+py ssh_relay.py daemon --name test --host 198.51.100.43 --user donpedro
+py ssh_relay.py list
+py ssh_relay.py status --all
 ```
 
-Поддерживается только один обычный файл. Каталоги и специальные файлы отклоняются. Существующий файл не перезаписывается без `--overwrite`.
+Session-файлы содержат локальные токены доступа к daemon. Они хранятся в пользовательском каталоге состояния, должны иметь ограниченные права и не должны попадать в Git.
 
-Локальный файл для upload читает CLI-процесс и передаёт содержимое daemon, поэтому рабочие каталоги CLI и daemon могут отличаться. Windows-style удалённые пути нормализуются для SFTP.
+## Передача файлов
 
-## status, list и stop
+Скачать файл:
 
 ```cmd
-py ssh_relay.py status --name prod
-py ssh_relay.py status --all
-py ssh_relay.py list
+py ssh_relay.py download --name prod /tmp/result.txt .\result.txt
+```
+
+Загрузить файл:
+
+```cmd
+py ssh_relay.py upload --name prod .\config.json /tmp/config.json
+```
+
+Перезапись требует явного `--overwrite`. Создание отсутствующих каталогов требует `--create-dirs`. Передаются только одиночные обычные файлы с учётом настроенных лимитов размера и времени.
+
+## Остановка daemon
+
+```cmd
 py ssh_relay.py stop --name prod
 py ssh_relay.py stop --all
 ```
 
-`status` выполняет аутентифицированный запрос. `stop` завершает daemon через токен и не посылает сигнал по PID из session-файла, поэтому устаревший PID не используется для завершения постороннего процесса. Если запрос уже отправлен, но ответ потерян, session-файл сохраняется: relay не объявляет daemon остановленным или неактивным без подтверждения.
+`stop` отправляется только после аутентифицированного обращения к локальному daemon. Процесс не завершается по одному PID из session-файла.
 
-## Session-файлы
+Если запрос мог быть отправлен, но подтверждение не получено, session-файл сохраняется до повторной проверки `status`. Это предотвращает потерю доступа к daemon при неопределённом результате.
 
-Расположение:
+## Совместимость с 0.5.x
 
-```text
-Windows: %LOCALAPPDATA%\ssh_relay\sessions\<name>.json
-Linux:   ${XDG_STATE_HOME:-~/.local/state}/ssh_relay/sessions/<name>.json
-```
+- daemon 0.6.0 принимает обычные запросы CLI 0.5.x и возвращает ответ старого формата;
+- новый CLI допускает обычную нерискованную команду через старый daemon;
+- `--risky` и `--json` требуют daemon с поддержкой протокола 0.6.0;
+- после обновления работающий daemon нужно перезапустить.
 
-Session-файл содержит локальный токен доступа. Он не содержит SSH-пароль, sudo-пароль, passphrase или приватный ключ.
+## Проверки
 
-На POSIX каталоги создаются с правами `0700`, session-файлы — `0600`. Session-файлы нельзя добавлять в Git или передавать недоверенному процессу.
-
-## Инструкция для OpenCode
-
-```text
-Удалённый сервер prod доступен через уже запущенный локальный SSH relay.
-Не используй прямой ssh и не запрашивай пароль.
-
-Перед работой выполни:
-py ssh_relay.py status --name prod
-py ssh_relay.py exec --name prod "hostname && whoami && pwd"
-
-Обычная команда:
-py ssh_relay.py exec --name prod "<remote-command>"
-
-Изменяющая команда:
-py ssh_relay.py exec --name prod --json --risky --transaction-id "<transaction-id>" --change-target "<target>" --change-description "<description>" "<remote-command>"
-
-Изменяющая root-команда:
-py ssh_relay.py sudo-exec --name prod --json --risky --receipt-path "/var/lib/agent-safe/changes.jsonl" --transaction-id "<transaction-id>" --change-target "<target>" --change-description "<description>" "<remote-command>"
-
-Не запускай интерактивные команды, запросы пароля, длительные процессы и команды с большим выводом.
-После process code 12 или 13 не продолжай изменяющие операции без verify или rollback.
-```
-
-## Безопасность
-
-- SSH-пароль, passphrase и sudo-пароль не сохраняются на диск;
-- токен session-файла не выводится в штатной диагностике;
-- daemon слушает только `127.0.0.1`;
-- каждый запрос проверяет токен;
-- неизвестный host key не принимается автоматически;
-- полная risky-команда не сохраняется в receipt;
-- секреты всё равно нельзя передавать в командной строке: их может раскрыть локальный список процессов, shell history, удалённый процесс или перебор низкоэнтропийного значения по `command_hash`;
-- сам удалённый stdout/stderr может содержать секрет по воле команды, поэтому агент не должен запускать команды, выводящие секреты;
-- `change-target` и `change-description` считаются безопасными метаданными и не должны содержать секреты;
-- session-файл sudo-сессии фактически даёт доступ к разрешённому `sudo-exec` через daemon и требует усиленной защиты;
-- возможность произвольного удалённого выполнения нельзя расширять без оценки угроз.
-
-## Проверки без SSH-сервера
-
-Из корня комплекта:
+Минимальные локальные проверки:
 
 ```cmd
 py -m py_compile ssh_relay.py
 py tests\test_machine_protocol.py
 py tests\test_local_tcp_protocol.py
 py ssh_relay.py --version
-py ssh_relay.py exec --help
-py ssh_relay.py sudo-exec --help
 ```
 
-`test_machine_protocol.py` проверяет матрицу статусов, коды завершения, отсутствие команды в receipt, self-hash, legacy anchor и параметры защиты файла.
-
-`test_local_tcp_protocol.py` запускает настоящий локальный TCP daemon с подменённым SSH-транспортом и проверяет:
-
-- запрос старого CLI 0.5.x;
-- новый JSON-протокол;
-- stdout JSON;
-- корректный `stop`.
-
-## Минимальная проверка с сервером
-
-После замены файла сначала перезапустите daemon.
+Ручной smoke-тест:
 
 ```cmd
-py ssh_relay.py stop --name prod
-py ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro
 py ssh_relay.py status --name prod
-py ssh_relay.py exec --name prod --json "printf protocol-ok"
-py ssh_relay.py exec --name prod --json "sh -c 'printf stdout-ok; printf stderr-ok >&2; exit 7'"
-py ssh_relay.py exec --name prod --json --risky --transaction-id "manual:test-001" --change-target "/tmp/ssh-relay-risky-test.txt" --change-description "Создание тестового файла" "touch /tmp/ssh-relay-risky-test.txt"
-py ssh_relay.py exec --name prod "tail -n 1 ~/.local/state/agent-safe/changes.jsonl"
+py ssh_relay.py exec --name prod "hostname && whoami && pwd"
+py ssh_relay.py exec --name prod --json "printf json-ok"
 ```
 
-Для `cmd.exe` проверяйте exit code в той же строке:
+Перед ручной проверкой изменённого daemon его обязательно нужно остановить и запустить заново.
 
-```cmd
-cmd /V:ON /C "py ssh_relay.py exec --name prod --json ^"sh -c 'exit 7'^" & echo Exit code: !ERRORLEVEL!"
-```
+Расширенная приёмка Issue #2 дополнительно требует реальных risky-сценариев на Linux, ошибок и неопределённого статуса receipt, сетевого разрыва после отправки команды и двух именованных сессий без смешения target.
 
-PowerShell использует `$LASTEXITCODE`.
+## Документы проекта
 
-В Far Manager не проверяйте `%ERRORLEVEL%` отдельной следующей командой: она может показать код уже другого процесса.
+- [`RISKY_OPERATION_CONTRACT.md`](RISKY_OPERATION_CONTRACT.md) — фактический машинный контракт версии 1;
+- [`SSH_RELAY_CHANGE_PLAN.md`](SSH_RELAY_CHANGE_PLAN.md) — состояние этапов реализации и дальнейшие работы;
+- [`AGENT_SAFE_INTEGRATION_FINDINGS.md`](AGENT_SAFE_INTEGRATION_FINDINGS.md) — выводы интеграции с `agent-safe`;
+- [`UX_FINDINGS.md`](UX_FINDINGS.md) — состояние quoting- и UX-задач;
+- [`IMPLEMENTATION_REPORT.md`](IMPLEMENTATION_REPORT.md) — отчёт о реализации P0;
+- [`MANUAL_TEST_REPORT_0.6.0.md`](MANUAL_TEST_REPORT_0.6.0.md) — протокол краткой ручной проверки;
+- [`GITHUB_CONNECTOR_WORKFLOW.md`](GITHUB_CONNECTOR_WORKFLOW.md) — регламент публикации через GitHub-коннектор.
 
-## Непроверенное в этом комплекте
+## Безопасность
 
-Локальные синтаксические, модульные и TCP-протокольные проверки выполнены. Реальный SSH-сервер, `sudo-exec`, фактическая запись JSONL на Linux, сбой записи receipt и потеря SSH-соединения требуют отдельного ручного прогона после перезапуска daemon.
+- SSH- и sudo-пароли не сохраняются на диск;
+- токены session-файлов не выводятся пользователю;
+- приватные ключи и passphrase не включаются в логи;
+- host key проверяется через `known_hosts`;
+- локальный сервер слушает только `127.0.0.1`;
+- полный текст risky-команды не записывается в receipt;
+- stdout и stderr могут содержать данные, которые вывела сама удалённая команда, поэтому команды с секретами в выводе недопустимы;
+- receipt и session-файлы не должны попадать в Git;
+- неподдерживаемые интерактивные сценарии следует явно отклонять, а не пытаться автоматизировать обходом ограничений.
