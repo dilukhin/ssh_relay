@@ -12,7 +12,7 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
   py ssh_relay.py stop
 """
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 import argparse
 import atexit
@@ -43,6 +43,11 @@ DEFAULT_DOWNLOAD_MAX_SIZE = 64 * 1024 * 1024
 DEFAULT_UPLOAD_TIMEOUT = 300
 DEFAULT_UPLOAD_MAX_SIZE = 64 * 1024 * 1024
 DEFAULT_RISKY_RECEIPT_PATH = "~/.local/state/agent-safe/changes.jsonl"
+OPERATION_PROTOCOL_VERSION = 1
+DEFAULT_RECONNECT_WAIT = 30
+SSH_KEEPALIVE_INTERVAL = 30
+SSH_MONITOR_INTERVAL = 1
+RECONNECT_DELAYS = (1, 2, 5, 10, 30)
 MACHINE_EXIT_NOT_STARTED = 10
 MACHINE_EXIT_COMMAND_FAILED = 11
 MACHINE_EXIT_PARTIAL_SUCCESS = 12
@@ -270,17 +275,32 @@ def command_hash(command: str) -> str:
     return sha256_prefixed(command.encode("utf-8"))
 
 
-def supports_operation_protocol(version: object) -> bool:
-    """Проверяет поддержку машинного протокола v1 без требования точного patch."""
+def supports_operation_protocol(session_or_version: object) -> bool:
+    """Проверяет поддержку машинного протокола независимо от версии программы."""
+    session_mapping = isinstance(session_or_version, dict)
+    if session_mapping:
+        advertised = session_or_version.get("operation_protocol_version")
+        if advertised is not None:
+            return advertised == OPERATION_PROTOCOL_VERSION
+        version = session_or_version.get("version")
+    else:
+        version = session_or_version
+
     if not isinstance(version, str):
         return False
     match = VERSION_PATTERN.fullmatch(version)
-    current = VERSION_PATTERN.fullmatch(__version__)
-    if match is None or current is None:
+    if match is None:
         return False
     major, minor, _ = (int(part) for part in match.groups())
-    current_major, current_minor, _ = (int(part) for part in current.groups())
-    return major == current_major and minor >= current_minor
+
+    # Session-файлы 0.6.x создавались до явного поля версии протокола,
+    # но уже поддерживали v1. Для session-файлов 0.7+ поле обязательно.
+    if session_mapping:
+        return major == 0 and minor == 6
+
+    # Строковый вызов сохранён для совместимости со старыми тестами/проверками:
+    # он отвечает только о семействах программы, где протокол v1 известен.
+    return major == 0 and minor >= 6
 
 
 def stored_receipt_hash(payload: dict[str, Any]) -> str:
@@ -571,6 +591,16 @@ def execute_remote_command(
                 time.sleep(0.01)
 
         exit_code = channel.recv_exit_status()
+        if exit_code < 0:
+            transport = client.get_transport()
+            if transport is None or not transport.is_active():
+                raise RemoteCommandError(
+                    "SSH-канал завершился без достоверного exit status; результат команды неизвестен.",
+                    error_code="command_result_unknown",
+                    command_started=True,
+                    stdout=b"".join(output).decode("utf-8", errors="replace"),
+                    stderr=b"".join(errors).decode("utf-8", errors="replace"),
+                )
         return {
             "ok": True,
             "stdout": b"".join(output).decode("utf-8", errors="replace"),
@@ -862,6 +892,7 @@ def machine_result_base(
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
+        "operation_protocol_version": OPERATION_PROTOCOL_VERSION,
         "tool": "ssh_relay",
         "tool_version": __version__,
         "action": action,
@@ -1535,27 +1566,45 @@ def daemon(args: argparse.Namespace) -> int:
     else:
         password = getpass.getpass(f"SSH-пароль для {args.user}@{args.host}: ")
 
-    client = paramiko.SSHClient()
+    def safe_ssh_error(exc: BaseException) -> str:
+        """Возвращает диагностику reconnect без содержимого учётных данных."""
+        return exc.__class__.__name__
+
+    def open_ssh_client() -> Any:
+        """Открывает проверенное SSH-соединение, пригодное для последующего reconnect."""
+        new_client = paramiko.SSHClient()
+        try:
+            if args.known_hosts:
+                new_client.load_system_host_keys(args.known_hosts)
+            else:
+                new_client.load_system_host_keys()
+            new_client.set_missing_host_key_policy(paramiko.RejectPolicy())
+            new_client.connect(
+                args.host,
+                port=args.port,
+                username=args.user,
+                password=password,
+                key_filename=identity_file,
+                passphrase=passphrase,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=10,
+            )
+            transport = new_client.get_transport()
+            if transport is None or not transport.is_active() or not transport.is_authenticated():
+                raise RelayError("SSH-транспорт не перешёл в активное аутентифицированное состояние.")
+            transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
+            return new_client
+        except Exception:
+            new_client.close()
+            raise
+
     try:
-        if args.known_hosts:
-            client.load_system_host_keys(args.known_hosts)
-        else:
-            client.load_system_host_keys()
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        client.connect(
-            args.host,
-            port=args.port,
-            username=args.user,
-            password=password,
-            key_filename=identity_file,
-            passphrase=passphrase,
-            look_for_keys=False,
-            allow_agent=False,
-            timeout=10,
-        )
+        client = open_ssh_client()
     except Exception as exc:
-        client.close()
-        print(f"Не удалось установить SSH-соединение: {exc}", file=sys.stderr)
+        password = None
+        passphrase = None
+        print(f"Не удалось установить SSH-соединение: {safe_ssh_error(exc)}", file=sys.stderr)
         if identity_file:
             print(
                 "Проверьте доступность сервера, файл ключа или сертификата, его passphrase "
@@ -1568,9 +1617,6 @@ def daemon(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         return 1
-    finally:
-        password = None
-        passphrase = None
 
     if args.enable_sudo:
         sudo_password = getpass.getpass(f"sudo-пароль для {args.user}@{args.host}: ")
@@ -1578,6 +1624,8 @@ def daemon(args: argparse.Namespace) -> int:
             verify_sudo_password(client, sudo_password, args.command_timeout)
         except RelayError as exc:
             sudo_password = None
+            password = None
+            passphrase = None
             client.close()
             print(str(exc), file=sys.stderr)
             return 1
@@ -1591,6 +1639,9 @@ def daemon(args: argparse.Namespace) -> int:
         server.settimeout(0.5)
     except OSError as exc:
         server.close()
+        sudo_password = None
+        password = None
+        passphrase = None
         client.close()
         print(f"Не удалось открыть локальный порт relay: {exc}", file=sys.stderr)
         return 1
@@ -1601,6 +1652,7 @@ def daemon(args: argparse.Namespace) -> int:
         "schema_version": 2,
         "name": session_name,
         "version": __version__,
+        "operation_protocol_version": OPERATION_PROTOCOL_VERSION,
         "host": args.host,
         "port": args.port,
         "user": args.user,
@@ -1613,29 +1665,218 @@ def daemon(args: argparse.Namespace) -> int:
         "download_max_size": args.download_max_size,
         "upload_timeout": args.upload_timeout,
         "upload_max_size": args.upload_max_size,
+        "reconnect_wait": DEFAULT_RECONNECT_WAIT,
     }
     try:
         session_path = write_session(session_name, session)
     except OSError as exc:
         server.close()
+        sudo_password = None
+        password = None
+        passphrase = None
         client.close()
         print(f"Не удалось безопасно записать файл сессии: {exc}", file=sys.stderr)
         return 1
 
     stop_event = threading.Event()
+    reconnect_event = threading.Event()
     command_lock = threading.Lock()
+    client_lock = threading.Lock()
+    connection_condition = threading.Condition()
+    connection_state = "connected"
+    connection_error: str | None = None
+    reconnect_attempt = 0
     cleanup_done = False
 
+    def client_is_active(candidate: Any) -> bool:
+        try:
+            transport = candidate.get_transport()
+            return bool(transport is not None and transport.is_active() and transport.is_authenticated())
+        except Exception:
+            return False
+
+    def current_client() -> Any:
+        with client_lock:
+            return client
+
+    def mark_connection_lost(error: BaseException | None = None) -> None:
+        """Переводит SSH в восстановление и будит reconnect-worker."""
+        nonlocal connection_state, connection_error
+        error_text = safe_ssh_error(error) if error is not None else "SSH-транспорт недоступен."
+        should_report = False
+        with connection_condition:
+            if stop_event.is_set():
+                return
+            if connection_state == "connected":
+                should_report = True
+                connection_state = "reconnecting"
+                connection_error = error_text
+            elif error is not None:
+                connection_error = error_text
+            connection_condition.notify_all()
+        reconnect_event.set()
+        if should_report:
+            print(f"SSH-соединение потеряно: {connection_error}", file=sys.stderr, flush=True)
+            print("Запущено автоматическое восстановление SSH-соединения.", file=sys.stderr, flush=True)
+
+    def connection_snapshot() -> dict[str, Any]:
+        candidate = current_client()
+        if not client_is_active(candidate):
+            mark_connection_lost()
+        with connection_condition:
+            return {
+                "ssh_status": connection_state,
+                "last_error": connection_error,
+                "reconnect_attempt": reconnect_attempt,
+            }
+
+    def wait_for_connection(timeout_seconds: float) -> Any:
+        """Ждёт восстановления SSH, но не выполняет и не повторяет удалённую операцию."""
+        candidate = current_client()
+        if client_is_active(candidate):
+            return candidate
+
+        mark_connection_lost()
+        deadline = time.monotonic() + timeout_seconds
+        with connection_condition:
+            while True:
+                if stop_event.is_set():
+                    raise RelayError("Daemon завершает работу; удалённый запрос не выполнялся.")
+                if connection_state == "connected":
+                    candidate = current_client()
+                    if client_is_active(candidate):
+                        return candidate
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RelayError(
+                        "SSH-соединение сейчас восстанавливается. Daemon работает, но удалённый запрос "
+                        f"не выполнялся за {int(timeout_seconds)} с ожидания. Повторите команду позднее."
+                    )
+                connection_condition.wait(timeout=remaining)
+
+    def run_transfer_operation(operation_name: str, operation: Any) -> dict[str, Any]:
+        """Выполняет передачу один раз; после обрыва автоматически её не повторяет."""
+        with command_lock:
+            operation_client = wait_for_connection(DEFAULT_RECONNECT_WAIT)
+            try:
+                return operation(operation_client)
+            except Exception as exc:
+                if not client_is_active(operation_client):
+                    mark_connection_lost(exc)
+                    raise RelayError(
+                        f"SSH-соединение потеряно во время {operation_name}. Результат операции неизвестен; "
+                        "операция автоматически не повторялась. Relay восстанавливает соединение для следующих запросов."
+                    ) from exc
+                raise
+
+    def reconnect_worker() -> None:
+        """Последовательно восстанавливает SSH с ограниченным backoff."""
+        nonlocal client, connection_state, connection_error, reconnect_attempt
+        delay_index = 0
+        while not stop_event.is_set():
+            reconnect_event.wait(timeout=0.5)
+            if stop_event.is_set():
+                return
+            if not reconnect_event.is_set():
+                continue
+
+            candidate = current_client()
+            if client_is_active(candidate):
+                with connection_condition:
+                    connection_state = "connected"
+                    connection_error = None
+                    reconnect_attempt = 0
+                    connection_condition.notify_all()
+                reconnect_event.clear()
+                delay_index = 0
+                continue
+
+            with connection_condition:
+                connection_state = "reconnecting"
+                reconnect_attempt += 1
+                attempt = reconnect_attempt
+                connection_condition.notify_all()
+
+            print(
+                f"Попытка восстановления SSH-соединения {attempt}: {args.user}@{args.host}:{args.port}",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                new_client = open_ssh_client()
+            except Exception as exc:
+                if stop_event.is_set():
+                    return
+                delay = RECONNECT_DELAYS[min(delay_index, len(RECONNECT_DELAYS) - 1)]
+                delay_index += 1
+                with connection_condition:
+                    connection_state = "disconnected"
+                    connection_error = safe_ssh_error(exc)
+                    connection_condition.notify_all()
+                print(
+                    f"Восстановить SSH-соединение не удалось: {connection_error}. "
+                    f"Следующая попытка через {delay} с.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                stop_event.wait(delay)
+                continue
+
+            if stop_event.is_set():
+                new_client.close()
+                return
+
+            with client_lock:
+                old_client = client
+                client = new_client
+            if old_client is not new_client:
+                try:
+                    old_client.close()
+                except Exception:
+                    pass
+
+            with connection_condition:
+                connection_state = "connected"
+                connection_error = None
+                reconnect_attempt = 0
+                connection_condition.notify_all()
+            reconnect_event.clear()
+            delay_index = 0
+            print(
+                f"SSH-соединение восстановлено: {args.user}@{args.host}:{args.port}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def connection_monitor() -> None:
+        """Контролирует состояние транспорта между локальными запросами."""
+        while not stop_event.wait(SSH_MONITOR_INTERVAL):
+            candidate = current_client()
+            if not client_is_active(candidate):
+                mark_connection_lost()
+
     def cleanup() -> None:
-        nonlocal cleanup_done, sudo_password
+        nonlocal cleanup_done, sudo_password, password, passphrase, connection_state
         if cleanup_done:
             return
         cleanup_done = True
+        stop_event.set()
+        reconnect_event.set()
+        with connection_condition:
+            connection_state = "stopping"
+            connection_condition.notify_all()
         sudo_password = None
+        password = None
+        passphrase = None
         remove_session_file(session_name, auth_token)
-        client.close()
+        try:
+            current_client().close()
+        except Exception:
+            pass
 
     atexit.register(cleanup)
+    threading.Thread(target=reconnect_worker, name=f"ssh-relay-reconnect-{session_name}", daemon=True).start()
+    threading.Thread(target=connection_monitor, name=f"ssh-relay-monitor-{session_name}", daemon=True).start()
 
     def handle_client(conn: socket.socket) -> None:
         with conn:
@@ -1655,10 +1896,16 @@ def daemon(args: argparse.Namespace) -> int:
 
                 action = request.get("action")
                 if action == "status":
+                    snapshot = connection_snapshot()
                     reply({
                         "ok": True,
-                        "status": "active",
+                        "status": "active" if snapshot["ssh_status"] == "connected" else snapshot["ssh_status"],
+                        "daemon_status": "active",
+                        "ssh_status": snapshot["ssh_status"],
+                        "last_error": snapshot["last_error"],
+                        "reconnect_attempt": snapshot["reconnect_attempt"],
                         "version": __version__,
+                        "operation_protocol_version": OPERATION_PROTOCOL_VERSION,
                         "sudo_enabled": bool(args.enable_sudo),
                         "name": session_name,
                     })
@@ -1666,6 +1913,9 @@ def daemon(args: argparse.Namespace) -> int:
                 if action == "stop":
                     reply({"ok": True, "status": "stopping"})
                     stop_event.set()
+                    reconnect_event.set()
+                    with connection_condition:
+                        connection_condition.notify_all()
                     return
                 if action not in {"exec", "sudo_exec", "download", "upload"}:
                     reply({"ok": False, "protocol_error": "Неизвестное действие relay."})
@@ -1682,16 +1932,18 @@ def daemon(args: argparse.Namespace) -> int:
                     if not isinstance(overwrite, bool) or not isinstance(create_dirs, bool):
                         reply({"ok": False, "protocol_error": "Некорректные параметры скачивания."})
                         return
-                    with command_lock:
-                        result = download_remote_file(
-                            client,
+                    result = run_transfer_operation(
+                        "скачивания файла",
+                        lambda active_client: download_remote_file(
+                            active_client,
                             remote_path,
                             local_path,
                             overwrite=overwrite,
                             create_dirs=create_dirs,
                             max_size=args.download_max_size,
                             timeout_seconds=args.download_timeout,
-                        )
+                        ),
+                    )
                     reply(result)
                     return
 
@@ -1715,9 +1967,10 @@ def daemon(args: argparse.Namespace) -> int:
                     except (ValueError, UnicodeEncodeError):
                         reply({"ok": False, "protocol_error": "Содержимое загружаемого файла повреждено."})
                         return
-                    with command_lock:
-                        result = upload_file_content(
-                            client,
+                    result = run_transfer_operation(
+                        "загрузки файла",
+                        lambda active_client: upload_file_content(
+                            active_client,
                             local_path,
                             content,
                             remote_path,
@@ -1725,7 +1978,8 @@ def daemon(args: argparse.Namespace) -> int:
                             create_dirs=create_dirs,
                             max_size=args.upload_max_size,
                             timeout_seconds=args.upload_timeout,
-                        )
+                        ),
+                    )
                     reply(result)
                     return
 
@@ -1738,7 +1992,7 @@ def daemon(args: argparse.Namespace) -> int:
                 change_description = request.get("change_description", "Удалённое изменение")
                 machine_mode = request.get("machine_mode", False)
                 protocol_version = request.get("operation_protocol_version")
-                if protocol_version is not None and protocol_version != 1:
+                if protocol_version is not None and protocol_version != OPERATION_PROTOCOL_VERSION:
                     reply({"ok": False, "protocol_error": "Неподдерживаемая версия протокола операции."})
                     return
                 legacy_request = protocol_version is None
@@ -1780,22 +2034,50 @@ def daemon(args: argparse.Namespace) -> int:
                     return
 
                 cli_action = "sudo-exec" if action == "sudo_exec" else "exec"
-                with command_lock:
-                    result = execute_command_operation(
-                        client,
-                        session=session,
-                        action=cli_action,
-                        command=command,
-                        risky=risky,
-                        receipt_path=receipt_path,
-                        transaction_id=transaction_id,
-                        transaction_id_source=transaction_id_source,
-                        change_target=change_target,
-                        change_description=change_description,
-                        timeout_seconds=args.command_timeout,
-                        sudo_password=sudo_password,
-                    )
-                if protocol_version == 1:
+                try:
+                    with command_lock:
+                        operation_client = wait_for_connection(DEFAULT_RECONNECT_WAIT)
+                        result = execute_command_operation(
+                            operation_client,
+                            session=session,
+                            action=cli_action,
+                            command=command,
+                            risky=risky,
+                            receipt_path=receipt_path,
+                            transaction_id=transaction_id,
+                            transaction_id_source=transaction_id_source,
+                            change_target=change_target,
+                            change_description=change_description,
+                            timeout_seconds=args.command_timeout,
+                            sudo_password=sudo_password,
+                        )
+                        if not client_is_active(operation_client):
+                            mark_connection_lost()
+                except RelayError as exc:
+                    if protocol_version == OPERATION_PROTOCOL_VERSION:
+                        result = machine_result_base(
+                            session=session,
+                            action=cli_action,
+                            risky=risky,
+                            transaction_id=transaction_id,
+                            transaction_id_source=transaction_id_source,
+                            change_target=change_target,
+                            change_description=change_description,
+                            receipt_path=receipt_path,
+                            command_hash_value=command_hash(command),
+                            started_at_utc=utc_now(),
+                        )
+                        result = finish_machine_result(
+                            result,
+                            operation_status="not_started",
+                            error_code="ssh_reconnecting",
+                            error_stage="daemon",
+                            error_message=str(exc),
+                        )
+                    else:
+                        reply({"ok": False, "protocol_error": str(exc)})
+                        return
+                if protocol_version == OPERATION_PROTOCOL_VERSION:
                     reply(result)
                 else:
                     reply(legacy_operation_response(result))
@@ -1806,12 +2088,15 @@ def daemon(args: argparse.Namespace) -> int:
             except Exception:
                 reply({"ok": False, "protocol_error": "Внутренняя ошибка daemon."})
 
-
     print(f"SSH-соединение установлено: {args.user}@{args.host}:{args.port}")
     print(f"Имя сессии: {session_name}")
     print(f"Relay слушает локальный адрес 127.0.0.1:{daemon_port}")
     print(f"Файл сессии: {session_path}")
     print(f"Режим sudo: {'включён' if args.enable_sudo else 'выключен'}")
+    print(
+        f"Автовосстановление SSH: включено, ожидание запроса до {DEFAULT_RECONNECT_WAIT} с, "
+        f"keepalive {SSH_KEEPALIVE_INTERVAL} с"
+    )
     print(f"Для завершения нажмите Ctrl+C или выполните команду: stop --name {session_name}")
 
     try:
@@ -1827,7 +2112,6 @@ def daemon(args: argparse.Namespace) -> int:
         server.close()
         cleanup()
     return 0
-
 
 def print_legacy_command_result(result: dict[str, Any]) -> int:
     if not result.get("ok"):
@@ -1925,12 +2209,16 @@ def run_exec_command(args: argparse.Namespace, *, daemon_action: str, cli_action
     try:
         session_name = validate_session_name(args.name)
         session = read_session(session_name)
-        if (args.risky or args.json) and not supports_operation_protocol(session.get("version")):
+        if (args.risky or args.json) and not supports_operation_protocol(session):
             raise RelayError(
-                f"Активный daemon имеет версию {session.get('version')}, требуется {__version__} "
-                "или совместимая более новая minor/patch-версия. Перезапустите daemon перед выполнением операции."
+                f"Активный daemon не подтверждает машинный протокол v{OPERATION_PROTOCOL_VERSION}. "
+                "Перезапустите daemon текущей версией перед выполнением операции."
             )
-        response_timeout = int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)) + 10
+        response_timeout = (
+            int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT))
+            + int(session.get("reconnect_wait", DEFAULT_RECONNECT_WAIT))
+            + 10
+        )
         result = request_daemon(
             session,
             daemon_action,
@@ -1942,7 +2230,7 @@ def run_exec_command(args: argparse.Namespace, *, daemon_action: str, cli_action
             change_target=args.change_target,
             change_description=change_description,
             machine_mode=bool(args.json),
-            operation_protocol_version=1,
+            operation_protocol_version=OPERATION_PROTOCOL_VERSION,
             response_timeout=response_timeout,
         )
         if "operation_status" not in result:
@@ -2012,7 +2300,11 @@ def download_cmd(args: argparse.Namespace) -> int:
         session_name = validate_session_name(args.name)
         session = read_session(session_name)
         local_path = Path(args.local_path).expanduser().resolve(strict=False)
-        response_timeout = int(session.get("download_timeout", DEFAULT_DOWNLOAD_TIMEOUT)) + 10
+        response_timeout = (
+            int(session.get("download_timeout", DEFAULT_DOWNLOAD_TIMEOUT))
+            + int(session.get("reconnect_wait", DEFAULT_RECONNECT_WAIT))
+            + 10
+        )
         result = request_daemon(
             session,
             "download",
@@ -2057,7 +2349,11 @@ def upload_cmd(args: argparse.Namespace) -> int:
                 f"{format_bytes(max_size)}. Перезапустите daemon с большим --upload-max-size, если это безопасно."
             )
         content_b64 = base64.b64encode(local_path.read_bytes()).decode("ascii")
-        response_timeout = int(session.get("upload_timeout", DEFAULT_UPLOAD_TIMEOUT)) + 10
+        response_timeout = (
+            int(session.get("upload_timeout", DEFAULT_UPLOAD_TIMEOUT))
+            + int(session.get("reconnect_wait", DEFAULT_RECONNECT_WAIT))
+            + 10
+        )
         result = request_daemon(
             session,
             "upload",
@@ -2136,11 +2432,25 @@ def stop(args: argparse.Namespace) -> int:
 
 
 def print_status(name: str, session: dict[str, Any], result: dict[str, Any]) -> None:
+    ssh_status = str(result.get("ssh_status", result.get("status", "unknown")))
+    ssh_labels = {
+        "connected": "подключено",
+        "reconnecting": "восстанавливается",
+        "disconnected": "временно недоступно, автоповтор продолжается",
+        "stopping": "завершается",
+        "active": "состояние SSH не поддерживается старой версией daemon",
+    }
     print(f"Сессия: {name}")
-    print(f"Активна: {format_session_target(session)}")
+    print("Daemon: активен")
+    print(f"SSH: {ssh_labels.get(ssh_status, ssh_status)}")
+    print(f"SSH-сервер: {format_session_target(session)}")
     print(f"Локальный порт: {session['daemon_port']}")
     print(f"Версия relay: {result.get('version', session['version'])}")
     print(f"Режим sudo: {'включён' if result.get('sudo_enabled') else 'выключен'}")
+    if ssh_status != "connected":
+        print(f"Попытка восстановления: {int(result.get('reconnect_attempt', 0) or 0)}")
+        if result.get("last_error"):
+            print(f"Последняя ошибка SSH: {result['last_error']}")
     print(f"Файл сессии: {session.get('_session_file_path', existing_session_file_path(name))}")
 
 
@@ -2161,11 +2471,11 @@ def status_one_session(name: str, *, cleanup_stale: bool) -> int:
         print(f"{name}: {exc}", file=sys.stderr)
         return 1
 
-    if not result.get("ok") or result.get("status") != "active":
-        print(f"{name}: daemon не подтвердил активную сессию.", file=sys.stderr)
+    if not result.get("ok") or result.get("daemon_status", "active") != "active":
+        print(f"{name}: daemon не подтвердил активное состояние.", file=sys.stderr)
         return 1
     print_status(name, session, result)
-    return 0
+    return 0 if result.get("ssh_status", result.get("status")) in {"connected", "active"} else 1
 
 
 def status(args: argparse.Namespace) -> int:
@@ -2203,10 +2513,21 @@ def list_sessions(_: argparse.Namespace) -> int:
         try:
             session = read_session(name)
             result = request_daemon(session, "status")
-            if result.get("ok") and result.get("status") == "active":
+            ssh_status = result.get("ssh_status", result.get("status"))
+            if result.get("ok") and ssh_status in {"connected", "active"}:
                 state = "активна"
                 sudo = "вкл." if result.get("sudo_enabled") else "выкл."
                 version = str(result.get("version", session["version"]))
+            elif result.get("ok") and ssh_status == "reconnecting":
+                state = "восстановление"
+                sudo = "вкл." if result.get("sudo_enabled") else "выкл."
+                version = str(result.get("version", session["version"]))
+                exit_code = 1
+            elif result.get("ok") and ssh_status == "disconnected":
+                state = "SSH недоступен"
+                sudo = "вкл." if result.get("sudo_enabled") else "выкл."
+                version = str(result.get("version", session["version"]))
+                exit_code = 1
             else:
                 state = "ошибка"
                 sudo = "?"
@@ -2226,7 +2547,6 @@ def list_sessions(_: argparse.Namespace) -> int:
                 version = "?"
             print(f"{name}\tнедоступна\t{target}\t?\t{port}\t{version}")
     return exit_code
-
 
 def add_session_name_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(

@@ -66,12 +66,29 @@ class FakeChannel:
 
 
 class FakeTransport:
+    def __init__(self) -> None:
+        self.active = True
+        self.authenticated = True
+        self.keepalive = None
+
+    def is_active(self) -> bool:
+        return self.active
+
+    def is_authenticated(self) -> bool:
+        return self.authenticated
+
+    def set_keepalive(self, interval: int) -> None:
+        self.keepalive = interval
+
     def open_session(self, timeout: int = 10) -> FakeChannel:
         assert timeout == 10
         return FakeChannel()
 
 
 class FakeSSHClient:
+    def __init__(self) -> None:
+        self.transport = FakeTransport()
+
     def load_system_host_keys(self, *_: object) -> None:
         pass
 
@@ -82,10 +99,11 @@ class FakeSSHClient:
         pass
 
     def get_transport(self) -> FakeTransport:
-        return FakeTransport()
+        return self.transport
 
     def close(self) -> None:
-        pass
+        self.transport.active = False
+        self.transport.authenticated = False
 
 
 class FakeRejectPolicy:
@@ -136,6 +154,12 @@ with tempfile.TemporaryDirectory() as tmp:
             time.sleep(0.02)
         assert session_path.exists(), output.getvalue()
         session = m.read_session('proto')
+        assert session['version'] == '0.7.0', session
+        assert session['operation_protocol_version'] == m.OPERATION_PROTOCOL_VERSION, session
+        status = raw_request(session['daemon_port'], {
+            'auth_token': session['auth_token'], 'action': 'status',
+        })
+        assert status['operation_protocol_version'] == m.OPERATION_PROTOCOL_VERSION, status
 
         # Запрос старого CLI 0.5.x: новых полей нет, ответ остаётся старого формата.
         legacy = raw_request(session['daemon_port'], {
@@ -171,6 +195,7 @@ with tempfile.TemporaryDirectory() as tmp:
         assert result['command_status'] == 'succeeded', result
         assert result['stdout'] == 'protocol-ok', result
         assert result['receipt_status'] == 'not_requested', result
+        assert result['operation_protocol_version'] == m.OPERATION_PROTOCOL_VERSION, result
 
         stopped = raw_request(session['daemon_port'], {
             'auth_token': session['auth_token'], 'action': 'stop',
