@@ -35,7 +35,7 @@ with tempfile.TemporaryDirectory() as tmp:
     )
 
     assert proc.returncode == 10, (proc.returncode, proc.stdout, proc.stderr)
-    assert proc.stderr == b'', proc.stderr
+    assert proc.stderr == b'', f"stderr hex={proc.stderr.hex()} repr={proc.stderr!r}"
     decoded = proc.stdout.decode('utf-8')
     result = json.loads(decoded)
     assert result['operation_status'] == 'not_started', result
