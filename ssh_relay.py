@@ -12,7 +12,7 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
   py ssh_relay.py stop
 """
 
-__version__ = "0.5.1"
+__version__ = "0.6.0"
 
 import argparse
 import atexit
@@ -42,6 +42,10 @@ DEFAULT_DOWNLOAD_MAX_SIZE = 64 * 1024 * 1024
 DEFAULT_UPLOAD_TIMEOUT = 300
 DEFAULT_UPLOAD_MAX_SIZE = 64 * 1024 * 1024
 DEFAULT_RISKY_RECEIPT_PATH = "~/.local/state/agent-safe/changes.jsonl"
+DEFAULT_RECONNECT_WAIT = 30
+SSH_KEEPALIVE_INTERVAL = 30
+SSH_MONITOR_INTERVAL = 1
+RECONNECT_DELAYS = (1, 2, 5, 10, 30)
 REQUIRED_SESSION_FIELDS = {
     "host": str,
     "port": int,
@@ -55,6 +59,10 @@ REQUIRED_SESSION_FIELDS = {
 
 class RelayError(Exception):
     """Ожидаемая ошибка relay, предназначенная для вывода пользователю."""
+
+
+class DaemonUnavailableError(RelayError):
+    """Локальный daemon недоступен или не ответил в установленный срок."""
 
 
 class RussianArgumentParser(argparse.ArgumentParser):
@@ -328,7 +336,7 @@ def request_daemon(
             sock.settimeout(response_timeout)
             return read_message(sock)
     except (ConnectionError, TimeoutError, socket.timeout, OSError) as exc:
-        raise RelayError("Daemon недоступен или не ответил вовремя.") from exc
+        raise DaemonUnavailableError("Daemon недоступен или не ответил вовремя.") from exc
 
 
 def load_paramiko():
@@ -424,6 +432,7 @@ def execute_sudo_command(
     )
 
 
+
 def quote_posix_path(path: str) -> str:
     """Экранирует POSIX-путь, сохраняя расширение ~/ на удалённой стороне."""
     if path == "~":
@@ -459,13 +468,6 @@ def build_risky_receipt_command(
     return f"mkdir -p {quote_posix_path(directory)} && printf '%s\\n' {shlex.quote(line)} >> {quote_posix_path(path)}"
 
 
-def normalize_remote_sftp_path(remote_path: str) -> str:
-    """Нормализует Windows-style путь для SFTP, не меняя POSIX-пути."""
-    if "\\" in remote_path:
-        return remote_path.replace("\\", "/")
-    return remote_path
-
-
 def execute_risky_receipt(
     client: Any,
     *,
@@ -493,6 +495,13 @@ def execute_risky_receipt(
     result["receipt_command"] = receipt_command
     result["receipt_path"] = receipt_path
     return result
+
+
+def normalize_remote_sftp_path(remote_path: str) -> str:
+    """Нормализует Windows-style путь для SFTP, не меняя POSIX-пути."""
+    if "\\" in remote_path:
+        return remote_path.replace("\\", "/")
+    return remote_path
 
 
 def download_remote_file(
@@ -914,26 +923,40 @@ def daemon(args: argparse.Namespace) -> int:
     else:
         password = getpass.getpass(f"SSH-пароль для {args.user}@{args.host}: ")
 
-    client = paramiko.SSHClient()
+    def open_ssh_client() -> Any:
+        """Открывает проверенное SSH-соединение, пригодное для последующего reconnect."""
+        new_client = paramiko.SSHClient()
+        try:
+            if args.known_hosts:
+                new_client.load_system_host_keys(args.known_hosts)
+            else:
+                new_client.load_system_host_keys()
+            new_client.set_missing_host_key_policy(paramiko.RejectPolicy())
+            new_client.connect(
+                args.host,
+                port=args.port,
+                username=args.user,
+                password=password,
+                key_filename=identity_file,
+                passphrase=passphrase,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=10,
+            )
+            transport = new_client.get_transport()
+            if transport is None or not transport.is_active() or not transport.is_authenticated():
+                raise RelayError("SSH-транспорт не перешёл в активное аутентифицированное состояние.")
+            transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
+            return new_client
+        except Exception:
+            new_client.close()
+            raise
+
     try:
-        if args.known_hosts:
-            client.load_system_host_keys(args.known_hosts)
-        else:
-            client.load_system_host_keys()
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
-        client.connect(
-            args.host,
-            port=args.port,
-            username=args.user,
-            password=password,
-            key_filename=identity_file,
-            passphrase=passphrase,
-            look_for_keys=False,
-            allow_agent=False,
-            timeout=10,
-        )
+        client = open_ssh_client()
     except Exception as exc:
-        client.close()
+        password = None
+        passphrase = None
         print(f"Не удалось установить SSH-соединение: {exc}", file=sys.stderr)
         if identity_file:
             print(
@@ -947,9 +970,6 @@ def daemon(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         return 1
-    finally:
-        password = None
-        passphrase = None
 
     if args.enable_sudo:
         sudo_password = getpass.getpass(f"sudo-пароль для {args.user}@{args.host}: ")
@@ -957,6 +977,8 @@ def daemon(args: argparse.Namespace) -> int:
             verify_sudo_password(client, sudo_password, args.command_timeout)
         except RelayError as exc:
             sudo_password = None
+            password = None
+            passphrase = None
             client.close()
             print(str(exc), file=sys.stderr)
             return 1
@@ -970,6 +992,9 @@ def daemon(args: argparse.Namespace) -> int:
         server.settimeout(0.5)
     except OSError as exc:
         server.close()
+        sudo_password = None
+        password = None
+        passphrase = None
         client.close()
         print(f"Не удалось открыть локальный порт relay: {exc}", file=sys.stderr)
         return 1
@@ -992,29 +1017,222 @@ def daemon(args: argparse.Namespace) -> int:
         "download_max_size": args.download_max_size,
         "upload_timeout": args.upload_timeout,
         "upload_max_size": args.upload_max_size,
+        "reconnect_wait": DEFAULT_RECONNECT_WAIT,
     }
     try:
         session_path = write_session(session_name, session)
     except OSError as exc:
         server.close()
+        sudo_password = None
+        password = None
+        passphrase = None
         client.close()
         print(f"Не удалось безопасно записать файл сессии: {exc}", file=sys.stderr)
         return 1
 
     stop_event = threading.Event()
+    reconnect_event = threading.Event()
     command_lock = threading.Lock()
+    client_lock = threading.Lock()
+    connection_condition = threading.Condition()
+    connection_state = "connected"
+    connection_error: str | None = None
+    reconnect_attempt = 0
     cleanup_done = False
 
+    def client_is_active(candidate: Any) -> bool:
+        try:
+            transport = candidate.get_transport()
+            return bool(transport is not None and transport.is_active() and transport.is_authenticated())
+        except Exception:
+            return False
+
+    def current_client() -> Any:
+        with client_lock:
+            return client
+
+    def mark_connection_lost(error: object | None = None) -> None:
+        """Переводит SSH в восстановление и будит reconnect-worker."""
+        nonlocal connection_state, connection_error
+        error_text = str(error).strip() if error is not None else ""
+        should_report = False
+        with connection_condition:
+            if stop_event.is_set():
+                return
+            if connection_state == "connected":
+                should_report = True
+                connection_state = "reconnecting"
+                connection_error = error_text or "SSH-транспорт недоступен."
+            elif error_text:
+                connection_error = error_text
+            connection_condition.notify_all()
+        reconnect_event.set()
+        if should_report:
+            print(f"SSH-соединение потеряно: {connection_error}", file=sys.stderr, flush=True)
+            print("Запущено автоматическое восстановление SSH-соединения.", file=sys.stderr, flush=True)
+
+    def connection_snapshot() -> dict[str, Any]:
+        candidate = current_client()
+        if not client_is_active(candidate):
+            mark_connection_lost()
+        with connection_condition:
+            return {
+                "ssh_status": connection_state,
+                "last_error": connection_error,
+                "reconnect_attempt": reconnect_attempt,
+            }
+
+    def wait_for_connection(timeout_seconds: float) -> Any:
+        """Ждёт восстановления SSH, но не выполняет и не повторяет удалённую операцию."""
+        candidate = current_client()
+        if client_is_active(candidate):
+            with connection_condition:
+                if connection_state != "connected":
+                    connection_condition.notify_all()
+            return candidate
+
+        mark_connection_lost()
+        deadline = time.monotonic() + timeout_seconds
+        with connection_condition:
+            while True:
+                if stop_event.is_set():
+                    raise RelayError("Daemon завершает работу; удалённый запрос не выполнялся.")
+                if connection_state == "connected":
+                    candidate = current_client()
+                    if client_is_active(candidate):
+                        return candidate
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    details = f" Последняя ошибка: {connection_error}" if connection_error else ""
+                    raise RelayError(
+                        "SSH-соединение сейчас восстанавливается. Daemon работает, но удалённый запрос "
+                        f"не выполнялся за {int(timeout_seconds)} с ожидания. Повторите команду позднее.{details}"
+                    )
+                connection_condition.wait(timeout=remaining)
+
+    def run_remote_operation(operation_name: str, operation: Any) -> dict[str, Any]:
+        """Запускает операцию только на рабочем SSH и не повторяет её после обрыва."""
+        with command_lock:
+            operation_client = wait_for_connection(DEFAULT_RECONNECT_WAIT)
+            try:
+                return operation(operation_client)
+            except Exception as exc:
+                if not client_is_active(operation_client):
+                    mark_connection_lost(exc)
+                    raise RelayError(
+                        f"SSH-соединение потеряно во время {operation_name}. Результат операции неизвестен; "
+                        "операция автоматически не повторялась. Relay восстанавливает соединение для следующих запросов."
+                    ) from exc
+                raise
+
+    def reconnect_worker() -> None:
+        """Последовательно восстанавливает SSH с ограниченным backoff."""
+        nonlocal client, connection_state, connection_error, reconnect_attempt
+        delay_index = 0
+        while not stop_event.is_set():
+            reconnect_event.wait(timeout=0.5)
+            if stop_event.is_set():
+                return
+            if not reconnect_event.is_set():
+                continue
+
+            candidate = current_client()
+            if client_is_active(candidate):
+                with connection_condition:
+                    connection_state = "connected"
+                    connection_error = None
+                    reconnect_attempt = 0
+                    connection_condition.notify_all()
+                reconnect_event.clear()
+                delay_index = 0
+                continue
+
+            with connection_condition:
+                connection_state = "reconnecting"
+                reconnect_attempt += 1
+                attempt = reconnect_attempt
+                connection_condition.notify_all()
+
+            print(
+                f"Попытка восстановления SSH-соединения {attempt}: {args.user}@{args.host}:{args.port}",
+                file=sys.stderr,
+                flush=True,
+            )
+            try:
+                new_client = open_ssh_client()
+            except Exception as exc:
+                if stop_event.is_set():
+                    return
+                delay = RECONNECT_DELAYS[min(delay_index, len(RECONNECT_DELAYS) - 1)]
+                delay_index += 1
+                with connection_condition:
+                    connection_state = "disconnected"
+                    connection_error = str(exc).strip() or exc.__class__.__name__
+                    connection_condition.notify_all()
+                print(
+                    f"Восстановить SSH-соединение не удалось: {connection_error}. "
+                    f"Следующая попытка через {delay} с.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                stop_event.wait(delay)
+                continue
+
+            if stop_event.is_set():
+                new_client.close()
+                return
+
+            with client_lock:
+                old_client = client
+                client = new_client
+            if old_client is not new_client:
+                try:
+                    old_client.close()
+                except Exception:
+                    pass
+
+            with connection_condition:
+                connection_state = "connected"
+                connection_error = None
+                reconnect_attempt = 0
+                connection_condition.notify_all()
+            reconnect_event.clear()
+            delay_index = 0
+            print(
+                f"SSH-соединение восстановлено: {args.user}@{args.host}:{args.port}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def connection_monitor() -> None:
+        """Контролирует состояние транспорта между локальными запросами."""
+        while not stop_event.wait(SSH_MONITOR_INTERVAL):
+            candidate = current_client()
+            if not client_is_active(candidate):
+                mark_connection_lost()
+
     def cleanup() -> None:
-        nonlocal cleanup_done, sudo_password
+        nonlocal cleanup_done, sudo_password, password, passphrase, connection_state
         if cleanup_done:
             return
         cleanup_done = True
+        stop_event.set()
+        reconnect_event.set()
+        with connection_condition:
+            connection_state = "stopping"
+            connection_condition.notify_all()
         sudo_password = None
+        password = None
+        passphrase = None
         remove_session_file(session_name, auth_token)
-        client.close()
+        try:
+            current_client().close()
+        except Exception:
+            pass
 
     atexit.register(cleanup)
+    threading.Thread(target=reconnect_worker, name=f"ssh-relay-reconnect-{session_name}", daemon=True).start()
+    threading.Thread(target=connection_monitor, name=f"ssh-relay-monitor-{session_name}", daemon=True).start()
 
     def handle_client(conn: socket.socket) -> None:
         with conn:
@@ -1034,9 +1252,14 @@ def daemon(args: argparse.Namespace) -> int:
 
                 action = request.get("action")
                 if action == "status":
+                    snapshot = connection_snapshot()
                     reply({
                         "ok": True,
-                        "status": "active",
+                        "status": "active" if snapshot["ssh_status"] == "connected" else snapshot["ssh_status"],
+                        "daemon_status": "active",
+                        "ssh_status": snapshot["ssh_status"],
+                        "last_error": snapshot["last_error"],
+                        "reconnect_attempt": snapshot["reconnect_attempt"],
                         "version": __version__,
                         "sudo_enabled": bool(args.enable_sudo),
                         "name": session_name,
@@ -1045,6 +1268,9 @@ def daemon(args: argparse.Namespace) -> int:
                 if action == "stop":
                     reply({"ok": True, "status": "stopping"})
                     stop_event.set()
+                    reconnect_event.set()
+                    with connection_condition:
+                        connection_condition.notify_all()
                     return
                 if action not in {"exec", "sudo_exec", "download", "upload"}:
                     reply({"ok": False, "protocol_error": "Неизвестное действие relay."})
@@ -1067,16 +1293,18 @@ def daemon(args: argparse.Namespace) -> int:
                     if not isinstance(overwrite, bool) or not isinstance(create_dirs, bool):
                         reply({"ok": False, "protocol_error": "Некорректные параметры скачивания."})
                         return
-                    with command_lock:
-                        result = download_remote_file(
-                            client,
+                    result = run_remote_operation(
+                        "скачивания файла",
+                        lambda active_client: download_remote_file(
+                            active_client,
                             remote_path,
                             local_path,
                             overwrite=overwrite,
                             create_dirs=create_dirs,
                             max_size=args.download_max_size,
                             timeout_seconds=args.download_timeout,
-                        )
+                        ),
+                    )
                     reply(result)
                     return
 
@@ -1100,9 +1328,10 @@ def daemon(args: argparse.Namespace) -> int:
                     except (ValueError, UnicodeEncodeError):
                         reply({"ok": False, "protocol_error": "Содержимое загружаемого файла повреждено."})
                         return
-                    with command_lock:
-                        result = upload_file_content(
-                            client,
+                    result = run_remote_operation(
+                        "загрузки файла",
+                        lambda active_client: upload_file_content(
+                            active_client,
                             local_path,
                             content,
                             remote_path,
@@ -1110,7 +1339,8 @@ def daemon(args: argparse.Namespace) -> int:
                             create_dirs=create_dirs,
                             max_size=args.upload_max_size,
                             timeout_seconds=args.upload_timeout,
-                        )
+                        ),
+                    )
                     reply(result)
                     return
 
@@ -1127,39 +1357,54 @@ def daemon(args: argparse.Namespace) -> int:
                     reply({"ok": False, "protocol_error": "Некорректный путь risky receipt."})
                     return
 
-                with command_lock:
-                    if action == "sudo_exec":
-                        if sudo_password is None:
-                            result = {
-                                "ok": False,
-                                "protocol_error": "Режим sudo недоступен: sudo-пароль отсутствует в памяти daemon.",
-                            }
+                if action == "sudo_exec" and sudo_password is None:
+                    result = {
+                        "ok": False,
+                        "protocol_error": "Режим sudo недоступен: sudo-пароль отсутствует в памяти daemon.",
+                    }
+                else:
+                    def execute_with_optional_receipt(active_client: Any) -> dict[str, Any]:
+                        if action == "sudo_exec":
+                            command_result = execute_sudo_command(
+                                active_client,
+                                command,
+                                args.command_timeout,
+                                sudo_password,
+                            )
                         else:
-                            result = execute_sudo_command(client, command, args.command_timeout, sudo_password)
-                    else:
-                        result = execute_remote_command(client, command, args.command_timeout)
-                    if result.get("ok") and result.get("exit_code") == 0 and risky:
-                        receipt = execute_risky_receipt(
-                            client,
-                            session=session,
-                            action=action,
-                            command=command,
-                            sudo=(action == "sudo_exec"),
-                            receipt_path=receipt_path,
-                            timeout_seconds=args.command_timeout,
-                            sudo_password=sudo_password,
-                        )
-                        result["risky_receipt"] = {
-                            "path": receipt.get("receipt_path"),
-                            "exit_code": receipt.get("exit_code"),
-                        }
-                        if receipt.get("exit_code") != 0:
-                            result = {
-                                "ok": False,
-                                "protocol_error": "Удалённая команда выполнена, но risky receipt записать не удалось.",
-                                "command_result": result,
-                                "receipt_result": receipt,
+                            command_result = execute_remote_command(
+                                active_client,
+                                command,
+                                args.command_timeout,
+                            )
+                        if command_result.get("ok") and command_result.get("exit_code") == 0 and risky:
+                            receipt = execute_risky_receipt(
+                                active_client,
+                                session=session,
+                                action=action,
+                                command=command,
+                                sudo=(action == "sudo_exec"),
+                                receipt_path=receipt_path,
+                                timeout_seconds=args.command_timeout,
+                                sudo_password=sudo_password,
+                            )
+                            command_result["risky_receipt"] = {
+                                "path": receipt.get("receipt_path"),
+                                "exit_code": receipt.get("exit_code"),
                             }
+                            if receipt.get("exit_code") != 0:
+                                return {
+                                    "ok": False,
+                                    "protocol_error": "Удалённая команда выполнена, но risky receipt записать не удалось.",
+                                    "command_result": command_result,
+                                    "receipt_result": receipt,
+                                }
+                        return command_result
+
+                    result = run_remote_operation(
+                        "выполнения sudo-команды" if action == "sudo_exec" else "выполнения команды",
+                        execute_with_optional_receipt,
+                    )
                 reply(result)
             except (socket.timeout, TimeoutError):
                 reply({"ok": False, "protocol_error": "Истекло время ожидания локального запроса."})
@@ -1173,6 +1418,10 @@ def daemon(args: argparse.Namespace) -> int:
     print(f"Relay слушает локальный адрес 127.0.0.1:{daemon_port}")
     print(f"Файл сессии: {session_path}")
     print(f"Режим sudo: {'включён' if args.enable_sudo else 'выключен'}")
+    print(
+        f"Автовосстановление SSH: включено, ожидание запроса до {DEFAULT_RECONNECT_WAIT} с, "
+        f"keepalive {SSH_KEEPALIVE_INTERVAL} с"
+    )
     print(f"Для завершения нажмите Ctrl+C или выполните команду: stop --name {session_name}")
 
     try:
@@ -1205,7 +1454,11 @@ def exec_cmd(args: argparse.Namespace) -> int:
     try:
         session_name = validate_session_name(args.name)
         session = read_session(session_name)
-        response_timeout = int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)) + 10
+        response_timeout = (
+            int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT))
+            + int(session.get("reconnect_wait", DEFAULT_RECONNECT_WAIT))
+            + 10
+        )
         result = request_daemon(
             session,
             "exec",
@@ -1214,8 +1467,11 @@ def exec_cmd(args: argparse.Namespace) -> int:
             receipt_path=args.receipt_path,
             response_timeout=response_timeout,
         )
-    except RelayError as exc:
+    except DaemonUnavailableError as exc:
         remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
+        print(str(exc), file=sys.stderr)
+        return 1
+    except RelayError as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -1226,7 +1482,11 @@ def sudo_exec_cmd(args: argparse.Namespace) -> int:
     try:
         session_name = validate_session_name(args.name)
         session = read_session(session_name)
-        response_timeout = int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT)) + 10
+        response_timeout = (
+            int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT))
+            + int(session.get("reconnect_wait", DEFAULT_RECONNECT_WAIT))
+            + 10
+        )
         result = request_daemon(
             session,
             "sudo_exec",
@@ -1235,8 +1495,11 @@ def sudo_exec_cmd(args: argparse.Namespace) -> int:
             receipt_path=args.receipt_path,
             response_timeout=response_timeout,
         )
-    except RelayError as exc:
+    except DaemonUnavailableError as exc:
         remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
+        print(str(exc), file=sys.stderr)
+        return 1
+    except RelayError as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -1248,7 +1511,11 @@ def download_cmd(args: argparse.Namespace) -> int:
         session_name = validate_session_name(args.name)
         session = read_session(session_name)
         local_path = Path(args.local_path).expanduser().resolve(strict=False)
-        response_timeout = int(session.get("download_timeout", DEFAULT_DOWNLOAD_TIMEOUT)) + 10
+        response_timeout = (
+            int(session.get("download_timeout", DEFAULT_DOWNLOAD_TIMEOUT))
+            + int(session.get("reconnect_wait", DEFAULT_RECONNECT_WAIT))
+            + 10
+        )
         result = request_daemon(
             session,
             "download",
@@ -1258,8 +1525,11 @@ def download_cmd(args: argparse.Namespace) -> int:
             overwrite=bool(args.overwrite),
             create_dirs=bool(args.create_dirs),
         )
-    except RelayError as exc:
+    except DaemonUnavailableError as exc:
         remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
+        print(str(exc), file=sys.stderr)
+        return 1
+    except RelayError as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -1289,7 +1559,11 @@ def upload_cmd(args: argparse.Namespace) -> int:
                 f"{format_bytes(max_size)}. Перезапустите daemon с большим --upload-max-size, если это безопасно."
             )
         content_b64 = base64.b64encode(local_path.read_bytes()).decode("ascii")
-        response_timeout = int(session.get("upload_timeout", DEFAULT_UPLOAD_TIMEOUT)) + 10
+        response_timeout = (
+            int(session.get("upload_timeout", DEFAULT_UPLOAD_TIMEOUT))
+            + int(session.get("reconnect_wait", DEFAULT_RECONNECT_WAIT))
+            + 10
+        )
         result = request_daemon(
             session,
             "upload",
@@ -1300,9 +1574,15 @@ def upload_cmd(args: argparse.Namespace) -> int:
             overwrite=bool(args.overwrite),
             create_dirs=bool(args.create_dirs),
         )
-    except RelayError as exc:
+    except DaemonUnavailableError as exc:
         remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
         print(str(exc), file=sys.stderr)
+        return 1
+    except RelayError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"Не удалось прочитать локальный файл: {exc}", file=sys.stderr)
         return 1
 
     if not result.get("ok"):
@@ -1320,10 +1600,13 @@ def stop_one_session(name: str) -> int:
     try:
         session = read_session(name)
         result = request_daemon(session, "stop")
-    except RelayError as exc:
+    except DaemonUnavailableError as exc:
         remove_session_file(name)
         print(f"{name}: {exc}", file=sys.stderr)
         print(f"{name}: файл неактивной сессии удалён; завершение daemon не подтверждено.", file=sys.stderr)
+        return 1
+    except RelayError as exc:
+        print(f"{name}: {exc}", file=sys.stderr)
         return 1
 
     if not result.get("ok"):
@@ -1353,11 +1636,25 @@ def stop(args: argparse.Namespace) -> int:
 
 
 def print_status(name: str, session: dict[str, Any], result: dict[str, Any]) -> None:
+    ssh_status = str(result.get("ssh_status", result.get("status", "unknown")))
+    ssh_labels = {
+        "connected": "подключено",
+        "reconnecting": "восстанавливается",
+        "disconnected": "временно недоступно, автоповтор продолжается",
+        "stopping": "завершается",
+        "active": "состояние SSH не поддерживается старой версией daemon",
+    }
     print(f"Сессия: {name}")
-    print(f"Активна: {format_session_target(session)}")
+    print("Daemon: активен")
+    print(f"SSH: {ssh_labels.get(ssh_status, ssh_status)}")
+    print(f"SSH-сервер: {format_session_target(session)}")
     print(f"Локальный порт: {session['daemon_port']}")
     print(f"Версия relay: {result.get('version', session['version'])}")
     print(f"Режим sudo: {'включён' if result.get('sudo_enabled') else 'выключен'}")
+    if ssh_status != "connected":
+        print(f"Попытка восстановления: {int(result.get('reconnect_attempt', 0) or 0)}")
+        if result.get("last_error"):
+            print(f"Последняя ошибка SSH: {result['last_error']}")
     print(f"Файл сессии: {session.get('_session_file_path', existing_session_file_path(name))}")
 
 
@@ -1365,17 +1662,20 @@ def status_one_session(name: str, *, cleanup_stale: bool) -> int:
     try:
         session = read_session(name)
         result = request_daemon(session, "status")
-    except RelayError as exc:
+    except DaemonUnavailableError as exc:
         if cleanup_stale:
             remove_session_file(name)
         print(f"{name}: {exc}", file=sys.stderr)
         return 1
+    except RelayError as exc:
+        print(f"{name}: {exc}", file=sys.stderr)
+        return 1
 
-    if not result.get("ok") or result.get("status") != "active":
-        print(f"{name}: daemon не подтвердил активную сессию.", file=sys.stderr)
+    if not result.get("ok") or result.get("daemon_status", "active") != "active":
+        print(f"{name}: daemon не подтвердил активное состояние.", file=sys.stderr)
         return 1
     print_status(name, session, result)
-    return 0
+    return 0 if result.get("ssh_status", result.get("status")) == "connected" else 1
 
 
 def status(args: argparse.Namespace) -> int:
@@ -1413,10 +1713,21 @@ def list_sessions(_: argparse.Namespace) -> int:
         try:
             session = read_session(name)
             result = request_daemon(session, "status")
-            if result.get("ok") and result.get("status") == "active":
+            ssh_status = result.get("ssh_status", result.get("status"))
+            if result.get("ok") and ssh_status == "connected":
                 state = "активна"
                 sudo = "вкл." if result.get("sudo_enabled") else "выкл."
                 version = str(result.get("version", session["version"]))
+            elif result.get("ok") and ssh_status == "reconnecting":
+                state = "восстановление"
+                sudo = "вкл." if result.get("sudo_enabled") else "выкл."
+                version = str(result.get("version", session["version"]))
+                exit_code = 1
+            elif result.get("ok") and ssh_status == "disconnected":
+                state = "SSH недоступен"
+                sudo = "вкл." if result.get("sudo_enabled") else "выкл."
+                version = str(result.get("version", session["version"]))
+                exit_code = 1
             else:
                 state = "ошибка"
                 sudo = "?"
