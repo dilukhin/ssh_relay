@@ -2721,7 +2721,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def configure_stdio_utf8() -> None:
+    """Настраивает стабильный UTF-8 вывод CLI, включая перенаправленный stdout/stderr в Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if not callable(reconfigure):
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            # Нестандартный поток может не поддерживать перенастройку;
+            # основная логика CLI при этом остаётся доступной.
+            pass
+
+
 def main() -> int:
+    configure_stdio_utf8()
     parser = build_parser()
     args = parser.parse_args()
     return int(args.handler(args))
