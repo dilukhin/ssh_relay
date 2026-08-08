@@ -24,7 +24,7 @@ jobs:
         run: |
           set -euo pipefail
           cat .integration/payload.* | base64 -d > /tmp/payload.tar.gz
-          echo "68e15b396530ecf44be3f8a3cec3e4dbe449a35f112be4038d449c6e53b7b5c4  /tmp/payload.tar.gz" | sha256sum -c -
+          echo "68e15b39e0963d7f5ab86e350549d52de70ef1a308550f000beb9542a9445e95  /tmp/payload.tar.gz" | sha256sum -c -
           tar -xzf /tmp/payload.tar.gz
           python - <<'PY'
           from pathlib import Path
