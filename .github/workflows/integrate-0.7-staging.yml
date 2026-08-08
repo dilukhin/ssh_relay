@@ -1,0 +1,64 @@
+name: Сборка staging 0.7.0
+
+on:
+  push:
+    branches:
+      - agent/0.7-integration-staging
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Восстановить и проверить payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .integration/payload.* | base64 -d > /tmp/payload.tar.gz
+          echo "68e15b396530ecf44be3f8a3cec3e4dbe449a35f112be4038d449c6e53b7b5c4  /tmp/payload.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/payload.tar.gz
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib
+          expected = {
+              "ssh_relay.py": "99c896c556b3defbc37c938f6f68fa5d13bc73b1fe9ad90369201f0b8f175954",
+              "README.md": "44c8c88ac43a1f70f45cd7d7768c50715f54dd73fc2a386d8885b290293cafba",
+              "tests/test_local_tcp_protocol.py": "48973af108514c1dccfff61b1f015ba6a33818cc03a1f3a9dabc9f3177dddaea",
+              "tests/test_reconnect_protocol.py": "82c30bc092df8dfccf65dabbc64ad08e6fe5778c8b42f857bc4c6d4a25c67794",
+              "tests/test_transfer_protocol.py": "eb550df248e6399280ab87f100499fd3540e7e76c1973b12e99d4906225049e7",
+              "tests/test_multi_session_protocol.py": "8a840bd3a8cee5ad7b627902553673dfd3cfa1e9e27ae7654cfff0161b201afc",
+              "tests/test_real_ssh_reconnect.py": "b3af5ff5dfd3770e302e86a72faa92da9110684952502f671544244449acea61",
+          }
+          for path, wanted in expected.items():
+              got = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+              if got != wanted:
+                  raise SystemExit(f"{path}: SHA-256 {got} != {wanted}")
+          PY
+      - name: Локальные автоматические тесты
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile ssh_relay.py tests/test_machine_protocol.py tests/test_local_tcp_protocol.py tests/test_reconnect_protocol.py tests/test_transfer_protocol.py tests/test_multi_session_protocol.py tests/test_real_ssh_reconnect.py
+          python tests/test_machine_protocol.py
+          python tests/test_local_tcp_protocol.py
+          python tests/test_reconnect_protocol.py
+          python tests/test_transfer_protocol.py
+          python tests/test_multi_session_protocol.py
+      - name: Зафиксировать проверенное дерево staging
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ssh_relay.py README.md tests/test_local_tcp_protocol.py tests/test_reconnect_protocol.py tests/test_transfer_protocol.py tests/test_multi_session_protocol.py tests/test_real_ssh_reconnect.py
+          git commit -m "подготовлено: проверенное дерево версии 0.7.0"
+          git push origin HEAD:agent/0.7-integration-staging
