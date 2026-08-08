@@ -31,12 +31,12 @@ jobs:
           import hashlib
           expected = {
               "ssh_relay.py": "99c896c556b3defbc37c938f6f68fa5d13bc73b1fe9ad90369201f0b8f175954",
-              "README.md": "44c8c88ac43a1f70f45cd7d7768c50715f54dd73fc2a386d8885b290293cafba",
-              "tests/test_local_tcp_protocol.py": "48973af108514c1dccfff61b1f015ba6a33818cc03a1f3a9dabc9f3177dddaea",
-              "tests/test_reconnect_protocol.py": "82c30bc092df8dfccf65dabbc64ad08e6fe5778c8b42f857bc4c6d4a25c67794",
-              "tests/test_transfer_protocol.py": "eb550df248e6399280ab87f100499fd3540e7e76c1973b12e99d4906225049e7",
-              "tests/test_multi_session_protocol.py": "8a840bd3a8cee5ad7b627902553673dfd3cfa1e9e27ae7654cfff0161b201afc",
-              "tests/test_real_ssh_reconnect.py": "b3af5ff5dfd3770e302e86a72faa92da9110684952502f671544244449acea61",
+              "README.md": "e1f82da66be7ab4d91be0e31691f87ed2394244656dd40b7ff5afad3bdfc20df",
+              "tests/test_local_tcp_protocol.py": "319fabace0e4df07eeadfef87a947cc2b2d7743be2cb89547a5ed243ebd8fc2b",
+              "tests/test_reconnect_protocol.py": "a99a163588f8d42381c6ac78953ab78ab82aeaee4f9e64ae21b37a3b1b22e5fe",
+              "tests/test_transfer_protocol.py": "84057689becb6babd6a261e199d07bfbca39911402c5448cfd1172d76fe11ada",
+              "tests/test_multi_session_protocol.py": "7aad2b29e2768c66f65a693cf9928516dfc9da0feaf3cbbf392c742b3203d119",
+              "tests/test_real_ssh_reconnect.py": "84d2fcd0320d308484870249dd443e3acef30fae9e27aa71cc79eeb484bcd3b7",
           }
           for path, wanted in expected.items():
               got = hashlib.sha256(Path(path).read_bytes()).hexdigest()
