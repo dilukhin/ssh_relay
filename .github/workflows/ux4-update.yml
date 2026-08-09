@@ -1,0 +1,69 @@
+name: Актуализировать UX-4 для 0.7.0
+
+on:
+  push:
+    branches:
+      - agent/0.7-docs-staging
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Проверить реализацию и обновить UX-4
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          source = Path('ssh_relay.py').read_text(encoding='utf-8')
+          test = Path('tests/test_stdio_utf8.py').read_text(encoding='utf-8')
+          ux_path = Path('UX_FINDINGS.md')
+          ux = ux_path.read_text(encoding='utf-8')
+
+          required_source = [
+              '__version__ = "0.7.0"',
+              'def configure_stdio_utf8()',
+              'reconfigure(encoding="utf-8", errors="replace")',
+          ]
+          for marker in required_source:
+              if marker not in source:
+                  raise SystemExit(f'Не подтверждён marker реализации: {marker}')
+          if "proc.stdout.decode('utf-8')" not in test:
+              raise SystemExit('Не найден UTF-8 regression-тест машинного stdout')
+
+          rows = ux.splitlines()
+          indexes = [i for i, line in enumerate(rows) if line.startswith('| UX-4 |')]
+          if len(indexes) != 1:
+              raise SystemExit(f'Ожидалась одна строка UX-4, найдено: {len(indexes)}')
+          rows[indexes[0]] = (
+              '| UX-4 | UTF-8 в PowerShell 5.1 требует внешней настройки | P1 | **Выполнено** | '
+              'CLI при старте настраивает `stdout` и `stderr` как UTF-8 с `errors="replace"`; '
+              'regression-тест проверяет redirected output в Windows и входит в матрицу Python 3.12/3.13. | '
+              'Поддерживать regression-тест при изменениях машинного вывода. |'
+          )
+          ux_path.write_text('\n'.join(rows) + '\n', encoding='utf-8', newline='\n')
+          PY
+          git diff --check
+          changed="$(git diff --name-only)"
+          if [ "$changed" != "UX_FINDINGS.md" ]; then
+            echo "Неожиданный docs-diff: $changed" >&2
+            exit 1
+          fi
+      - name: Зафиксировать чистый docs-diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add UX_FINDINGS.md
+          git rm .github/workflows/ux4-update.yml
+          git commit -m "актуализировано: UX-4 закрыт в версии 0.7.0"
+          git push origin HEAD:agent/0.7-docs-staging
