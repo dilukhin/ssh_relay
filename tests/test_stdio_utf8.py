@@ -16,11 +16,13 @@ for stream in (sys.stdout, sys.stderr):
 
 with tempfile.TemporaryDirectory() as tmp:
     env = dict(os.environ)
-    env['PYTHONIOENCODING'] = 'cp1252'
+    env.pop('PYTHONUTF8', None)
+    env.pop('PYTHONIOENCODING', None)
     if os.name == 'nt':
         env['LOCALAPPDATA'] = tmp
     else:
         env['XDG_STATE_HOME'] = tmp
+        env['PYTHONIOENCODING'] = 'cp1252'
 
     proc = subprocess.run(
         [
