@@ -9,6 +9,11 @@ from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / 'ssh_relay.py'
 
+for stream in (sys.stdout, sys.stderr):
+    reconfigure = getattr(stream, 'reconfigure', None)
+    if callable(reconfigure):
+        reconfigure(encoding='utf-8', errors='replace')
+
 with tempfile.TemporaryDirectory() as tmp:
     env = dict(os.environ)
     env['PYTHONIOENCODING'] = 'cp1252'
