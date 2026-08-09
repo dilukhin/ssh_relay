@@ -1,0 +1,146 @@
+name: Проверить и опубликовать hotfix 0.7.0
+
+on:
+  push:
+    branches:
+      - agent/0.7-integration-staging
+
+permissions:
+  contents: write
+
+jobs:
+  protocol-tests:
+    name: Python ${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Проверить синтаксис
+        run: python -m py_compile ssh_relay.py tests/test_machine_protocol.py tests/test_local_tcp_protocol.py tests/test_reconnect_protocol.py tests/test_transfer_protocol.py tests/test_multi_session_protocol.py tests/test_real_ssh_reconnect.py tests/test_stdio_utf8.py
+      - name: Проверить машинный протокол
+        env:
+          PYTHONUTF8: '1'
+        run: python tests/test_machine_protocol.py
+      - name: Проверить UTF-8 вывод CLI
+        run: python tests/test_stdio_utf8.py
+      - name: Проверить локальный TCP-протокол
+        run: python tests/test_local_tcp_protocol.py
+      - name: Проверить reconnect
+        run: python tests/test_reconnect_protocol.py
+      - name: Проверить upload и download
+        run: python tests/test_transfer_protocol.py
+      - name: Проверить две именованные сессии
+        run: python tests/test_multi_session_protocol.py
+
+  real-paramiko-reconnect:
+    name: Реальный Paramiko + локальный sshd
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Установить зависимости теста
+        run: |
+          python -m pip install --disable-pip-version-check paramiko
+          sudo apt-get update
+          sudo apt-get install -y openssh-server openssh-client sudo
+      - name: Подготовить локальный SSH-сервер
+        run: |
+          set -eu
+          sudo mkdir -p /run/sshd
+          ssh-keygen -q -t ed25519 -N '' -f /tmp/ssh_relay_host_key
+          ssh-keygen -q -t ed25519 -N '' -f /tmp/ssh_relay_client_key
+          sudo useradd -m -s /bin/bash relaytest
+          echo 'relaytest:relaypass' | sudo chpasswd
+          sudo usermod -aG sudo relaytest
+          sudo install -d -m 700 -o relaytest -g relaytest /home/relaytest/.ssh
+          sudo install -m 600 -o relaytest -g relaytest /tmp/ssh_relay_client_key.pub /home/relaytest/.ssh/authorized_keys
+          cat >/tmp/ssh_relay_sshd_config <<'EOF'
+          Port 2222
+          ListenAddress 127.0.0.1
+          HostKey /tmp/ssh_relay_host_key
+          PidFile /tmp/ssh_relay_sshd.pid
+          AuthorizedKeysFile .ssh/authorized_keys
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          ChallengeResponseAuthentication no
+          UsePAM no
+          PermitRootLogin no
+          AllowUsers relaytest
+          StrictModes yes
+          LogLevel ERROR
+          Subsystem sftp internal-sftp
+          EOF
+          sudo /usr/sbin/sshd -f /tmp/ssh_relay_sshd_config -E /tmp/ssh_relay_sshd.log
+      - name: Проверить реальный reconnect
+        env:
+          SSH_RELAY_REAL_SSH_TEST: '1'
+          SSH_RELAY_TEST_SSH_HOST: 127.0.0.1
+          SSH_RELAY_TEST_SSH_PORT: '2222'
+          SSH_RELAY_TEST_USER: relaytest
+          SSH_RELAY_TEST_IDENTITY: /tmp/ssh_relay_client_key
+        run: python tests/test_real_ssh_reconnect.py
+      - name: Показать sshd log при ошибке
+        if: failure()
+        run: sudo cat /tmp/ssh_relay_sshd.log || true
+
+  publish:
+    name: Опубликовать проверенный hotfix в release-ветку
+    needs: [protocol-tests, real-paramiko-reconnect]
+    runs-on: ubuntu-latest
+    if: ${{ success() }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Проверить target и опубликовать три файла
+        shell: bash
+        env:
+          EXPECTED_TARGET: d7219742cd14acd8062bbf70f835c97b8a68eb8f
+          TARGET_BRANCH: agent/safe-integration-improvements
+        run: |
+          set -euo pipefail
+          TESTED_SHA="$GITHUB_SHA"
+          git fetch origin "$TARGET_BRANCH"
+          TARGET_HEAD="$(git rev-parse "origin/$TARGET_BRANCH")"
+          if [ "$TARGET_HEAD" != "$EXPECTED_TARGET" ]; then
+            echo "Target HEAD изменился: $TARGET_HEAD != $EXPECTED_TARGET" >&2
+            exit 1
+          fi
+          git switch --detach "$TARGET_HEAD"
+          git checkout "$TESTED_SHA" -- ssh_relay.py .github/workflows/tests.yml tests/test_stdio_utf8.py
+          mapfile -t changed < <(git diff --name-only | sort)
+          expected=(.github/workflows/tests.yml ssh_relay.py tests/test_stdio_utf8.py)
+          if [ "${changed[*]}" != "${expected[*]}" ]; then
+            printf 'Неожиданный набор файлов: %s\n' "${changed[*]}" >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- .github/workflows/tests.yml ssh_relay.py tests/test_stdio_utf8.py
+          git commit -m "исправлено: UTF-8 вывод CLI и Windows-тесты"
+          NEW_HEAD="$(git rev-parse HEAD)"
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
+          REMOTE_HEAD="$(git ls-remote origin "refs/heads/$TARGET_BRANCH" | cut -f1)"
+          if [ "$REMOTE_HEAD" != "$NEW_HEAD" ]; then
+            echo "Новый target HEAD не подтверждён" >&2
+            exit 1
+          fi
+          for path in ssh_relay.py .github/workflows/tests.yml tests/test_stdio_utf8.py; do
+            if [ "$(git rev-parse "$NEW_HEAD:$path")" != "$(git rev-parse "$TESTED_SHA:$path")" ]; then
+              echo "Blob $path не совпадает с проверенным staging" >&2
+              exit 1
+            fi
+          done
+          echo "Опубликован и проверен target HEAD: $NEW_HEAD"
