@@ -62,6 +62,18 @@ class JobShellTests(unittest.TestCase):
         self.assertEqual(second.returncode, 17)
         self.assertEqual(jobs.classify_job_command_failure(second.returncode, second.stdout), "job_active_exists")
 
+    def test_start_publishes_complete_process_identity(self):
+        for index in range(20):
+            name = f"identity{index}"
+            start = self.run_shell(jobs.build_job_start_command(name, "sleep 0.2"))
+            self.assertEqual(start.returncode, 0, start.stderr + start.stdout)
+            status = jobs.parse_job_status(start.stdout)
+            self.assertNotEqual(status["state"], "unknown", start.stdout)
+            self.assertIsInstance(status["pid"], int)
+            jobdir = self.state / "ssh_relay" / "jobs" / name
+            self.assertTrue((jobdir / "start_ticks").read_text().strip().isdigit())
+            self.wait_state(name, "succeeded")
+
     def test_exit_zero_becomes_succeeded_and_state_persists(self):
         start = self.run_shell(jobs.build_job_start_command("ok", "printf 'done\\n'"))
         self.assertEqual(start.returncode, 0)

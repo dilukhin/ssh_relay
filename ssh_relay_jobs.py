@@ -150,15 +150,19 @@ set -u
 umask 077
 jobdir=$1
 pid=$$
-printf '%s\n' "$pid" > "$jobdir/pid.tmp" && mv "$jobdir/pid.tmp" "$jobdir/pid"
 self_stat=$(cat "/proc/$$/stat" 2>/dev/null || printf '')
 self_rest=${self_stat##*) }
 set -- $self_rest
 start_ticks=''
 if [ "$#" -ge 20 ]; then start_ticks=${20}; fi
+if [ -z "$start_ticks" ]; then
+  printf '126\n' > "$jobdir/exit_code.tmp" && mv "$jobdir/exit_code.tmp" "$jobdir/exit_code"
+  exit 126
+fi
 printf '%s\n' "$start_ticks" > "$jobdir/start_ticks.tmp" && mv "$jobdir/start_ticks.tmp" "$jobdir/start_ticks"
 date +%s > "$jobdir/started_epoch.tmp" && mv "$jobdir/started_epoch.tmp" "$jobdir/started_epoch"
 : > "$jobdir/log"
+printf '%s\n' "$pid" > "$jobdir/pid.tmp" && mv "$jobdir/pid.tmp" "$jobdir/pid"
 command_b64=$(cat)
 read_rc=$?
 exec </dev/null
