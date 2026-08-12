@@ -232,23 +232,26 @@ class JobShellTests(unittest.TestCase):
         self.assertEqual(stopped_status["exit_code"], 143)
 
     def test_corrupted_terminal_state_is_not_reused(self):
-        jobdir = self.state / "ssh_relay" / "jobs" / "corrupt-dead"
-        jobdir.mkdir(parents=True)
-        (jobdir / "pid").write_text("999999\n")
-        (jobdir / "start_ticks").write_text("1\n")
-        (jobdir / "started_epoch").write_text(f"{int(time.time())}\n")
-        (jobdir / "exit_code").write_text("1-2\n")
-        (jobdir / "log").write_text("")
+        for index, invalid_exit in enumerate(("1-2", "999", "999999999999")):
+            name = f"corrupt-dead-{index}"
+            with self.subTest(exit_code=invalid_exit):
+                jobdir = self.state / "ssh_relay" / "jobs" / name
+                jobdir.mkdir(parents=True)
+                (jobdir / "pid").write_text("999999\n")
+                (jobdir / "start_ticks").write_text("1\n")
+                (jobdir / "started_epoch").write_text(f"{int(time.time())}\n")
+                (jobdir / "exit_code").write_text(invalid_exit + "\n")
+                (jobdir / "log").write_text("")
 
-        status_result, status = self.status("corrupt-dead")
-        self.assertEqual(status_result.returncode, 0)
-        self.assertEqual(status["state"], "unknown")
-        restart = self.run_shell(jobs.build_job_start_command("corrupt-dead", "printf should-not-run"))
-        self.assertEqual(restart.returncode, 18, restart.stderr + restart.stdout)
-        self.assertEqual(
-            jobs.classify_job_command_failure(restart.returncode, restart.stdout),
-            "job_unknown_existing",
-        )
+                status_result, status = self.status(name)
+                self.assertEqual(status_result.returncode, 0)
+                self.assertEqual(status["state"], "unknown")
+                restart = self.run_shell(jobs.build_job_start_command(name, "printf should-not-run"))
+                self.assertEqual(restart.returncode, 18, restart.stderr + restart.stdout)
+                self.assertEqual(
+                    jobs.classify_job_command_failure(restart.returncode, restart.stdout),
+                    "job_unknown_existing",
+                )
 
     def test_job_command_size_is_bounded(self):
         with self.assertRaises(ValueError):

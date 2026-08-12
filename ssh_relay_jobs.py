@@ -63,6 +63,8 @@ job_process_alive() {
 job_exit_code_valid() {
   value=$1
   case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#value}" -le 3 ] || return 1
+  [ "$value" -le 255 ] 2>/dev/null || return 1
   return 0
 }
 '''.strip()
