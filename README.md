@@ -1,43 +1,51 @@
 # ssh_relay
 
-`ssh_relay.py` — локальный SSH-relay для коротких неинтерактивных команд и управляемых длительных задач через заранее открытые именованные SSH-сессии.
+`ssh_relay.py` — локальный SSH-relay для коротких неинтерактивных команд, управляемых длительных удалённых задач и контролируемых передач файлов через заранее открытую именованную SSH-сессию.
 
-Пользователь вручную запускает `daemon` и проходит SSH-аутентификацию. После этого CLI-агент, в частности OpenCode, использует локальный relay: `exec`/`sudo-exec` для коротких команд и `job` для сборок, CTest, интеграционных тестов и других длительных неинтерактивных процессов. Прямой `ssh` агенту не нужен.
+Пользователь вручную запускает `daemon` и проходит SSH-аутентификацию. После этого CLI-агент, в частности OpenCode, работает только через локальный relay: `exec`/`sudo-exec` для коротких команд, `job` для длительных удалённых процессов и `upload`/`download` для SFTP-передач. Прямой `ssh` агенту не нужен.
 
-Текущая версия: `0.7.0`.
+Текущая версия: `0.8.0`.
 
-Внутренняя структура: `ssh_relay.py` остаётся основным CLI и задаёт фактическую версию; существующая реализация daemon/reconnect/SFTP/risky вынесена без функциональных изменений в `ssh_relay_core.py`, а удалённый протокол длительных задач изолирован в `ssh_relay_jobs.py`. `ssh_relay_core.py` не является самостоятельной точкой входа.
+Внутренняя структура:
+
+* `ssh_relay.py` — основной CLI и фактическая версия;
+* `ssh_relay_core.py` — daemon, reconnect, SFTP и существующий `--risky`;
+* `ssh_relay_jobs.py` — протокол управляемых длительных удалённых задач;
+* `ssh_relay_transfers.py` — прогресс, чанки, таймауты и безопасные частичные файлы для длительных передач.
 
 ## Возможности
 
 * именованные SSH-сессии с парольной или key/certificate-аутентификацией;
-* проверка host key только через доверенный `known_hosts`;
-* `exec` для коротких неинтерактивных команд с раздельными stdout/stderr и исходным exit code;
+* обязательная проверка host key через доверенный `known_hosts`;
+* `exec` для коротких команд с раздельными stdout/stderr и исходным exit code;
 * `sudo-exec` при явном `daemon --enable-sudo`;
-* `job start/status/tail/wait/stop/list` для управляемых длительных задач;
+* `job start/status/tail/wait/stop/list` для длительных неинтерактивных процессов;
 * `download` и `upload` одного обычного файла через SFTP;
+* наблюдаемый прогресс длительной передачи без чтения всего файла в память;
+* общий аварийный timeout и отдельный timeout отсутствия прогресса;
+* безопасные `.ssh-relay.part`, которые не выглядят как готовый файл;
 * SSH keepalive и автоматический reconnect с backoff `1, 2, 5, 10, 30` секунд;
 * локальный TCP-server только на `127.0.0.1` и токен сессии;
 * `status`, `status --all`, `list`, `stop`, `stop --all`;
-* detached daemon по SSH-ключу без интерактивных запросов;
 * существующий `--risky`/agent-safe receipt для коротких `exec`/`sudo-exec`.
+
+## Ключевое различие: `job` и file transfer
+
+`job` управляет удалённым процессом. После подтверждённого старта такой процесс может продолжать работать независимо от управляющего SSH-канала. Поэтому сборки, CTest и другие длительные процессы запускаются через `job`.
+
+`upload`/`download` — это SFTP-передача между локальной и удалённой сторонами. Она зависит от SSH/SFTP и **не является `job`**. Для неё relay использует собственную модель прогресса, таймаутов и частичных файлов.
+
+Не превращайте SFTP-передачу в удалённый shell-процесс ради унификации.
 
 ## Ограничения
 
-`exec` и `sudo-exec` предназначены только для коротких команд. Они не поддерживают интерактивный stdin, PTY, редакторы, shell, `top`, `less`, `passwd`, повторные запросы пароля, длительные процессы и потенциально большой вывод. Вывод короткой команды ограничен 4 МиБ, время — `--command-timeout`.
+`exec` и `sudo-exec` предназначены только для коротких неинтерактивных команд. Не поддерживаются PTY, интерактивный stdin, редакторы, shell, `top`, `less`, `passwd`, повторные запросы пароля и потенциально большой вывод. Вывод ограничен 4 МиБ, время — `--command-timeout`.
 
-`job` поддерживает длительные **неинтерактивные** процессы на Linux/Ubuntu. Встроенный sudo-пароль daemon для long-job на этапе 1 не используется. `job tail` читает только ограниченный хвост журнала.
-Команды, которые сами отделяются в новую session/process group или иным способом daemonize за пределы группы job, не поддерживаются: relay не сможет надёжно отслеживать и останавливать такие потомки.
+`job` поддерживает длительные **неинтерактивные** процессы на Linux/Ubuntu. Команды, которые самостоятельно daemonize и покидают process group job, не поддерживаются. Встроенный sudo-пароль daemon для long-job не используется.
 
-`download`/`upload` работают только с обычными файлами, доступными текущему SSH-пользователю. Каталоги, рекурсивная передача, специальные файлы, `sudo-download` и `sudo-upload` не поддерживаются.
+`upload`/`download` работают только с обычными файлами, доступными текущему SSH-пользователю. Не поддерживаются каталоги, рекурсивная передача, специальные файлы, `sudo-upload` и `sudo-download`.
 
-Ключевое правило для reconnect и long-job:
-
-```text
-таймаут или обрыв управляющего транспорта != завершение удалённого процесса
-```
-
-Если результат уже начатой операции неизвестен, relay не повторяет её автоматически. Для `job start` после reconnect сначала проверяйте `job status`/`job list`, а не запускайте вторую копию.
+Автоматическое resume в версии `0.8.0` **не поддерживается**. Размер частичного файла сам по себе недостаточен для доказательства, что это префикс того же исходного файла. Relay не имитирует безопасное resume без надёжной проверки идентичности данных.
 
 ## Требования
 
@@ -84,8 +92,8 @@ py .\ssh_relay.py job tail [--name NAME] --job JOB [--lines N] [--bytes SIZE]
 py .\ssh_relay.py job wait [--name NAME] --job JOB [--poll-interval SECONDS] [--timeout SECONDS]
 py .\ssh_relay.py job stop [--name NAME] --job JOB [--grace SECONDS] [--force]
 py .\ssh_relay.py job list [--name NAME]
-py .\ssh_relay.py download [--name NAME] [--overwrite] [--create-dirs] REMOTE_PATH LOCAL_PATH
-py .\ssh_relay.py upload [--name NAME] [--overwrite] [--create-dirs] LOCAL_PATH REMOTE_PATH
+py .\ssh_relay.py download [--name NAME] [--overwrite] [--create-dirs] [--idle-timeout SECONDS] [--discard-partial] REMOTE_PATH LOCAL_PATH
+py .\ssh_relay.py upload [--name NAME] [--overwrite] [--create-dirs] [--idle-timeout SECONDS] [--discard-partial] LOCAL_PATH REMOTE_PATH
 py .\ssh_relay.py status [--name NAME] [--all]
 py .\ssh_relay.py stop [--name NAME] [--all]
 py .\ssh_relay.py list
@@ -113,37 +121,19 @@ py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro -i "%U
 
 Для зашифрованного ключа используйте `--ask-key-passphrase`. Пароль, passphrase и sudo-пароль не записываются в session-файл. При reconnect необходимые секреты остаются только в памяти daemon до его остановки.
 
-`--detach` доступен только с `--identity-file` без интерактивного passphrase и без `--enable-sudo`:
+`--detach` доступен только с `--identity-file` без интерактивного passphrase и без `--enable-sudo`.
 
-```powershell
-py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro -i "$env:USERPROFILE\.ssh\id_ed25519" --detach
-```
-
-Пример рабочего daemon:
-
-```text
-SSH-соединение установлено: donpedro@198.51.100.42:22
-Имя сессии: prod
-Relay слушает локальный адрес 127.0.0.1:54321
-Файл сессии: C:\Users\User\AppData\Local\ssh_relay\sessions\prod.json
-Режим sudo: выключен
-Автовосстановление SSH: включено, ожидание запроса до 30 с, keepalive 30 с
-Для завершения нажмите Ctrl+C или выполните команду: stop --name prod
-```
-
-Имя сессии: 1–64 символа `[A-Za-z0-9_.-]`. `default` используется, если `--name` не задан.
+После обновления daemon старую активную сессию нужно остановить и запустить заново. Клиент `0.8.x` откажется запускать новый протокол длительных `upload`/`download` через daemon старее `0.8.0`, чтобы старый daemon не интерпретировал служебные чанки как обычную передачу.
 
 ## Автоматический reconnect
 
 Daemon сохраняет локальный TCP-server и session-файл при разрыве SSH. Повторные попытки выполняются с backoff `1, 2, 5, 10, 30` секунд, затем каждые 30 секунд. Host key проверяется заново тем же `known_hosts`.
 
-Если SSH недоступен **до начала** новой операции, relay может ждать восстановления до 30 секунд. Если разрыв произошёл **после начала**, операция не повторяется: сервер мог успеть выполнить её полностью или частично.
+Если SSH недоступен **до начала** новой операции, relay может ждать восстановления. Если разрыв произошёл **после начала** команды или чанка передачи, relay не считает его подтверждённым автоматически.
 
-`status` различает живой daemon и состояние SSH. Разрыв только удалённого SSH не удаляет session-файл.
+Для `job start` после неопределённого результата сначала проверяйте `job status`/`job list`. Для передачи сначала проверяйте фактический частичный файл и только затем решайте, как продолжать.
 
 ## exec и sudo-exec
-
-Короткие команды:
 
 ```powershell
 py .\ssh_relay.py exec --name prod "hostname && whoami && pwd"
@@ -156,129 +146,146 @@ py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro --enab
 py .\ssh_relay.py sudo-exec --name prod "whoami"
 ```
 
-Sudo-пароль передаётся только из памяти daemon во внутренний stdin `sudo -S`; `sudo-exec` остаётся неинтерактивным и предназначен для коротких команд.
-
-Для короткой изменяющей команды сохраняется `--risky`:
+Для короткой изменяющей команды сохраняется существующий `--risky`:
 
 ```powershell
 py .\ssh_relay.py exec --name prod --risky "mkdir -p ~/work/app"
 ```
 
-При exit code `0` receipt пишется в `~/.local/state/agent-safe/changes.jsonl` либо путь из `--receipt-path`. Ненулевой exit code финальный receipt не создаёт.
+При exit code `0` receipt пишется в `~/.local/state/agent-safe/changes.jsonl` либо путь из `--receipt-path`.
 
-## job — длительные задачи
+## job — длительные удалённые процессы
 
-### Жизненный цикл
+Типичный цикл:
 
 ```powershell
 py .\ssh_relay.py job start --name prod --job build-app "cd ~/src/app && cmake --build build -j2"
 py .\ssh_relay.py job status --name prod --job build-app
 py .\ssh_relay.py job tail --name prod --job build-app
 py .\ssh_relay.py job wait --name prod --job build-app --poll-interval 5 --timeout 7200
+```
+
+`job start` подтверждает запуск механизма job, а не успешное завершение команды. `job wait` локально опрашивает короткий status. Локальный timeout `job wait` не останавливает удалённую задачу. `job tail` возвращает только ограниченный хвост журнала.
+
+Остановка сначала мягкая; `--force` — отдельная явная ступень:
+
+```powershell
 py .\ssh_relay.py job stop --name prod --job build-app
-py .\ssh_relay.py job list --name prod
+py .\ssh_relay.py job stop --name prod --job build-app --force
 ```
 
-CTest:
+## Длительные download/upload
 
-```powershell
-py .\ssh_relay.py job start --name prod --job ctest-app "cd ~/src/app/build && ctest --output-on-failure"
-py .\ssh_relay.py job wait --name prod --job ctest-app --timeout 3600
-```
+### Прогресс
 
-### start
-
-`--job` принимает 1–64 символа `[A-Za-z0-9_.-]`. Активный job с тем же именем повторно не запускается. Если от старой задачи остался state без exit code, а сохранённый процесс нельзя подтвердить, состояние становится `unknown`; автоматическая перезапись такого state запрещена.
-
-Runner запускается через `setsid` в отдельной session/process group. Команда передаётся detached-runner через pipe и не сохраняется в job-state. stdout и stderr пишутся в один журнал, exit code — атомарно в отдельный файл.
-
-Успешный `job start` означает только, что launcher подтверждён. Это **не** успех длительной команды.
-
-Если подтверждение `start` потеряно, не повторяйте запуск:
-
-```powershell
-py .\ssh_relay.py job status --name prod --job build-app
-py .\ssh_relay.py job list --name prod
-```
-
-### status
-
-Состояния:
-
-* `running` — exit code ещё нет, PID и process start time подтверждены;
-* `succeeded` — `exit_code=0`;
-* `failed` — ненулевой exit code;
-* `unknown` — exit code отсутствует, а исходный процесс нельзя надёжно подтвердить.
-
-Поля: `job`, `state`, `pid`, `elapsed`, `exit_code`, `log_size`, `log_age`. Для защиты от PID reuse проверяется start time из `/proc/<pid>/stat`. Исчезновение PID не считается успехом.
-
-Remote state:
+Передача разбивается на последовательные чанки по 1 МиБ. После подтверждённого роста количества байтов CLI печатает прогресс не чаще примерно одного раза в секунду и всегда печатает начало/завершение:
 
 ```text
-${XDG_STATE_HOME:-$HOME/.local/state}/ssh_relay/jobs/<job>/
+Прогресс: transferred_bytes=4194304 total_bytes=16777216 percent=25.0 elapsed=3.2s speed=1310720.0B/s
 ```
 
-С `umask 077` сохраняются только `pid`, `start_ticks`, `started_epoch`, `exit_code` и `log`. Полная команда отдельно на диск не пишется.
+Поля:
 
-### tail
+* `transferred_bytes` — подтверждённое количество переданных байтов;
+* `total_bytes` — известный размер файла;
+* `percent` — процент от `0.0` до `100.0`;
+* `elapsed` — время текущего вызова передачи;
+* `speed` — средняя скорость по подтверждённым байтам.
 
-По умолчанию возвращаются максимум 80 строк и 64 КиБ; верхние пределы — 1000 строк и 256 КиБ:
+Рост `transferred_bytes`/`percent` означает, что передача продвигается. Отсутствие текстового вывода не используется как признак зависания.
+
+`upload` читает локальный файл чанками, а не целиком в память. В локальном JSON-запросе одновременно находится только текущий чанк.
+
+### Два разных timeout
+
+Сохраняется прежний смысл daemon-параметров:
+
+* `--download-timeout` — общий аварийный предел всего download;
+* `--upload-timeout` — общий аварийный предел всего upload.
+
+Они по-прежнему задаются при старте daemon и **не меняют смысл** в `0.8.0`.
+
+Дополнительно у `download` и `upload` есть `--idle-timeout`, по умолчанию 60 секунд. Это максимальный интервал без подтверждения одного сетевого шага/чанка. Пока чанки подтверждаются быстрее этого интервала, transfer считается живым. Общий аварийный предел при этом всё равно действует.
+
+Пример большого download с большим общим пределом:
 
 ```powershell
-py .\ssh_relay.py job tail --name prod --job build-app --lines 120 --bytes 128K
+py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro --download-timeout 7200 --download-max-size 4G
+py .\ssh_relay.py download --name prod "/srv/archive.bin" ".\archive.bin" --idle-timeout 90
 ```
 
-Строки прогресса вроде `[ 71%] Building CXX object ...` передаются без преобразований.
-
-### wait
-
-`job wait` **локально** опрашивает `job status` короткими запросами, а не удерживает SSH-channel на всё время. По умолчанию poll interval 5 секунд, локальный timeout 3600 секунд.
-
-Истечение локального timeout возвращает `124` и не останавливает удалённую задачу. `succeeded` возвращает `0`; `failed` возвращает сохранённый exit code, если он подходит для exit code локального процесса.
-
-### stop
-
-`job stop` не ищет процессы по тексту команды. Используются сохранённые PID, process start time и process group. Сначала отправляется SIGTERM и выполняется ожидание, по умолчанию 5 секунд:
+Пример upload:
 
 ```powershell
-py .\ssh_relay.py job stop --name prod --job build-app
+py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro --upload-timeout 7200 --upload-max-size 4G
+py .\ssh_relay.py upload --name prod ".\archive.bin" "/srv/incoming/archive.bin" --idle-timeout 90
 ```
 
-Если мягкая остановка не сработала, `--force` — отдельная явная ступень SIGKILL:
+В `cmd.exe` параметры те же:
+
+```cmd
+py .\ssh_relay.py upload --name prod ".\archive.bin" "/srv/incoming/archive.bin" --idle-timeout 90
+```
+
+### Частичный download
+
+Download пишет рядом с целевым локальным файлом детерминированный временный файл:
+
+```text
+.<имя>.ssh-relay.part
+```
+
+Готовый целевой файл не появляется до получения всех байтов, `fsync`, проверки размера и финального `os.replace`. При сбое partial сохраняется для диагностики и не выглядит как готовый результат.
+
+Если следующий вызов видит partial, он сначала получает актуальный размер удалённого файла и сообщает оба размера. Автоматическое resume не выполняется. После проверки можно явно удалить partial и начать заново:
 
 ```powershell
-py .\ssh_relay.py job stop --name prod --job build-app --grace 5 --force
+py .\ssh_relay.py download --name prod "/srv/archive.bin" ".\archive.bin" --discard-partial
 ```
 
-### sudo и agent-safe
+Если удалённый размер или `mtime` меняется во время одного download, финализация запрещается.
 
-На этапе 1 long-job через встроенный sudo-пароль daemon не реализован: безопасный вариант требует единого privilege context для запуска, state/status/tail/stop. Ограниченный `sudo -n`/`NOPASSWD` внутри конкретной команды допустим только как отдельная политика сервера.
+### Частичный upload
 
-`job start` не поддерживает `--risky`, потому что существующий agent-safe receipt `status=done` после успешного launcher был бы ложным финальным успехом. Для отдельной доработки agent-safe нужен lifecycle-контракт:
+Upload использует рядом с удалённым целевым путём:
 
-* события `started`, `completed`, `failed` и желательно `stopped`;
-* стабильный `job`/correlation ID;
-* terminal `exit_code`;
-* идемпотентный dedup-ключ;
-* возможность не сохранять исходную команду либо хранить только безопасный hash/redacted summary.
+```text
+.<имя>.ssh-relay.part
+```
 
-До появления такого контракта `ssh_relay` не создаёт несовместимый формат receipts для job.
+Каждый следующий чанк разрешён только если фактический размер partial совпадает с ожидаемым offset. После полной передачи размер проверяется ещё раз. Если целевого файла не было, partial переименовывается в него только после успешной проверки.
 
-## download и upload
+При `--overwrite` существующий готовый файл не удаляется заранее. Для его замены требуется поддержка SFTP `posix-rename`; если безопасная замена недоступна или завершается ошибкой, старый готовый файл сохраняется, а partial остаётся для диагностики.
 
-Скачать один файл:
+При повторном вызове существующий partial сначала обнаруживается и его размер показывается. Автоматическое resume не выполняется. Для явного перезапуска:
 
 ```powershell
-py .\ssh_relay.py download --name prod "/var/log/app.log" ".\downloads\app.log" --create-dirs
+py .\ssh_relay.py upload --name prod ".\archive.bin" "/srv/incoming/archive.bin" --overwrite --discard-partial
 ```
 
-Загрузить один файл:
+`probe` не создаёт удалённые каталоги даже при `--create-dirs`; создание начинается только на подтверждённой фазе `begin`.
 
-```powershell
-py .\ssh_relay.py upload --name prod ".\config.json" "/tmp/config.json" --overwrite
-```
+### Обрыв SSH/SFTP
 
-Размер и время ограничиваются параметрами daemon `--download-*`/`--upload-*`. `upload` начиная с `0.5.1` читает локальный файл в CLI-процессе и поэтому корректно работает с detached daemon; Windows-style удалённые пути нормализуются для SFTP.
+Обрыв текущего чанка не считается успехом. Relay не повторяет изменяющий upload-чанк вслепую: сервер мог принять данные до потери подтверждения.
+
+После reconnect следующий запуск сначала делает `probe` и сравнивает фактическое состояние готового и частичного файла. Поскольку безопасное автоматическое resume пока не доказано, найденный partial требует явного решения пользователя/агента: сохранить для проверки либо удалить через `--discard-partial` и начать заново.
+
+`--overwrite` при этом не обходится.
+
+## Размеры
+
+Сохраняются лимиты `--download-max-size` и `--upload-max-size`. Размер задаётся числом байт либо с суффиксом `K`, `M`, `G`.
+
+Большой лимит следует выставлять осознанно. Relay по-прежнему передаёт только один файл за вызов и не поддерживает рекурсивную передачу.
+
+## agent-safe
+
+`upload` меняет удалённое состояние, однако существующий agent-safe receipt имеет контракт короткой команды `status=done`. В `0.8.0` для transfer не создаётся новый несовместимый receipt-формат и `--risky` к `upload` не добавляется.
+
+Это явное ограничение: если для file transfer потребуется lifecycle receipt, его нужно проектировать отдельно с состояниями начала/завершения/ошибки и стабильным transfer ID. До этого upload остаётся существующей явной изменяющей командой relay без agent-safe receipt.
+
+`download` обычно не меняет удалённое состояние; локальный overwrite по-прежнему требует `--overwrite`.
 
 ## status, list, stop
 
@@ -297,7 +304,7 @@ Session-файлы:
 * Windows: `%LOCALAPPDATA%\ssh_relay\sessions\<name>.json`;
 * Linux: `${XDG_STATE_HOME:-~/.local/state}/ssh_relay/sessions/<name>.json`.
 
-На Linux каталоги состояния создаются с `0700`, session-файлы — `0600`. Токен session-файла чувствителен и не должен попадать в Git, логи или недоверенные процессы.
+На Linux каталоги состояния создаются с `0700`, session-файлы — `0600`. Токен чувствителен и не должен попадать в Git, логи или недоверенные процессы.
 
 ## Использование с OpenCode
 
@@ -306,74 +313,62 @@ Session-файлы:
 ```text
 1. Не используй прямой ssh.
 2. status --name <session>.
-3. Короткая диагностика через exec: hostname && whoami && pwd.
+3. Короткая диагностика: exec "hostname && whoami && pwd".
 4. Короткие команды — exec/sudo-exec.
-5. Длительные процессы — job.
-6. Таймаут транспорта != ошибка процесса.
-7. При неизвестном результате job start не повторяй запуск; сначала job status/job list.
-8. Не раскрывай пароли, ключи, токены, секреты из команд и логов.
+5. Длительные удалённые процессы — job.
+6. Большие upload/download — собственный transfer-механизм, не job.
+7. Рост байтов/процента означает живую передачу.
+8. Idle timeout и общий timeout — разные причины остановки.
+9. После обрыва не повторяй upload/download вслепую; сначала проверь partial.
+10. Не раскрывай секреты в командах, выводе, логах и receipts.
 ```
-
-Skill не содержит IP, имён конкретных серверов или специфики BS Downloader и предназначен как источник истины для последующей установки через `opencode_setup`.
 
 ## Безопасность
 
 * SSH-пароль, passphrase и sudo-пароль не сохраняются на диск и не выводятся в логи.
 * Приватный ключ не копируется в session-файл.
-* Session token не выводится в CLI и даёт доступ к активному локальному daemon; защищайте session-файл.
-* `known_hosts` обязателен; автоматический accept неизвестного host key не используется.
+* Session token не выводится в CLI; защищайте session-файл.
+* `known_hosts` обязателен; неизвестный host key автоматически не принимается.
 * Все локальные relay-запросы идут только на `127.0.0.1` и проверяются по токену.
-* Job-state создаётся с `umask 077`; полная команда отдельно в state не сохраняется.
-* `job stop` проверяет PID вместе с process start time и не выполняет поиск по тексту команды.
-* Возможность выполнения произвольной shell-команды — назначение relay; не расширяйте её без оценки угроз.
-* Для постоянной эксплуатации root-команд предпочтительнее ограниченный `NOPASSWD`, а не широкий sudo-пароль в памяти relay.
+* `download` не заменяет готовый локальный файл без `--overwrite`.
+* `upload` не заменяет готовый удалённый файл без `--overwrite`.
+* Частичный файл никогда не выдаётся за готовый результат.
+* Возможность выполнения произвольной shell-команды — назначение relay; её не следует расширять без оценки угроз.
 
 ## Проверка
 
 Без SSH-сервера:
 
 ```powershell
-py -m py_compile .\ssh_relay.py .\ssh_relay_jobs.py .\tests\test_jobs.py
+py -m py_compile .\ssh_relay.py .\ssh_relay_core.py .\ssh_relay_jobs.py .\ssh_relay_transfers.py .\tests\test_jobs.py .\tests\test_transfers.py
 py -m unittest discover -s .\tests -v
 py .\ssh_relay.py --version
 py .\ssh_relay.py --help
-py .\ssh_relay.py daemon --help
-py .\ssh_relay.py exec --help
-py .\ssh_relay.py sudo-exec --help
-py .\ssh_relay.py job --help
-py .\ssh_relay.py job start --help
-py .\ssh_relay.py job status --help
-py .\ssh_relay.py job tail --help
-py .\ssh_relay.py job wait --help
-py .\ssh_relay.py job stop --help
-py .\ssh_relay.py job list --help
 py .\ssh_relay.py download --help
 py .\ssh_relay.py upload --help
-py .\ssh_relay.py status --help
-py .\ssh_relay.py stop --help
-py .\ssh_relay.py list --help
+py .\ssh_relay.py job --help
 ```
 
-Перед ручным тестом изменённого daemon старую сессию нужно остановить и запустить заново.
+Перед ручным тестом изменённого daemon старую сессию обязательно остановите и запустите заново.
 
-PowerShell проверяет код через `$LASTEXITCODE`. В `cmd.exe`/Far Manager код нужно читать в той же командной строке; отдельный следующий `echo %ERRORLEVEL%` в Far Manager ненадёжен:
-
-```cmd
-cmd /V:ON /C "py .\ssh_relay.py sudo-exec --name prod ^"sh -c 'exit 7'^" & echo Exit code: !ERRORLEVEL!"
-```
-
-Минимальный remote job-тест:
+Минимальный transfer-тест:
 
 ```powershell
-py .\ssh_relay.py job start --name prod --job relay-long-test "sh -c 'echo start; sleep 3; echo done; exit 0'"
-py .\ssh_relay.py job status --name prod --job relay-long-test
-py .\ssh_relay.py job tail --name prod --job relay-long-test
-py .\ssh_relay.py job wait --name prod --job relay-long-test --timeout 30
+Set-Content -NoNewline .\relay-transfer-test.txt "transfer-ok"
+py .\ssh_relay.py upload --name prod ".\relay-transfer-test.txt" "/tmp/relay-transfer-test.txt" --overwrite
+py .\ssh_relay.py download --name prod "/tmp/relay-transfer-test.txt" ".\relay-transfer-test.downloaded.txt" --overwrite
+Get-Content .\relay-transfer-test.downloaded.txt
+$LASTEXITCODE
 ```
+
+PowerShell проверяет код через `$LASTEXITCODE`.
+
+В `cmd.exe` код проверяйте через `%ERRORLEVEL%` в том же `cmd.exe`. В Far Manager не полагайтесь на отдельную следующую команду `echo %ERRORLEVEL%`, потому что она может выполняться в другом экземпляре командного процессора.
 
 ## Дальнейшие доработки
 
-* lifecycle receipts agent-safe для long-job;
+* доказуемое resume с проверкой идентичности источника/partial;
+* lifecycle receipts agent-safe для long-job и transfer;
 * отдельная безопасная архитектура длительных sudo-job;
-* этап 2 — крупные/рекурсивные SFTP-передачи;
-* дополнительные интеграционные тесты reconnect/job на тестовом SSH-сервере.
+* рекурсивная передача каталогов только после отдельной оценки лимитов и угроз;
+* интеграционные тесты обрывов SFTP на тестовом SSH-сервере.
