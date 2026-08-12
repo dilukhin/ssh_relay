@@ -60,6 +60,11 @@ job_process_alive() {
   [ "$current_ticks" = "$expected_ticks" ] || return 1
   kill -0 "$p" 2>/dev/null
 }
+job_exit_code_valid() {
+  value=$1
+  case "$value" in ''|*[!0-9]*) return 1 ;; esac
+  return 0
+}
 '''.strip()
 
 
@@ -94,11 +99,11 @@ alive=0
 if job_process_alive "$pid" "$start_ticks"; then alive=1; fi
 if [ -r "$jobdir/exit_code" ]; then
   exit_code=$(cat "$jobdir/exit_code" 2>/dev/null || true)
-  case "$exit_code" in
-    ''|*[!0-9-]*) state="unknown" ;;
-    0) state="succeeded" ;;
-    *) state="failed" ;;
-  esac
+  if job_exit_code_valid "$exit_code"; then
+    if [ "$exit_code" = "0" ]; then state="succeeded"; else state="failed"; fi
+  else
+    state="unknown"
+  fi
 elif [ "$alive" -eq 1 ]; then
   state="running"
 fi
@@ -215,14 +220,15 @@ exit "$rc"
             'command -v base64 >/dev/null 2>&1 || { printf "start_error=base64_missing\\n"; exit 19; }',
             'mkdir -p "$root"',
             'if [ -d "$jobdir" ]; then',
-            '  if [ -r "$jobdir/exit_code" ]; then',
+            '  pid=""; old_ticks=""; alive=0; stored_exit=""',
+            '  if [ -r "$jobdir/pid" ]; then pid=$(cat "$jobdir/pid" 2>/dev/null || true); fi',
+            '  if [ -r "$jobdir/start_ticks" ]; then old_ticks=$(cat "$jobdir/start_ticks" 2>/dev/null || true); fi',
+            '  if job_process_alive "$pid" "$old_ticks"; then alive=1; fi',
+            '  if [ "$alive" -eq 1 ]; then printf "start_error=active_exists\\n"; exit 17; fi',
+            '  if [ -r "$jobdir/exit_code" ]; then stored_exit=$(cat "$jobdir/exit_code" 2>/dev/null || true); fi',
+            '  if job_exit_code_valid "$stored_exit"; then',
             '    rm -rf "$jobdir"',
             '  else',
-            '    pid=""; old_ticks=""; alive=0',
-            '    if [ -r "$jobdir/pid" ]; then pid=$(cat "$jobdir/pid" 2>/dev/null || true); fi',
-            '    if [ -r "$jobdir/start_ticks" ]; then old_ticks=$(cat "$jobdir/start_ticks" 2>/dev/null || true); fi',
-            '    if job_process_alive "$pid" "$old_ticks"; then alive=1; fi',
-            '    if [ "$alive" -eq 1 ]; then printf "start_error=active_exists\\n"; exit 17; fi',
             '    printf "start_error=unknown_existing\\n"; exit 18',
             '  fi',
             'fi',
@@ -258,18 +264,21 @@ def build_job_stop_command(job: str, *, force: bool, grace_seconds: float = DEFA
         [
             _state_prelude(job),
             'if [ ! -d "$jobdir" ]; then printf "stop_error=not_found\\n"; exit 44; fi',
-            'if [ -r "$jobdir/exit_code" ]; then ' + _emit_status_shell() + '; exit 0; fi',
-            'pid=""; old_ticks=""',
+            'pid=""; old_ticks=""; stored_exit=""; alive=0',
             'if [ -r "$jobdir/pid" ]; then pid=$(cat "$jobdir/pid" 2>/dev/null || true); fi',
             'if [ -r "$jobdir/start_ticks" ]; then old_ticks=$(cat "$jobdir/start_ticks" 2>/dev/null || true); fi',
-            'valid=0',
-            'if job_process_alive "$pid" "$old_ticks"; then valid=1; fi',
-            'if [ "$valid" -ne 1 ]; then printf "stop_error=identity_mismatch\\n"; ' + _emit_status_shell() + '; exit 20; fi',
+            'if job_process_alive "$pid" "$old_ticks"; then alive=1; fi',
+            'if [ -r "$jobdir/exit_code" ]; then stored_exit=$(cat "$jobdir/exit_code" 2>/dev/null || true); fi',
+            'if [ "$alive" -ne 1 ]; then',
+            '  if job_exit_code_valid "$stored_exit"; then ' + _emit_status_shell() + '; exit 0; fi',
+            '  printf "stop_error=identity_mismatch\\n"; ' + _emit_status_shell() + '; exit 20',
+            'fi',
             '/bin/kill -TERM -- "-$pid" 2>/dev/null || /bin/kill -TERM "$pid" 2>/dev/null || true',
             f'i=0; while [ "$i" -lt {checks} ]; do if ! job_process_alive "$pid" "$old_ticks"; then break; fi; sleep 0.1; i=$((i+1)); done',
             f'if job_process_alive "$pid" "$old_ticks" && [ "{force_flag}" = "1" ]; then /bin/kill -KILL -- "-$pid" 2>/dev/null || /bin/kill -KILL "$pid" 2>/dev/null || true; sleep 0.05; fi',
             f'if job_process_alive "$pid" "$old_ticks"; then printf "stop_error=still_running\\n"; {_emit_status_shell()}; exit 21; fi',
-            f'if [ ! -r "$jobdir/exit_code" ]; then if [ "{force_flag}" = "1" ]; then code=137; else code=143; fi; printf "%s\\n" "$code" > "$jobdir/exit_code.tmp" && mv "$jobdir/exit_code.tmp" "$jobdir/exit_code"; fi',
+            'stored_exit=""; if [ -r "$jobdir/exit_code" ]; then stored_exit=$(cat "$jobdir/exit_code" 2>/dev/null || true); fi',
+            f'if ! job_exit_code_valid "$stored_exit"; then if [ "{force_flag}" = "1" ]; then code=137; else code=143; fi; printf "%s\\n" "$code" > "$jobdir/exit_code.tmp" && mv "$jobdir/exit_code.tmp" "$jobdir/exit_code"; fi',
             _emit_status_shell(),
         ]
     )

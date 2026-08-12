@@ -207,6 +207,49 @@ class JobShellTests(unittest.TestCase):
         self.assertEqual(stopped.returncode, 20)
         self.assertEqual(jobs.classify_job_command_failure(stopped.returncode, stopped.stdout), "identity_mismatch")
 
+    def test_corrupted_exit_code_never_allows_duplicate_running_job(self):
+        start = self.run_shell(jobs.build_job_start_command("corrupt-live", "sleep 30"))
+        self.assertEqual(start.returncode, 0, start.stderr + start.stdout)
+        jobdir = self.state / "ssh_relay" / "jobs" / "corrupt-live"
+        (jobdir / "exit_code").write_text("garbage\n")
+
+        _, status = self.status("corrupt-live")
+        self.assertEqual(status["state"], "unknown")
+        duplicate = self.run_shell(jobs.build_job_start_command("corrupt-live", "printf duplicate"))
+        self.assertEqual(duplicate.returncode, 17, duplicate.stderr + duplicate.stdout)
+        self.assertEqual(
+            jobs.classify_job_command_failure(duplicate.returncode, duplicate.stdout),
+            "job_active_exists",
+        )
+
+        stopped = self.run_shell(
+            jobs.build_job_stop_command("corrupt-live", force=False, grace_seconds=2),
+            timeout=5,
+        )
+        self.assertEqual(stopped.returncode, 0, stopped.stderr + stopped.stdout)
+        stopped_status = jobs.parse_job_status(stopped.stdout)
+        self.assertEqual(stopped_status["state"], "failed")
+        self.assertEqual(stopped_status["exit_code"], 143)
+
+    def test_corrupted_terminal_state_is_not_reused(self):
+        jobdir = self.state / "ssh_relay" / "jobs" / "corrupt-dead"
+        jobdir.mkdir(parents=True)
+        (jobdir / "pid").write_text("999999\n")
+        (jobdir / "start_ticks").write_text("1\n")
+        (jobdir / "started_epoch").write_text(f"{int(time.time())}\n")
+        (jobdir / "exit_code").write_text("1-2\n")
+        (jobdir / "log").write_text("")
+
+        status_result, status = self.status("corrupt-dead")
+        self.assertEqual(status_result.returncode, 0)
+        self.assertEqual(status["state"], "unknown")
+        restart = self.run_shell(jobs.build_job_start_command("corrupt-dead", "printf should-not-run"))
+        self.assertEqual(restart.returncode, 18, restart.stderr + restart.stdout)
+        self.assertEqual(
+            jobs.classify_job_command_failure(restart.returncode, restart.stdout),
+            "job_unknown_existing",
+        )
+
     def test_job_command_size_is_bounded(self):
         with self.assertRaises(ValueError):
             jobs.build_job_start_command("large", "x" * (jobs.MAX_JOB_COMMAND_BYTES + 1))
