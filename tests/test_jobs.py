@@ -148,6 +148,34 @@ class JobShellTests(unittest.TestCase):
         self.assertEqual(parsed["state"], "failed")
         self.assertEqual(parsed["exit_code"], 137)
 
+    def test_background_descendant_keeps_job_running_and_force_stops_group(self):
+        command = "sh -c 'trap \"\" TERM; while :; do sleep 1; done' & exit 0"
+        start = self.run_shell(jobs.build_job_start_command("descendant", command))
+        self.assertEqual(start.returncode, 0, start.stderr + start.stdout)
+        time.sleep(0.15)
+        _, status = self.status("descendant")
+        self.assertEqual(status["state"], "running")
+
+        soft = self.run_shell(
+            jobs.build_job_stop_command("descendant", force=False, grace_seconds=0.2),
+            timeout=3,
+        )
+        self.assertEqual(soft.returncode, 21, soft.stderr + soft.stdout)
+        forced = self.run_shell(
+            jobs.build_job_stop_command("descendant", force=True, grace_seconds=0.2),
+            timeout=3,
+        )
+        self.assertEqual(forced.returncode, 0, forced.stderr + forced.stdout)
+        self.assertEqual(jobs.parse_job_status(forced.stdout)["exit_code"], 137)
+
+    def test_stale_separate_start_lock_cannot_block_job_name(self):
+        root = self.state / "ssh_relay" / "jobs"
+        root.mkdir(parents=True)
+        (root / ".nolock.start-lock").mkdir()
+        start = self.run_shell(jobs.build_job_start_command("nolock", "exit 0"))
+        self.assertEqual(start.returncode, 0, start.stderr + start.stdout)
+        self.wait_state("nolock", "succeeded")
+
     def test_state_files_do_not_store_full_command(self):
         secret_marker = "sensitive-command-marker-42"
         start = self.run_shell(jobs.build_job_start_command("nostore", f"sleep 1 # {secret_marker}"))

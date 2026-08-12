@@ -188,6 +188,21 @@ while :; do
   rc=$?
   if ! kill -0 "$child_pid" 2>/dev/null; then break; fi
 done
+job_group_has_other_processes() {
+  for proc_path in /proc/[0-9]*/stat; do
+    proc_stat=$(cat "$proc_path" 2>/dev/null) || continue
+    proc_pid=${proc_stat%% *}
+    proc_rest=${proc_stat##*) }
+    set -- $proc_rest
+    [ "$#" -ge 3 ] || continue
+    proc_state=$1; proc_pgrp=$3
+    [ "$proc_pid" != "$$" ] || continue
+    [ "$proc_state" != "Z" ] && [ "$proc_state" != "X" ] || continue
+    [ "$proc_pgrp" = "$pid" ] && return 0
+  done
+  return 1
+}
+while job_group_has_other_processes; do sleep 0.1; done
 trap - HUP INT TERM
 printf '%s\n' "$rc" > "$jobdir/exit_code.tmp" && mv "$jobdir/exit_code.tmp" "$jobdir/exit_code"
 exit "$rc"
@@ -199,9 +214,6 @@ exit "$rc"
             'command -v setsid >/dev/null 2>&1 || { printf "start_error=setsid_missing\\n"; exit 19; }',
             'command -v base64 >/dev/null 2>&1 || { printf "start_error=base64_missing\\n"; exit 19; }',
             'mkdir -p "$root"',
-            'lock="$root/.$job.start-lock"',
-            'if ! mkdir "$lock" 2>/dev/null; then printf "start_error=start_locked\\n"; exit 17; fi',
-            "trap 'rmdir \"$lock\" 2>/dev/null || true' EXIT HUP INT TERM",
             'if [ -d "$jobdir" ]; then',
             '  if [ -r "$jobdir/exit_code" ]; then',
             '    rm -rf "$jobdir"',
@@ -214,7 +226,7 @@ exit "$rc"
             '    printf "start_error=unknown_existing\\n"; exit 18',
             '  fi',
             'fi',
-            'mkdir "$jobdir"',
+            'if ! mkdir "$jobdir" 2>/dev/null; then printf "start_error=start_locked\\n"; exit 17; fi',
             f"printf '%s\\n' {shlex.quote(command_b64)} | setsid sh -c {shlex.quote(runner)} sh \"$jobdir\" >/dev/null 2>&1 &",
             'launcher_pid=$!',
             'i=0; while [ "$i" -lt 40 ] && [ ! -r "$jobdir/pid" ] && [ ! -r "$jobdir/exit_code" ]; do sleep 0.05; i=$((i+1)); done',
