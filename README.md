@@ -1,92 +1,67 @@
 # ssh_relay
 
-`ssh_relay.py` — локальный SSH-relay для выполнения коротких неинтерактивных команд через одну или несколько заранее открытых именованных SSH-сессий.
+`ssh_relay.py` — локальный SSH-relay для коротких неинтерактивных команд и управляемых длительных задач через заранее открытые именованные SSH-сессии.
 
-Основной сценарий: пользователь вручную запускает один или несколько `daemon`, проходя SSH-аутентификацию паролем либо заданным ключом/сертификатом, после чего CLI-агент, в частности OpenCode, выполняет удалённые команды через локальный вызов `exec` или явно включённый `sudo-exec`, не используя прямой SSH и не запрашивая SSH-учётные данные повторно.
+Пользователь вручную запускает `daemon` и проходит SSH-аутентификацию. После этого CLI-агент, в частности OpenCode, использует локальный relay: `exec`/`sudo-exec` для коротких команд и `job` для сборок, CTest, интеграционных тестов и других длительных неинтерактивных процессов. Прямой `ssh` агенту не нужен.
 
-Текущая версия: `0.6.0`.
+Текущая версия: `0.7.0`.
+
+Внутренняя структура: `ssh_relay.py` остаётся основным CLI и задаёт фактическую версию; существующая реализация daemon/reconnect/SFTP/risky вынесена без функциональных изменений в `ssh_relay_core.py`, а удалённый протокол длительных задач изолирован в `ssh_relay_jobs.py`. `ssh_relay_core.py` не является самостоятельной точкой входа.
 
 ## Возможности
 
-* открытие одной или нескольких именованных SSH-сессий по паролю, приватному SSH-ключу либо OpenSSH-сертификату и их использование до ручной остановки;
-* выполнение одной удалённой команды за вызов `exec`;
-* явный режим `sudo` через `daemon --enable-sudo` и отдельную команду `sudo-exec`;
-* скачивание одного обычного удалённого файла через активную SSH-сессию командой `download`;
-* загрузка одного обычного локального файла на удалённый сервер через активную SSH-сессию командой `upload`;
-* автоматическое восстановление SSH-соединения после разрыва с backoff `1, 2, 5, 10, 30` секунд;
-* SSH keepalive каждые 30 секунд и фоновый контроль состояния транспорта;
-* ожидание восстановления SSH до 30 секунд перед новым `exec`, `sudo-exec`, `download` или `upload`;
-* проверка локального daemon и фактического состояния SSH через аутентифицированный запрос `status`;
-* проверка всех известных сессий через `status --all` и просмотр списка через `list`;
-* корректная остановка daemon через аутентифицированный запрос `stop`;
-* прослушивание только локального адреса `127.0.0.1`;
-* обязательная проверка SSH host key через `known_hosts`;
-* ограничение вывода команды размером 4 МиБ, ограничение времени выполнения команды, а также лимиты размера и времени для скачивания и загрузки файлов.
+* именованные SSH-сессии с парольной или key/certificate-аутентификацией;
+* проверка host key только через доверенный `known_hosts`;
+* `exec` для коротких неинтерактивных команд с раздельными stdout/stderr и исходным exit code;
+* `sudo-exec` при явном `daemon --enable-sudo`;
+* `job start/status/tail/wait/stop/list` для управляемых длительных задач;
+* `download` и `upload` одного обычного файла через SFTP;
+* SSH keepalive и автоматический reconnect с backoff `1, 2, 5, 10, 30` секунд;
+* локальный TCP-server только на `127.0.0.1` и токен сессии;
+* `status`, `status --all`, `list`, `stop`, `stop --all`;
+* detached daemon по SSH-ключу без интерактивных запросов;
+* существующий `--risky`/agent-safe receipt для коротких `exec`/`sudo-exec`.
 
 ## Ограничения
 
-Relay предназначен только для коротких неинтерактивных команд.
+`exec` и `sudo-exec` предназначены только для коротких команд. Они не поддерживают интерактивный stdin, PTY, редакторы, shell, `top`, `less`, `passwd`, повторные запросы пароля, длительные процессы и потенциально большой вывод. Вывод короткой команды ограничен 4 МиБ, время — `--command-timeout`.
 
-Не поддерживаются:
+`job` поддерживает длительные **неинтерактивные** процессы на Linux/Ubuntu. Встроенный sudo-пароль daemon для long-job на этапе 1 не используется. `job tail` читает только ограниченный хвост журнала.
 
-* интерактивный ввод в удалённую команду;
-* обычный пропуск `sudo` через `exec` с запросом пароля;
-* редакторы, интерактивные shell, `top`, `less`, `passwd`, команды с повторными запросами ввода;
-* скачивание и загрузка каталогов, рекурсивное копирование, SCP-режим и специальные файлы;
-* `sudo-download` и `sudo-upload`: команды `download` и `upload` работают только с файлами, доступными текущему SSH-пользователю через SFTP;
-* параллельное выполнение удалённых команд и скачиваний;
-* длительные задачи и команды с большим выводом.
+`download`/`upload` работают только с обычными файлами, доступными текущему SSH-пользователю. Каталоги, рекурсивная передача, специальные файлы, `sudo-download` и `sudo-upload` не поддерживаются.
 
-Команды, скачивания и загрузки выполняются последовательно. Псевдотерминал для удалённых команд не создаётся. Если команда выдаёт более 4 МиБ данных либо работает дольше установленного лимита, relay завершает её с диагностическим сообщением. Если файл превышает лимит передачи либо передаётся дольше разрешённого времени, relay останавливает операцию и удаляет временный файл.
+Ключевое правило для reconnect и long-job:
 
-`sudo-exec` не делает relay интерактивным. Sudo-пароль передаётся только внутренне из памяти daemon в stdin удалённой команды `sudo -S`; обычный `exec` stdin от пользователя не принимает.
+```text
+таймаут или обрыв управляющего транспорта != завершение удалённого процесса
+```
 
-Если SSH разорвался до начала новой операции, daemon ждёт восстановления до 30 секунд и после успешного reconnect выполняет операцию один раз. Если SSH разорвался уже во время команды или передачи файла, relay не повторяет эту операцию автоматически: сервер мог успеть выполнить её полностью или частично, поэтому клиент получает сообщение, что результат неизвестен.
+Если результат уже начатой операции неизвестен, relay не повторяет её автоматически. Для `job start` после reconnect сначала проверяйте `job status`/`job list`, а не запускайте вторую копию.
 
 ## Требования
 
-Локальная сторона:
+Локально:
 
-* Windows с PowerShell или `cmd.exe`;
-* Python 3.12 или новее;
-* библиотека `paramiko`;
-* сетевой доступ к SSH-порту удалённого сервера.
+* Windows, PowerShell или `cmd.exe`;
+* Python 3.12+;
+* `paramiko`.
 
-Удалённая сторона:
+Удалённо:
 
-* Linux/Ubuntu-сервер;
-* работающая служба SSH;
-* учётная запись с разрешённой парольной SSH-аутентификацией либо аутентификацией по ключу/сертификату;
-* shell для выполнения переданных команд;
-* для `sudo-exec` — право пользователя выполнять нужные команды через `sudo`.
+* Linux/Ubuntu и SSH;
+* POSIX shell;
+* для `job`: Linux `/proc`, `setsid`, `base64`, `date`, `stat`, `tail`, `wc`;
+* для `sudo-exec`: право выполнять нужные команды через `sudo`.
 
-Сам relay работает локально. Установка Python или `paramiko` на удалённый сервер для работы `ssh_relay.py` не требуется.
-
-## Установка зависимости
+Установка зависимости:
 
 ```powershell
 py -m pip install paramiko
 ```
 
-## Проверка версии и справка
+## known_hosts
 
-```powershell
-py .\ssh_relay.py --version
-py .\ssh_relay.py -v
-py .\ssh_relay.py --help
-```
-
-Ожидаемый вывод версии:
-
-```text
-ssh_relay 0.6.0
-```
-
-## Подготовка `known_hosts`
-
-Relay не принимает неизвестный ключ SSH-сервера автоматически. До первого подключения добавьте ключ сервера в `%USERPROFILE%\.ssh\known_hosts` либо передайте отдельный проверенный файл параметром `--known-hosts`.
-
-Пример получения публичного ключа сервера в PowerShell:
+Relay не принимает неизвестный host key автоматически. До запуска добавьте проверенный ключ сервера в `%USERPROFILE%\.ssh\known_hosts` либо передайте отдельный файл через `--known-hosts`.
 
 ```powershell
 New-Item -ItemType Directory -Force "$env:USERPROFILE\.ssh" | Out-Null
@@ -94,7 +69,7 @@ ssh-keyscan -H 198.51.100.42 | Out-File -Append -Encoding ascii "$env:USERPROFIL
 ssh-keygen -lf "$env:USERPROFILE\.ssh\known_hosts"
 ```
 
-Ключ, полученный через сеть, нельзя считать доверенным автоматически. До запуска relay сравните показанный fingerprint с fingerprint сервера, полученным по доверенному каналу, например от администратора сервера или из его консоли.
+Fingerprint, полученный через сеть, нужно сверить по доверенному каналу.
 
 ## Команды
 
@@ -102,6 +77,12 @@ ssh-keygen -lf "$env:USERPROFILE\.ssh\known_hosts"
 py .\ssh_relay.py daemon [--name NAME] --host HOST --user USER [--port PORT] [-i PATH] [--ask-key-passphrase] [--known-hosts PATH] [--command-timeout SECONDS] [--download-timeout SECONDS] [--download-max-size SIZE] [--upload-timeout SECONDS] [--upload-max-size SIZE] [--enable-sudo] [--detach] [--detach-log PATH]
 py .\ssh_relay.py exec [--name NAME] [--risky] [--receipt-path REMOTE_JSONL] "COMMAND"
 py .\ssh_relay.py sudo-exec [--name NAME] [--risky] [--receipt-path REMOTE_JSONL] "COMMAND"
+py .\ssh_relay.py job start [--name NAME] --job JOB "COMMAND"
+py .\ssh_relay.py job status [--name NAME] --job JOB
+py .\ssh_relay.py job tail [--name NAME] --job JOB [--lines N] [--bytes SIZE]
+py .\ssh_relay.py job wait [--name NAME] --job JOB [--poll-interval SECONDS] [--timeout SECONDS]
+py .\ssh_relay.py job stop [--name NAME] --job JOB [--grace SECONDS] [--force]
+py .\ssh_relay.py job list [--name NAME]
 py .\ssh_relay.py download [--name NAME] [--overwrite] [--create-dirs] REMOTE_PATH LOCAL_PATH
 py .\ssh_relay.py upload [--name NAME] [--overwrite] [--create-dirs] LOCAL_PATH REMOTE_PATH
 py .\ssh_relay.py status [--name NAME] [--all]
@@ -109,422 +90,262 @@ py .\ssh_relay.py stop [--name NAME] [--all]
 py .\ssh_relay.py list
 ```
 
-### `daemon`
+## daemon и именованные сессии
 
-Устанавливает SSH-соединение и запускает локальный relay. Без параметра `--identity-file` используется режим SSH-пароля: пароль вводится вручную, не сохраняется на диск и до остановки daemon остаётся только в памяти процесса, чтобы relay мог автоматически переподключиться после обрыва. Для зашифрованного ключа по той же причине в памяти daemon сохраняется введённый passphrase.
-
-```powershell
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro
-```
-
-Для входа по приватному ключу используйте `--identity-file` либо сокращённый вариант `-i`:
+Обычный запуск:
 
 ```powershell
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i "$env:USERPROFILE\.ssh\id_ed25519"
+py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro
 ```
 
-Эквивалентный запуск в `cmd.exe`:
+По ключу:
+
+```powershell
+py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro -i "$env:USERPROFILE\.ssh\id_ed25519"
+```
+
+Эквивалент для `cmd.exe`:
 
 ```cmd
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i "%USERPROFILE%\.ssh\id_ed25519"
+py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro -i "%USERPROFILE%\.ssh\id_ed25519"
 ```
 
-Для зашифрованного приватного ключа укажите безопасный интерактивный запрос passphrase. Passphrase не передаётся в командной строке и не записывается в session-файл:
+Для зашифрованного ключа используйте `--ask-key-passphrase`. Пароль, passphrase и sudo-пароль не записываются в session-файл. При reconnect необходимые секреты остаются только в памяти daemon до его остановки.
+
+`--detach` доступен только с `--identity-file` без интерактивного passphrase и без `--enable-sudo`:
 
 ```powershell
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i "$env:USERPROFILE\.ssh\id_ed25519" --ask-key-passphrase
+py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro -i "$env:USERPROFILE\.ssh\id_ed25519" --detach
 ```
 
-Paramiko принимает через `--identity-file` также публичный OpenSSH-сертификат с окончанием `-cert.pub`. Соответствующий приватный ключ должен находиться рядом с сертификатом и иметь имя без суффикса `-cert.pub`:
-
-```powershell
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i "$env:USERPROFILE\.ssh\id_ed25519-cert.pub" --ask-key-passphrase
-```
-
-Приватный ключ и сертификат для входа не заменяют `known_hosts`: файл `known_hosts` проверяет ключ самого SSH-сервера и защищает от подключения к подменённому узлу.
-
-Для нестандартного SSH-порта и отдельного файла `known_hosts`:
-
-```powershell
-py .\ssh_relay.py daemon --host 198.51.100.42 --port 2222 --user donpedro --known-hosts .\trusted_known_hosts
-```
-
-По умолчанию каждая команда может выполняться не более 120 секунд. Для короткой диагностики лимит можно уменьшить:
-
-```powershell
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro --command-timeout 30
-```
-
-Для скачивания и загрузки файлов по умолчанию действует лимит 300 секунд и 64 МиБ на один файл. Лимиты задаются при запуске daemon:
-
-```powershell
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro --download-timeout 120 --download-max-size 16M --upload-timeout 120 --upload-max-size 16M
-```
-
-Размер можно задавать числом байт либо с суффиксом `K`, `M` или `G`.
-
-### Автоматическое восстановление SSH
-
-После успешного запуска daemon включает SSH keepalive с интервалом 30 секунд и раз в секунду проверяет состояние Paramiko transport. Если транспорт перестал быть активным или удалённая операция обнаружила обрыв, daemon сохраняет локальный TCP-server и session-файл, переводит SSH в состояние восстановления и начинает переподключение.
-
-Интервалы между неудачными попытками reconnect: `1, 2, 5, 10, 30` секунд; далее используется интервал 30 секунд до восстановления соединения или ручного `stop`. Проверка host key выполняется при каждом новом подключении тем же `known_hosts`, который использовался при запуске daemon.
-
-Новый `exec`, `sudo-exec`, `download` или `upload`, поступивший во время восстановления, ждёт рабочее SSH-соединение до 30 секунд. Если reconnect успел завершиться, операция выполняется обычным образом. Если нет, клиент получает ненулевой код завершения и сообщение, что daemon работает, SSH восстанавливается, а запрос ещё не выполнялся.
-
-Уже начавшаяся операция после обрыва не повторяется автоматически. В этом случае relay возвращает ошибку вида:
-
-```text
-Ошибка relay: SSH-соединение потеряно во время выполнения команды. Результат операции неизвестен; операция автоматически не повторялась. Relay восстанавливает соединение для следующих запросов.
-```
-
-Это правило защищает от повторного выполнения команд с побочными эффектами, если сервер успел принять команду до разрыва соединения.
-
-### `daemon --enable-sudo`
-
-Режим sudo включается только явно при запуске daemon:
-
-```powershell
-py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro --enable-sudo
-```
-
-То же самое при входе по ключу:
-
-```powershell
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i "$env:USERPROFILE\.ssh\id_ed25519" --enable-sudo
-```
-
-При запуске с `--enable-sudo` relay сначала устанавливает обычное SSH-соединение, затем локально запрашивает sudo-пароль через `getpass`, проверяет его удалённой командой `sudo -k && sudo -S -p '' -v` и только после успешной проверки запускает локальный TCP-server relay.
-
-Sudo-пароль не принимается из аргументов командной строки, не записывается в session-файл и не выводится в диагностике. Он хранится только в памяти процесса daemon. SSH-пароль и passphrase ключа также сохраняются только в памяти daemon на время его работы, если они нужны для автоматического reconnect. При остановке daemon ссылки на эти строки очищаются, но полный контроль над обнулением памяти Python не гарантируется.
-
-Пример вывода после подключения:
+Пример рабочего daemon:
 
 ```text
 SSH-соединение установлено: donpedro@198.51.100.42:22
 Имя сессии: prod
 Relay слушает локальный адрес 127.0.0.1:54321
 Файл сессии: C:\Users\User\AppData\Local\ssh_relay\sessions\prod.json
-Режим sudo: включён
+Режим sudo: выключен
 Автовосстановление SSH: включено, ожидание запроса до 30 с, keepalive 30 с
 Для завершения нажмите Ctrl+C или выполните команду: stop --name prod
 ```
 
-Окно терминала с daemon должно оставаться открытым до конца работы.
+Имя сессии: 1–64 символа `[A-Za-z0-9_.-]`. `default` используется, если `--name` не задан.
 
-Для временной автоматизации без интерактивного ввода можно запустить daemon в фоне:
+## Автоматический reconnect
 
-```powershell
-py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro -i "$env:USERPROFILE\.ssh\id_ed25519" --detach
-```
+Daemon сохраняет локальный TCP-server и session-файл при разрыве SSH. Повторные попытки выполняются с backoff `1, 2, 5, 10, 30` секунд, затем каждые 30 секунд. Host key проверяется заново тем же `known_hosts`.
 
-`--detach` требует `--identity-file` без запроса passphrase и несовместим с `--enable-sudo`, потому что скрытый процесс не должен ждать интерактивный ввод пароля. Команда возвращается только после подтверждения активной relay-сессии или ошибки. Лог по умолчанию пишется в каталог состояния `ssh_relay`; путь можно задать через `--detach-log`. После запуска detached daemon использует тот же механизм keepalive и автоматического reconnect, что и обычный daemon.
+Если SSH недоступен **до начала** новой операции, relay может ждать восстановления до 30 секунд. Если разрыв произошёл **после начала**, операция не повторяется: сервер мог успеть выполнить её полностью или частично.
 
-### Именованные сессии
+`status` различает живой daemon и состояние SSH. Разрыв только удалённого SSH не удаляет session-файл.
 
-По умолчанию используется сессия `default`, поэтому команды без `--name` тоже работают:
+## exec и sudo-exec
 
-```powershell
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro
-py .\ssh_relay.py exec "hostname"
-py .\ssh_relay.py stop
-```
-
-Для нескольких одновременных daemon задавайте имя явно. Имя используется только для выбора локального session-файла; каждый daemon по-прежнему слушает свой локальный порт на `127.0.0.1`:
+Короткие команды:
 
 ```powershell
-py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro
-py .\ssh_relay.py daemon --name test --host 198.51.100.43 --user donpedro
-py .\ssh_relay.py daemon --name rootbox --host 198.51.100.44 --user donpedro --enable-sudo
+py .\ssh_relay.py exec --name prod "hostname && whoami && pwd"
 ```
 
-Команды к конкретной сессии:
+Sudo-режим включается только вручную при старте daemon:
 
 ```powershell
-py .\ssh_relay.py exec --name prod "hostname"
-py .\ssh_relay.py exec -n test "hostname"
-py .\ssh_relay.py sudo-exec --name rootbox "whoami"
-py .\ssh_relay.py download --name prod "/var/log/app.log" ".\downloads\app.log" --create-dirs
-py .\ssh_relay.py upload --name prod ".\config.json" "/tmp/config.json" --overwrite
-py .\ssh_relay.py upload --name win ".\tool.ps1" "C:\Windows\Temp\tool.ps1" --overwrite
-py .\ssh_relay.py status --name prod
-py .\ssh_relay.py status --all
-py .\ssh_relay.py list
-py .\ssh_relay.py stop --name prod
-py .\ssh_relay.py stop --all
+py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro --enable-sudo
+py .\ssh_relay.py sudo-exec --name prod "whoami"
 ```
 
-Допустимое имя сессии: от 1 до 64 символов, только латинские буквы, цифры, точка, дефис и подчёркивание. Символы `/`, `\`, `:`, пробелы и `..` запрещены, чтобы имя нельзя было использовать для выхода за пределы каталога session-файлов.
+Sudo-пароль передаётся только из памяти daemon во внутренний stdin `sudo -S`; `sudo-exec` остаётся неинтерактивным и предназначен для коротких команд.
 
-Если session-файл с таким именем уже существует, `daemon --name NAME` сначала проверяет daemon через токен. Если daemon активен, запуск отклоняется. Если daemon недоступен, устаревший session-файл удаляется и запуск продолжается.
-
-### `exec`
-
-Выполняет одну команду через активную SSH-сессию:
-
-```powershell
-py .\ssh_relay.py exec "hostname"
-py .\ssh_relay.py exec --name prod "whoami"
-py .\ssh_relay.py exec -n prod "cd /opt/project && git status --short"
-```
-
-Код завершения удалённой команды возвращается вызывающему процессу. `stdout` удалённой команды выводится в `stdout`, `stderr` — в `stderr`; наличие текста в `stderr` само по себе не является ошибкой relay.
-
-Не запускайте через `exec` редакторы, оболочки, `top`, запросы пароля, длительные процессы либо чтение больших логов целиком.
-
-Если команда меняет состояние удалённого хоста, добавьте `--risky`. После успешного завершения команды с кодом `0` relay запишет JSONL receipt на сам удалённый хост:
+Для короткой изменяющей команды сохраняется `--risky`:
 
 ```powershell
 py .\ssh_relay.py exec --name prod --risky "mkdir -p ~/work/app"
 ```
 
-По умолчанию receipt пишется в `~/.local/state/agent-safe/changes.jsonl`. Путь можно переопределить:
+При exit code `0` receipt пишется в `~/.local/state/agent-safe/changes.jsonl` либо путь из `--receipt-path`. Ненулевой exit code финальный receipt не создаёт.
+
+## job — длительные задачи
+
+### Жизненный цикл
 
 ```powershell
-py .\ssh_relay.py exec --name prod --risky --receipt-path "/tmp/agent-safe-changes.jsonl" "touch /tmp/example"
+py .\ssh_relay.py job start --name prod --job build-app "cd ~/src/app && cmake --build build -j2"
+py .\ssh_relay.py job status --name prod --job build-app
+py .\ssh_relay.py job tail --name prod --job build-app
+py .\ssh_relay.py job wait --name prod --job build-app --poll-interval 5 --timeout 7200
+py .\ssh_relay.py job stop --name prod --job build-app
+py .\ssh_relay.py job list --name prod
 ```
 
-Если основная команда завершилась с ненулевым кодом, receipt не записывается. Если основная команда успешна, но receipt записать не удалось, relay возвращает ошибку, чтобы вызывающий агент не пропустил отсутствие аудита.
-
-### `sudo-exec`
-
-Выполняет одну команду через `sudo` в активном relay:
+CTest:
 
 ```powershell
-py .\ssh_relay.py sudo-exec "whoami"
-py .\ssh_relay.py sudo-exec --name prod "systemctl restart nginx"
-py .\ssh_relay.py sudo-exec --name prod --risky --receipt-path "/var/lib/agent-safe/changes.jsonl" "systemctl restart nginx"
+py .\ssh_relay.py job start --name prod --job ctest-app "cd ~/src/app/build && ctest --output-on-failure"
+py .\ssh_relay.py job wait --name prod --job ctest-app --timeout 3600
 ```
 
-`sudo-exec` доступен только если текущий daemon был запущен с параметром `--enable-sudo`. Если режим sudo не включён, команда вернёт ошибку:
+### start
+
+`--job` принимает 1–64 символа `[A-Za-z0-9_.-]`. Активный job с тем же именем повторно не запускается. Если от старой задачи остался state без exit code, а сохранённый процесс нельзя подтвердить, состояние становится `unknown`; автоматическая перезапись такого state запрещена.
+
+Runner запускается через `setsid` в отдельной session/process group. Команда передаётся detached-runner через pipe и не сохраняется в job-state. stdout и stderr пишутся в один журнал, exit code — атомарно в отдельный файл.
+
+Успешный `job start` означает только, что launcher подтверждён. Это **не** успех длительной команды.
+
+Если подтверждение `start` потеряно, не повторяйте запуск:
+
+```powershell
+py .\ssh_relay.py job status --name prod --job build-app
+py .\ssh_relay.py job list --name prod
+```
+
+### status
+
+Состояния:
+
+* `running` — exit code ещё нет, PID и process start time подтверждены;
+* `succeeded` — `exit_code=0`;
+* `failed` — ненулевой exit code;
+* `unknown` — exit code отсутствует, а исходный процесс нельзя надёжно подтвердить.
+
+Поля: `job`, `state`, `pid`, `elapsed`, `exit_code`, `log_size`, `log_age`. Для защиты от PID reuse проверяется start time из `/proc/<pid>/stat`. Исчезновение PID не считается успехом.
+
+Remote state:
 
 ```text
-Режим sudo не включён. Перезапустите daemon с параметром --enable-sudo.
+${XDG_STATE_HOME:-$HOME/.local/state}/ssh_relay/jobs/<job>/
 ```
 
-Команду передавайте без внешнего префикса `sudo`: relay сам формирует удалённый запуск вида `sudo -S -p '' -- sh -c ...` и экранирует пользовательскую shell-строку через `shlex.quote()`.
+С `umask 077` сохраняются только `pid`, `start_ticks`, `started_epoch`, `exit_code` и `log`. Полная команда отдельно на диск не пишется.
 
-`sudo-exec` предназначен только для коротких неинтерактивных команд. Не используйте его для редакторов, интерактивных shell, `top`, команд с повторными запросами ввода, длительных процессов и команд с большим выводом.
+### tail
 
-С `--risky` receipt-команда выполняется через тот же sudo-механизм, поэтому для системного журнала удобно использовать путь вроде `/var/lib/agent-safe/changes.jsonl`.
+По умолчанию возвращаются максимум 80 строк и 64 КиБ; верхние пределы — 1000 строк и 256 КиБ:
 
-Для регулярной эксплуатации безопаснее настроить ограниченный `NOPASSWD` в `sudoers` только для заранее разрешённых команд и использовать `sudo -n` в обычном `exec`. `sudo-exec` — временный ручной режим для доверенного локального пользователя и доверенного сервера.
+```powershell
+py .\ssh_relay.py job tail --name prod --job build-app --lines 120 --bytes 128K
+```
 
-### `download`
+Строки прогресса вроде `[ 71%] Building CXX object ...` передаются без преобразований.
 
-Скачивает один обычный файл с удалённого сервера в локальный файл через SFTP внутри уже открытой SSH-сессии:
+### wait
+
+`job wait` **локально** опрашивает `job status` короткими запросами, а не удерживает SSH-channel на всё время. По умолчанию poll interval 5 секунд, локальный timeout 3600 секунд.
+
+Истечение локального timeout возвращает `124` и не останавливает удалённую задачу. `succeeded` возвращает `0`; `failed` возвращает сохранённый exit code, если он подходит для exit code локального процесса.
+
+### stop
+
+`job stop` не ищет процессы по тексту команды. Используются сохранённые PID, process start time и process group. Сначала отправляется SIGTERM и выполняется ожидание, по умолчанию 5 секунд:
+
+```powershell
+py .\ssh_relay.py job stop --name prod --job build-app
+```
+
+Если мягкая остановка не сработала, `--force` — отдельная явная ступень SIGKILL:
+
+```powershell
+py .\ssh_relay.py job stop --name prod --job build-app --grace 5 --force
+```
+
+### sudo и agent-safe
+
+На этапе 1 long-job через встроенный sudo-пароль daemon не реализован: безопасный вариант требует единого privilege context для запуска, state/status/tail/stop. Ограниченный `sudo -n`/`NOPASSWD` внутри конкретной команды допустим только как отдельная политика сервера.
+
+`job start` не поддерживает `--risky`, потому что существующий agent-safe receipt `status=done` после успешного launcher был бы ложным финальным успехом. Для отдельной доработки agent-safe нужен lifecycle-контракт:
+
+* события `started`, `completed`, `failed` и желательно `stopped`;
+* стабильный `job`/correlation ID;
+* terminal `exit_code`;
+* идемпотентный dedup-ключ;
+* возможность не сохранять исходную команду либо хранить только безопасный hash/redacted summary.
+
+До появления такого контракта `ssh_relay` не создаёт несовместимый формат receipts для job.
+
+## download и upload
+
+Скачать один файл:
 
 ```powershell
 py .\ssh_relay.py download --name prod "/var/log/app.log" ".\downloads\app.log" --create-dirs
-py .\ssh_relay.py download --name prod "/tmp/result.json" ".\result.json" --overwrite
 ```
 
-В `cmd.exe` пример выглядит так:
-
-```cmd
-py .\ssh_relay.py download --name prod "/var/log/app.log" ".\downloads\app.log" --create-dirs
-```
-
-Команда `download` не использует прямой `ssh`, `scp` или `sftp` из командной строки. Запрос отправляется локальному daemon по `127.0.0.1` с токеном сессии, а daemon скачивает файл через SFTP по уже открытому SSH-соединению. Содержимое файла не кодируется в JSON и не проходит через stdout команды `exec`: daemon пишет локальный файл напрямую во временный файл рядом с целевым путём, затем атомарно переименовывает его в целевой файл.
-
-По умолчанию существующий локальный файл не перезаписывается. Для перезаписи нужен явный параметр `--overwrite`. Если локальный каталог назначения ещё не существует, используйте `--create-dirs` либо создайте каталог вручную.
-
-Поддерживается только скачивание обычных файлов. Каталоги, рекурсивное копирование, специальные файлы и загрузка локальных файлов на сервер не поддерживаются. Файл должен быть доступен текущему SSH-пользователю через SFTP. Для скачивания файла, доступного только root, сначала подготовьте читаемую временную копию на сервере отдельной контролируемой командой, например через `sudo-exec`, затем скачайте эту копию и удалите её.
-
-### `status`
-
-Проверяет наличие session-файла, доступность локального daemon с корректным токеном и фактическое состояние SSH-транспорта:
+Загрузить один файл:
 
 ```powershell
-py .\ssh_relay.py status
+py .\ssh_relay.py upload --name prod ".\config.json" "/tmp/config.json" --overwrite
+```
+
+Размер и время ограничиваются параметрами daemon `--download-*`/`--upload-*`. `upload` начиная с `0.5.1` читает локальный файл в CLI-процессе и поэтому корректно работает с detached daemon; Windows-style удалённые пути нормализуются для SFTP.
+
+## status, list, stop
+
+```powershell
 py .\ssh_relay.py status --name prod
 py .\ssh_relay.py status --all
-```
-
-При рабочем SSH пример вывода выглядит так:
-
-```text
-Сессия: prod
-Daemon: активен
-SSH: подключено
-SSH-сервер: donpedro@198.51.100.42:22
-Локальный порт: 54321
-Версия relay: 0.6.0
-Режим sudo: включён
-Файл сессии: C:\Users\User\AppData\Local\ssh_relay\sessions\prod.json
-```
-
-Во время восстановления daemon остаётся доступным, но `status` завершается с ненулевым кодом, чтобы агент не принял локально живой daemon за рабочий SSH-канал:
-
-```text
-Сессия: prod
-Daemon: активен
-SSH: временно недоступно, автоповтор продолжается
-SSH-сервер: donpedro@198.51.100.42:22
-Локальный порт: 54321
-Версия relay: 0.6.0
-Режим sudo: включён
-Попытка восстановления: 3
-Последняя ошибка SSH: ...
-Файл сессии: C:\Users\User\AppData\Local\ssh_relay\sessions\prod.json
-```
-
-Состояния SSH: `connected` — подключено, `reconnecting` — выполняется попытка reconnect, `disconnected` — последняя попытка завершилась ошибкой и следующая будет выполнена автоматически после backoff.
-
-Если локальный daemon действительно недоступен, `status --name` удаляет устаревший session-файл. Разрыв только удалённого SSH session-файл не удаляет.
-
-### `list`
-
-Показывает все известные session-файлы и проверяет доступность соответствующих daemon:
-
-```powershell
 py .\ssh_relay.py list
-```
-
-Пример вывода:
-
-```text
-Имя      Состояние   SSH                         Sudo   Порт relay   Версия
-default  активна          donpedro@198.51.100.42:22   выкл.  54321        0.6.0
-prod     восстановление     donpedro@198.51.100.43:22   вкл.   54322        0.6.0
-old      недоступна         donpedro@198.51.100.44:22   ?      54323        0.2.0
-```
-
-`list` ничего не удаляет. Устаревшие session-файлы удаляются при обращении к конкретной сессии через `status --name`, `exec`, `sudo-exec` или `stop`.
-
-### `stop`
-
-Передаёт действующему daemon команду корректного завершения:
-
-```powershell
-py .\ssh_relay.py stop
 py .\ssh_relay.py stop --name prod
 py .\ssh_relay.py stop --all
 ```
 
-`stop` не завершает процесс по PID из файла сессии, поэтому устаревший файл не может привести к принудительному завершению постороннего процесса. Daemon также можно остановить клавишами `Ctrl+C` в его терминале.
+`stop` завершает daemon только через аутентифицированный локальный запрос и токен, а не по PID из session-файла.
 
-## Файлы сессий
-
-Файл сессии содержит локальный токен доступа к открытой SSH-сессии. SSH-пароль, passphrase ключа, приватный ключ и sudo-пароль в него не записываются.
-
-В режиме sudo файл сессии становится особенно чувствительным: токен даёт доступ к открытому локальному daemon, который способен выполнять root-команды на удалённом сервере. При множественных сессиях чувствительным считается весь каталог `sessions`. Такой файл нельзя копировать, публиковать, передавать агентам без необходимости или помещать в Git.
-
-Расположение файла больше не зависит от рабочего каталога:
+Session-файлы:
 
 * Windows: `%LOCALAPPDATA%\ssh_relay\sessions\<name>.json`;
 * Linux: `${XDG_STATE_HOME:-~/.local/state}/ssh_relay/sessions/<name>.json`.
 
-Старый одиночный файл `%LOCALAPPDATA%\ssh_relay\.ssh_relay_session.json` или `${XDG_STATE_HOME:-~/.local/state}/ssh_relay/.ssh_relay_session.json` читается только как legacy-сессия `default`, если нового `sessions/default.json` ещё нет. Новые daemon всегда записывают session-файлы в каталог `sessions`.
-
-На Linux каталог состояния и каталог `sessions` создаются с правами `0700`, файлы сессий — с правами `0600`. На Windows файл размещается в пользовательском каталоге `%LOCALAPPDATA%`, доступ к которому должен контролироваться правами текущей учётной записи.
-
-Файл `.ssh_relay_session.json` от ранней реализации в каталоге проекта больше не используется и должен быть удалён.
+На Linux каталоги состояния создаются с `0700`, session-файлы — `0600`. Токен session-файла чувствителен и не должен попадать в Git, логи или недоверенные процессы.
 
 ## Использование с OpenCode
 
-Пользователь вручную запускает daemon, например по ключу:
-
-```powershell
-cd C:\Tools\ssh-relay
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i "$env:USERPROFILE\.ssh\id_ed25519"
-```
-
-Для задач, где иногда нужны root-права, daemon запускается явно с sudo-режимом:
-
-```powershell
-cd C:\Tools\ssh-relay
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i "$env:USERPROFILE\.ssh\id_ed25519" --enable-sudo
-```
-
-После запуска для OpenCode можно использовать следующую инструкцию:
+Авторитетная инструкция находится в `opencode/skills/ssh-relay/SKILL.md`. Основной порядок:
 
 ```text
-Удалённый сервер prod доступен через уже запущенный локальный SSH relay.
-
-Не используй прямые вызовы ssh и не запрашивай пароль.
-
-Для обычных команд используй:
-cd C:\Tools\ssh-relay
-py .\ssh_relay.py exec --name prod "<remote-command>"
-
-Для команд, которые меняют состояние хоста, используй:
-cd C:\Tools\ssh-relay
-py .\ssh_relay.py exec --name prod --risky "<remote-command>"
-
-Для команд, которым нужны права root, используй:
-cd C:\Tools\ssh-relay
-py .\ssh_relay.py sudo-exec --name prod "<remote-command>"
-
-Для root-команд, которые меняют состояние хоста, используй:
-cd C:\Tools\ssh-relay
-py .\ssh_relay.py sudo-exec --name prod --risky --receipt-path "/var/lib/agent-safe/changes.jsonl" "<remote-command>"
-
-Для скачивания одного файла с сервера используй:
-cd C:\Tools\ssh-relay
-py .\ssh_relay.py download --name prod "<remote-path>" "<local-path>"
-
-До выполнения рабочей задачи проверь relay:
-py .\ssh_relay.py status --name prod
-py .\ssh_relay.py exec --name prod "hostname && whoami && pwd"
-
-Если status завершился с ненулевым кодом и сообщает, что SSH восстанавливается или временно недоступен, не используй прямой ssh и не считай daemon погибшим: relay продолжает автоматический reconnect. Повтори status или рабочую команду позднее; сама рабочая команда также может ждать reconnect до 30 секунд.
-
-Если relay сообщает, что SSH потерян во время уже начавшейся операции и результат неизвестен, не повторяй изменяющую состояние команду автоматически. Сначала проверь фактическое состояние на сервере после восстановления соединения.
-
-Не запускай интерактивные команды.
-Не запускай команды, которые ожидают ввод пароля.
-Не запускай длительные команды и команды с большим выводом.
-Не скачивай и не загружай большие файлы, каталоги и специальные файлы.
-Если нужна рекурсивная передача каталога, сначала сообщи, что текущий relay этого не поддерживает.
+1. Не используй прямой ssh.
+2. status --name <session>.
+3. Короткая диагностика через exec: hostname && whoami && pwd.
+4. Короткие команды — exec/sudo-exec.
+5. Длительные процессы — job.
+6. Таймаут транспорта != ошибка процесса.
+7. При неизвестном результате job start не повторяй запуск; сначала job status/job list.
+8. Не раскрывай пароли, ключи, токены, секреты из команд и логов.
 ```
 
-## Пример рабочей сессии
+Skill не содержит IP, имён конкретных серверов или специфики BS Downloader и предназначен как источник истины для последующей установки через `opencode_setup`.
 
-Первый терминал:
+## Безопасность
 
-```powershell
-cd C:\Tools\ssh-relay
-py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro --enable-sudo
-```
+* SSH-пароль, passphrase и sudo-пароль не сохраняются на диск и не выводятся в логи.
+* Приватный ключ не копируется в session-файл.
+* Session token не выводится в CLI и даёт доступ к активному локальному daemon; защищайте session-файл.
+* `known_hosts` обязателен; автоматический accept неизвестного host key не используется.
+* Все локальные relay-запросы идут только на `127.0.0.1` и проверяются по токену.
+* Job-state создаётся с `umask 077`; полная команда отдельно в state не сохраняется.
+* `job stop` проверяет PID вместе с process start time и не выполняет поиск по тексту команды.
+* Возможность выполнения произвольной shell-команды — назначение relay; не расширяйте её без оценки угроз.
+* Для постоянной эксплуатации root-команд предпочтительнее ограниченный `NOPASSWD`, а не широкий sudo-пароль в памяти relay.
 
-Второй терминал:
+## Проверка
 
-```powershell
-cd C:\Tools\ssh-relay
-py .\ssh_relay.py status --name prod
-py .\ssh_relay.py exec --name prod "whoami"
-py .\ssh_relay.py sudo-exec --name prod "whoami"
-py .\ssh_relay.py exec --name prod "cd /opt/project && git status --short"
-py .\ssh_relay.py download --name prod "/tmp/report.txt" ".\downloads\report.txt" --create-dirs
-py .\ssh_relay.py stop --name prod
-```
-
-## Замечания по безопасности
-
-* SSH-пароль, passphrase ключа и sudo-пароль вводятся только пользователем в терминале daemon и не сохраняются на диск.
-* SSH-пароль, passphrase ключа и sudo-пароль при необходимости reconnect хранятся только в памяти процесса daemon до его остановки; полное обнуление памяти Python после очистки ссылок не гарантируется.
-* Приватный SSH-ключ не копируется в session-файл; его защита и права доступа остаются ответственностью пользователя.
-* Токен сессии не выводится в сообщения и хранится в пользовательском файле сессии.
-* В режиме sudo доступ к session-файлу следует рассматривать как доступ к открытому root-каналу через доверенный daemon.
-* Relay принимает локальные запросы только на `127.0.0.1` и проверяет токен для `exec`, `sudo-exec`, `download`, `upload`, `status` и `stop`.
-* SSH-сервер должен быть заранее доверен через проверенный `known_hosts`; автоматическое принятие неизвестного host key не используется.
-* Возможность выполнения произвольной удалённой shell-команды является назначением relay; расширять её без оценки угроз не следует.
-* `download` даёт владельцу токена возможность записать локальный файл с правами процесса daemon. `upload` даёт владельцу токена возможность прочитать локальный файл с правами CLI-процесса и записать его на сервер через SFTP. Не передавайте session-файл и токен недоверенным процессам.
-* Для постоянной эксплуатации предпочтительнее ограниченный `NOPASSWD` в `sudoers` под конкретные команды, а не хранение sudo-пароля в памяти relay.
-
-Начиная с `0.5.1`, `upload` читает локальный файл в CLI-процессе и передаёт содержимое активному daemon. Это корректно работает, когда daemon запущен в другом рабочем каталоге или detached. Windows-style удалённые пути с обратными слэшами нормализуются для SFTP, например `C:\Windows\Temp\tool.ps1` передаётся как `C:/Windows/Temp/tool.ps1`.
-
-## Минимальная ручная проверка
-
-Без подключения к серверу:
+Без SSH-сервера:
 
 ```powershell
-py -m py_compile .\ssh_relay.py
+py -m py_compile .\ssh_relay.py .\ssh_relay_jobs.py .\tests\test_jobs.py
+py -m unittest discover -s .\tests -v
 py .\ssh_relay.py --version
 py .\ssh_relay.py --help
 py .\ssh_relay.py daemon --help
-py .\ssh_relay.py sudo-exec --help
 py .\ssh_relay.py exec --help
+py .\ssh_relay.py sudo-exec --help
+py .\ssh_relay.py job --help
+py .\ssh_relay.py job start --help
+py .\ssh_relay.py job status --help
+py .\ssh_relay.py job tail --help
+py .\ssh_relay.py job wait --help
+py .\ssh_relay.py job stop --help
+py .\ssh_relay.py job list --help
 py .\ssh_relay.py download --help
 py .\ssh_relay.py upload --help
 py .\ssh_relay.py status --help
@@ -532,75 +353,26 @@ py .\ssh_relay.py stop --help
 py .\ssh_relay.py list --help
 ```
 
-С тестовым сервером после проверки host key запустите новый daemon в выбранном режиме аутентификации. Перед проверкой изменённого `daemon` обязательно остановите старую сессию, если она работала.
+Перед ручным тестом изменённого daemon старую сессию нужно остановить и запустить заново.
 
-Вход по паролю с sudo-режимом:
-
-```powershell
-py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro --enable-sudo
-```
-
-Вход по ключу с sudo-режимом в другом запуске daemon:
-
-```powershell
-py .\ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i "$env:USERPROFILE\.ssh\id_ed25519" --enable-sudo
-```
-
-Проверка в PowerShell после запуска daemon:
-
-```powershell
-py .\ssh_relay.py status --name prod
-py .\ssh_relay.py list
-py .\ssh_relay.py exec --name prod "whoami"
-py .\ssh_relay.py sudo-exec --name prod "whoami"
-py .\ssh_relay.py sudo-exec --name prod "sh -c 'printf stdout-ok; printf stderr-ok >&2; exit 7'"
-$LASTEXITCODE
-py .\ssh_relay.py exec --name prod --risky "touch /tmp/ssh-relay-risky-test.txt"
-py .\ssh_relay.py exec --name prod "tail -n 1 ~/.local/state/agent-safe/changes.jsonl"
-py .\ssh_relay.py exec --name prod "printf download-ok > /tmp/ssh-relay-download-test.txt"
-py .\ssh_relay.py download --name prod "/tmp/ssh-relay-download-test.txt" ".\downloads\ssh-relay-download-test.txt" --create-dirs --overwrite
-Get-Content .\downloads\ssh-relay-download-test.txt
-py .\ssh_relay.py stop --name prod
-```
-
-Для отдельной проверки reconnect используйте только тестовый сервер или сервер с альтернативным каналом доступа. После запуска daemon контролируемо сделайте SSH временно недоступным и проверьте:
-
-```powershell
-py .\ssh_relay.py status --name prod
-$LASTEXITCODE
-py .\ssh_relay.py exec --name prod "hostname"
-```
-
-Пока SSH недоступен, `status` должен показывать активный daemon и состояние восстановления, возвращая ненулевой код. Если вернуть SSH в течение 30 секунд ожидания `exec`, команда должна завершиться успешно без ручного перезапуска daemon. После более длительного обрыва `exec` должен сообщить, что запрос не выполнялся и SSH продолжает восстанавливаться; session-файл при этом должен сохраниться.
-
-Для проверки неоднозначного обрыва во время уже начавшейся команды используйте только специально подготовленную тестовую команду без опасных побочных эффектов. Relay должен сообщить, что результат неизвестен и автоматического повтора не было.
-
-Ожидаемо:
-
-* обычный `exec "whoami"` показывает пользователя `donpedro`;
-* `sudo-exec "whoami"` показывает `root`;
-* stdout и stderr удалённой команды проходят раздельно;
-* код завершения удалённой команды возвращается вызывающему процессу;
-* `status` показывает включённый режим sudo;
-* `download` скачивает тестовый файл в локальный каталог `downloads`;
-* `upload` загружает тестовый файл на сервер и сохраняет его содержимое;
-* `stop` завершает только активный daemon через токен, а не по PID из файла.
-
-Проверка возврата кода в `cmd.exe` или командной строке Far Manager выполняется одной строкой, чтобы `%ERRORLEVEL%` не потерялся при запуске нового экземпляра командного процессора:
+PowerShell проверяет код через `$LASTEXITCODE`. В `cmd.exe`/Far Manager код нужно читать в той же командной строке; отдельный следующий `echo %ERRORLEVEL%` в Far Manager ненадёжен:
 
 ```cmd
 cmd /V:ON /C "py .\ssh_relay.py sudo-exec --name prod ^"sh -c 'exit 7'^" & echo Exit code: !ERRORLEVEL!"
 ```
 
-В Far Manager нельзя полагаться на отдельную следующую команду `echo %ERRORLEVEL%`: она может выполняться в новом экземпляре командного процессора и показывать `0`.
+Минимальный remote job-тест:
 
-Сложные команды с перенаправлениями и вложенным экранированием в `cmd.exe` не следует использовать как базовую диагностику; для проверки `stderr` надёжнее применять PowerShell либо отдельный `.cmd`-файл.
+```powershell
+py .\ssh_relay.py job start --name prod --job relay-long-test "sh -c 'echo start; sleep 3; echo done; exit 0'"
+py .\ssh_relay.py job status --name prod --job relay-long-test
+py .\ssh_relay.py job tail --name prod --job relay-long-test
+py .\ssh_relay.py job wait --name prod --job relay-long-test --timeout 30
+```
 
-Проверка должна подтвердить: подключение в каждом нужном режиме аутентификации, успешную команду со `stderr`, возврат кода `7`, корректный `status`, автоматическое восстановление SSH без удаления session-файла, отсутствие автоматического повтора неоднозначной операции и завершение только активного daemon через `stop`.
+## Дальнейшие доработки
 
-## Возможные дальнейшие доработки
-
-* отдельная команда регистрации и показа fingerprint SSH-сервера с явным подтверждением пользователя;
-* рекурсивное скачивание и загрузка каталогов с явными лимитами и фильтрами;
-* настройка ограниченного sudo-профиля с `sudo -n` для заранее разрешённых команд;
-* дополнительные автоматизированные тесты протокола daemon/exec/sudo-exec/download/upload/status/stop и сценариев reconnect.
+* lifecycle receipts agent-safe для long-job;
+* отдельная безопасная архитектура длительных sudo-job;
+* этап 2 — крупные/рекурсивные SFTP-передачи;
+* дополнительные интеграционные тесты reconnect/job на тестовом SSH-сервере.
