@@ -1,1907 +1,413 @@
 #!/usr/bin/env python3
-"""
-ssh_relay.py — локальный SSH-relay для выполнения неинтерактивных команд.
+"""CLI-слой ssh_relay с управляемыми длительными задачами.
 
-Примеры:
-  py ssh_relay.py daemon --host 198.51.100.42 --user donpedro
-  py ssh_relay.py daemon --host 198.51.100.42 --user donpedro -i ~/.ssh/id_ed25519
-  py ssh_relay.py exec "hostname"
-  py ssh_relay.py download /tmp/result.txt ./result.txt
-  py ssh_relay.py upload ./config.json /tmp/config.json
-  py ssh_relay.py status
-  py ssh_relay.py stop
+Основная реализация существующего relay находится в ``ssh_relay_core`` и сохранена
+без функциональных изменений. Этот модуль добавляет CLI ``job`` и использует
+обычный короткий daemon-action ``exec`` как транспорт для служебных job-команд.
 """
 
-__version__ = "0.6.0"
+from __future__ import annotations
+
+__version__ = "0.7.0"
 
 import argparse
-import atexit
-import base64
-import getpass
-import json
-import os
-import posixpath
-import re
-import shlex
-import socket
-import stat
-import subprocess
 import sys
-import threading
 import time
-import uuid
-from pathlib import Path
 from typing import Any
 
-BUFFER_SIZE = 64 * 1024
-MAX_OUTPUT_SIZE = 4 * 1024 * 1024
-MAX_MESSAGE_SIZE = 96 * 1024 * 1024
-DEFAULT_COMMAND_TIMEOUT = 120
-DEFAULT_DOWNLOAD_TIMEOUT = 300
-DEFAULT_DOWNLOAD_MAX_SIZE = 64 * 1024 * 1024
-DEFAULT_UPLOAD_TIMEOUT = 300
-DEFAULT_UPLOAD_MAX_SIZE = 64 * 1024 * 1024
-DEFAULT_RISKY_RECEIPT_PATH = "~/.local/state/agent-safe/changes.jsonl"
-DEFAULT_RECONNECT_WAIT = 30
-SSH_KEEPALIVE_INTERVAL = 30
-SSH_MONITOR_INTERVAL = 1
-RECONNECT_DELAYS = (1, 2, 5, 10, 30)
-REQUIRED_SESSION_FIELDS = {
-    "host": str,
-    "port": int,
-    "user": str,
-    "daemon_port": int,
-    "auth_token": str,
-    "pid": int,
-    "version": str,
-}
+import ssh_relay_core as _core
+import ssh_relay_jobs as relay_jobs
+from ssh_relay_core import *  # noqa: F403 — сохраняем публичный интерфейс прежнего модуля.
+
+_core.__version__ = __version__
 
 
-class RelayError(Exception):
-    """Ожидаемая ошибка relay, предназначенная для вывода пользователю."""
-
-
-class DaemonUnavailableError(RelayError):
-    """Локальный daemon недоступен или не ответил в установленный срок."""
-
-
-class RussianArgumentParser(argparse.ArgumentParser):
-    """ArgumentParser с русскими заголовками и диагностикой."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        kwargs.setdefault("add_help", False)
-        super().__init__(*args, **kwargs)
-        self._positionals.title = "позиционные аргументы"
-        self._optionals.title = "параметры"
-        self.add_argument("-h", "--help", action="help", help="Показать эту справку и выйти.")
-
-    def format_usage(self) -> str:
-        return super().format_usage().replace("usage:", "использование:", 1)
-
-    def format_help(self) -> str:
-        return super().format_help().replace("usage:", "использование:", 1)
-
-    def error(self, message: str) -> None:
-        message = message.replace("the following arguments are required:", "обязательные аргументы не заданы:")
-        message = message.replace("unrecognized arguments:", "неизвестные аргументы:")
-        message = message.replace("argument ", "аргумент ")
-        message = message.replace("expected one argument", "требуется одно значение")
-        message = message.replace("invalid choice:", "недопустимое значение:")
-        if message.endswith(": command"):
-            message = message[:-len("command")] + "команда"
-        self.print_usage(sys.stderr)
-        self.exit(2, f"{self.prog}: ошибка: {message}\n")
-
-
-def parse_port(value: str) -> int:
+def parse_positive_float_seconds(value: str) -> float:
     try:
-        port = int(value)
+        seconds = float(value)
     except ValueError as exc:
-        raise argparse.ArgumentTypeError("порт должен быть целым числом") from exc
-    if not 1 <= port <= 65535:
-        raise argparse.ArgumentTypeError("порт должен находиться в диапазоне от 1 до 65535")
-    return port
-
-
-def parse_positive_seconds(value: str) -> int:
-    try:
-        seconds = int(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("время должно быть целым числом секунд") from exc
+        raise argparse.ArgumentTypeError("время должно быть числом секунд") from exc
     if seconds <= 0:
         raise argparse.ArgumentTypeError("время должно быть положительным числом секунд")
     return seconds
 
 
-def parse_size_bytes(value: str) -> int:
-    """Разбирает размер в байтах с необязательным суффиксом K/M/G."""
-    cleaned = value.strip().replace(" ", "")
-    match = re.fullmatch(r"(\d+)([A-Za-zА-Яа-я]*)", cleaned)
-    if not match:
-        raise argparse.ArgumentTypeError("размер должен быть числом байт или значением с суффиксом K, M или G")
+def parse_nonnegative_float_seconds(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("время должно быть числом секунд") from exc
+    if seconds < 0 or seconds > 60:
+        raise argparse.ArgumentTypeError("время должно быть от 0 до 60 секунд")
+    return seconds
 
-    number = int(match.group(1))
-    suffix = match.group(2).lower()
-    multipliers = {
-        "": 1,
-        "b": 1,
-        "byte": 1,
-        "bytes": 1,
-        "б": 1,
-        "байт": 1,
-        "байта": 1,
-        "байтов": 1,
-        "k": 1024,
-        "kb": 1024,
-        "kib": 1024,
-        "к": 1024,
-        "кб": 1024,
-        "m": 1024 * 1024,
-        "mb": 1024 * 1024,
-        "mib": 1024 * 1024,
-        "м": 1024 * 1024,
-        "мб": 1024 * 1024,
-        "g": 1024 * 1024 * 1024,
-        "gb": 1024 * 1024 * 1024,
-        "gib": 1024 * 1024 * 1024,
-        "г": 1024 * 1024 * 1024,
-        "гб": 1024 * 1024 * 1024,
-    }
-    if suffix not in multipliers:
-        raise argparse.ArgumentTypeError("поддерживаются только суффиксы K, M или G")
-    size = number * multipliers[suffix]
-    if size <= 0:
-        raise argparse.ArgumentTypeError("размер должен быть положительным")
+
+def parse_tail_lines(value: str) -> int:
+    try:
+        lines = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("число строк должно быть целым") from exc
+    if not 1 <= lines <= relay_jobs.MAX_TAIL_LINES:
+        raise argparse.ArgumentTypeError(f"число строк должно быть от 1 до {relay_jobs.MAX_TAIL_LINES}")
+    return lines
+
+
+def parse_tail_bytes(value: str) -> int:
+    size = parse_size_bytes(value)  # noqa: F405
+    if size > relay_jobs.MAX_TAIL_BYTES:
+        raise argparse.ArgumentTypeError(
+            f"лимит tail не должен превышать {format_bytes(relay_jobs.MAX_TAIL_BYTES)}"  # noqa: F405
+        )
     return size
 
 
-def format_bytes(size: int) -> str:
-    """Возвращает компактное человекочитаемое представление размера."""
-    units = ((1024 * 1024 * 1024, "ГиБ"), (1024 * 1024, "МиБ"), (1024, "КиБ"))
-    for factor, suffix in units:
-        if size >= factor and size % factor == 0:
-            return f"{size // factor} {suffix}"
-    return f"{size} байт"
-
-
-SESSION_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-DEFAULT_SESSION_NAME = "default"
-
-
-def state_directory() -> Path:
-    """Возвращает фиксированный пользовательский каталог состояния relay."""
-    if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    else:
-        base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-    return base / "ssh_relay"
-
-
-def legacy_session_file_path() -> Path:
-    """Возвращает путь старого одиночного session-файла для совместимости."""
-    return state_directory() / ".ssh_relay_session.json"
-
-
-def sessions_directory() -> Path:
-    """Возвращает каталог именованных session-файлов."""
-    return state_directory() / "sessions"
-
-
-def validate_session_name(name: str) -> str:
-    """Проверяет имя сессии перед использованием в имени файла."""
-    if not SESSION_NAME_PATTERN.fullmatch(name):
-        raise RelayError(
-            "Недопустимое имя сессии. Используйте 1-64 символа: латинские буквы, цифры, точка, дефис или подчёркивание."
-        )
-    if name in {".", ".."}:
-        raise RelayError("Недопустимое имя сессии.")
-    return name
-
-
-def session_file_path(name: str) -> Path:
-    """Возвращает путь нового именованного session-файла."""
-    name = validate_session_name(name)
-    return sessions_directory() / f"{name}.json"
-
-
-def existing_session_file_path(name: str) -> Path:
-    """Возвращает существующий session-файл с учётом legacy default-сессии."""
-    current = session_file_path(name)
-    if current.exists():
-        return current
-    legacy = legacy_session_file_path()
-    if name == DEFAULT_SESSION_NAME and legacy.exists():
-        return legacy
-    return current
-
-
-def prepare_session_directory() -> None:
-    state_directory().mkdir(parents=True, exist_ok=True)
-    sessions_directory().mkdir(parents=True, exist_ok=True)
-    if os.name != "nt":
-        os.chmod(state_directory(), 0o700)
-        os.chmod(sessions_directory(), 0o700)
-
-
-def remove_session_file(name: str, expected_token: str | None = None) -> None:
-    """Удаляет файл только указанной сессии, если задан ожидаемый токен."""
-    try:
-        path = existing_session_file_path(name)
-        if expected_token is not None and path.exists():
-            current = read_session(name)
-            if current["auth_token"] != expected_token:
-                return
-        path.unlink(missing_ok=True)
-    except (OSError, RelayError):
-        pass
-
-
-def write_session(name: str, session: dict[str, Any]) -> Path:
-    prepare_session_directory()
-    path = session_file_path(name)
-    temporary = path.with_suffix(".tmp")
-    data = json.dumps(session, ensure_ascii=False, indent=2)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-    fd = os.open(temporary, flags, 0o600)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as output:
-            output.write(data)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-        if os.name != "nt":
-            os.chmod(path, 0o600)
-        if name == DEFAULT_SESSION_NAME:
-            legacy_session_file_path().unlink(missing_ok=True)
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
-    return path
-
-
-def read_session(name: str) -> dict[str, Any]:
-    path = existing_session_file_path(name)
-    if not path.exists():
-        raise RelayError(f"Сессия {name} не найдена. Сначала запустите команду daemon --name {name}.")
-    try:
-        with path.open("r", encoding="utf-8") as source:
-            session = json.load(source)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RelayError(f"Файл сессии повреждён или недоступен: {path}") from exc
-
-    if not isinstance(session, dict):
-        raise RelayError(f"Файл сессии имеет неверный формат: {path}")
-    for field, expected_type in REQUIRED_SESSION_FIELDS.items():
-        if not isinstance(session.get(field), expected_type):
-            raise RelayError(f"Файл сессии имеет неверный формат: отсутствует поле {field}.")
-    session.setdefault("name", name)
-    session["_session_file_path"] = str(path)
-    return session
-
-
-def iter_session_names() -> list[str]:
-    """Возвращает имена всех известных session-файлов."""
-    names: set[str] = set()
-    directory = sessions_directory()
-    if directory.exists():
-        for item in directory.glob("*.json"):
-            candidate = item.stem
-            if SESSION_NAME_PATTERN.fullmatch(candidate):
-                names.add(candidate)
-    if legacy_session_file_path().exists():
-        names.add(DEFAULT_SESSION_NAME)
-    return sorted(names)
-
-
-def read_message(sock: socket.socket) -> dict[str, Any]:
-    parts: list[bytes] = []
-    size = 0
-    while True:
-        chunk = sock.recv(BUFFER_SIZE)
-        if not chunk:
-            break
-        size += len(chunk)
-        if size > MAX_MESSAGE_SIZE:
-            raise RelayError("Полученное сообщение превышает допустимый размер.")
-        parts.append(chunk)
-    if not parts:
-        raise RelayError("Получено пустое сообщение от relay.")
-    try:
-        result = json.loads(b"".join(parts).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RelayError("Получено повреждённое сообщение от relay.") from exc
-    if not isinstance(result, dict):
-        raise RelayError("Получено сообщение relay неверного формата.")
-    return result
-
-
-def send_message(conn: socket.socket, message: dict[str, Any]) -> None:
-    conn.sendall(json.dumps(message, ensure_ascii=False).encode("utf-8"))
-
-
-def request_daemon(
-    session: dict[str, Any],
-    action: str,
-    *,
-    response_timeout: float | None = 5,
-    **payload: Any,
-) -> dict[str, Any]:
-    request = {"auth_token": session["auth_token"], "action": action, **payload}
-    try:
-        with socket.create_connection(("127.0.0.1", session["daemon_port"]), timeout=5) as sock:
-            sock.sendall(json.dumps(request, ensure_ascii=False).encode("utf-8"))
-            sock.shutdown(socket.SHUT_WR)
-            sock.settimeout(response_timeout)
-            return read_message(sock)
-    except (ConnectionError, TimeoutError, socket.timeout, OSError) as exc:
-        raise DaemonUnavailableError("Daemon недоступен или не ответил вовремя.") from exc
-
-
-def load_paramiko():
-    try:
-        import paramiko
-    except ImportError as exc:
-        raise RelayError("Не установлена зависимость paramiko. Выполните: py -m pip install paramiko") from exc
-    return paramiko
-
-
-def execute_remote_command(
-    client: Any,
-    command: str,
-    timeout_seconds: int,
-    stdin_data: bytes | None = None,
-) -> dict[str, Any]:
-    """Выполняет команду без PTY, одновременно вычитывая stdout и stderr."""
-    channel = client.get_transport().open_session(timeout=10)
-    channel.exec_command(command)
-    if stdin_data is not None:
-        channel.sendall(stdin_data)
-    channel.shutdown_write()
-    output: list[bytes] = []
-    errors: list[bytes] = []
-    total_size = 0
-    started = time.monotonic()
-
-    try:
-        while True:
-            read_any = False
-            while channel.recv_ready():
-                chunk = channel.recv(BUFFER_SIZE)
-                output.append(chunk)
-                total_size += len(chunk)
-                read_any = True
-            while channel.recv_stderr_ready():
-                chunk = channel.recv_stderr(BUFFER_SIZE)
-                errors.append(chunk)
-                total_size += len(chunk)
-                read_any = True
-
-            if total_size > MAX_OUTPUT_SIZE:
-                raise RelayError(
-                    "Вывод удалённой команды превышает допустимый размер 4 МиБ. "
-                    "Используйте фильтрацию или запись результата в файл на сервере."
-                )
-            if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
-                break
-            if time.monotonic() - started > timeout_seconds:
-                raise RelayError(
-                    f"Превышено время выполнения команды: {timeout_seconds} с. "
-                    "Relay предназначен для коротких команд."
-                )
-            if not read_any:
-                time.sleep(0.01)
-
-        exit_code = channel.recv_exit_status()
-        return {
-            "ok": True,
-            "stdout": b"".join(output).decode("utf-8", errors="replace"),
-            "stderr": b"".join(errors).decode("utf-8", errors="replace"),
-            "exit_code": exit_code,
-        }
-    finally:
-        channel.close()
-
-
-def verify_sudo_password(client: Any, sudo_password: str, timeout_seconds: int) -> None:
-    """Проверяет sudo-пароль без сохранения результата sudo timestamp."""
-    result = execute_remote_command(
-        client,
-        "sudo -k && sudo -S -p '' -v",
-        timeout_seconds,
-        stdin_data=(sudo_password + "\n").encode("utf-8"),
-    )
-    if result.get("exit_code") != 0:
-        raise RelayError("Проверка sudo-пароля не прошла. SSH-соединение будет закрыто.")
-
-
-def execute_sudo_command(
-    client: Any,
-    command: str,
-    timeout_seconds: int,
-    sudo_password: str,
-) -> dict[str, Any]:
-    """Выполняет команду через sudo, передавая пароль только во внутренний stdin."""
-    wrapped_command = "sudo -S -p '' -- sh -c " + shlex.quote(command)
-    return execute_remote_command(
-        client,
-        wrapped_command,
-        timeout_seconds,
-        stdin_data=(sudo_password + "\n").encode("utf-8"),
-    )
-
-
-
-def quote_posix_path(path: str) -> str:
-    """Экранирует POSIX-путь, сохраняя расширение ~/ на удалённой стороне."""
-    if path == "~":
-        return '"$HOME"'
-    if path.startswith("~/"):
-        return '"$HOME"/' + shlex.quote(path[2:])
-    return shlex.quote(path)
-
-
-def build_risky_receipt_command(
-    *,
-    path: str,
-    session: dict[str, Any],
-    action: str,
-    command: str,
-    sudo: bool,
-) -> str:
-    """Формирует POSIX shell-команду для JSONL-записи о risky-изменении на удалённом хосте."""
-    if not path.strip():
-        raise RelayError("Путь receipt-файла не должен быть пустым.")
-    payload = {
-        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "tool": "ssh_relay",
-        "session": session_display_name(session),
-        "target": format_session_target(session),
-        "action": action,
-        "sudo": sudo,
-        "command": command,
-        "status": "done",
-    }
-    line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    directory = posixpath.dirname(path.rstrip("/")) or "."
-    return f"mkdir -p {quote_posix_path(directory)} && printf '%s\\n' {shlex.quote(line)} >> {quote_posix_path(path)}"
-
-
-def execute_risky_receipt(
-    client: Any,
-    *,
-    session: dict[str, Any],
-    action: str,
-    command: str,
-    sudo: bool,
-    receipt_path: str,
-    timeout_seconds: int,
-    sudo_password: str | None,
-) -> dict[str, Any]:
-    receipt_command = build_risky_receipt_command(
-        path=receipt_path,
-        session=session,
-        action=action,
-        command=command,
-        sudo=sudo,
-    )
-    if sudo:
-        if sudo_password is None:
-            raise RelayError("Нельзя записать sudo receipt: sudo-пароль отсутствует в памяти daemon.")
-        result = execute_sudo_command(client, receipt_command, timeout_seconds, sudo_password)
-    else:
-        result = execute_remote_command(client, receipt_command, timeout_seconds)
-    result["receipt_command"] = receipt_command
-    result["receipt_path"] = receipt_path
-    return result
-
-
-def normalize_remote_sftp_path(remote_path: str) -> str:
-    """Нормализует Windows-style путь для SFTP, не меняя POSIX-пути."""
-    if "\\" in remote_path:
-        return remote_path.replace("\\", "/")
-    return remote_path
-
-
-def download_remote_file(
-    client: Any,
-    remote_path: str,
-    local_path: str,
-    *,
-    overwrite: bool,
-    create_dirs: bool,
-    max_size: int,
-    timeout_seconds: int,
-) -> dict[str, Any]:
-    """Скачивает один обычный удалённый файл через SFTP в локальный файл."""
-    if not remote_path.strip():
-        raise RelayError("Передан пустой путь удалённого файла.")
-    if not local_path.strip():
-        raise RelayError("Передан пустой локальный путь для сохранения файла.")
-
-    remote_source = normalize_remote_sftp_path(remote_path)
-    target = Path(local_path).expanduser()
-    if not target.is_absolute():
-        raise RelayError("Локальный путь должен быть абсолютным.")
-    if not target.name:
-        raise RelayError("Локальный путь должен указывать на файл, а не на корень диска или файловой системы.")
-    if target.exists() and target.is_dir():
-        raise RelayError("Локальный путь указывает на каталог, а не на файл.")
-    if target.exists() and not overwrite:
-        raise RelayError("Локальный файл уже существует. Укажите --overwrite для перезаписи.")
-
-    parent = target.parent
-    if create_dirs:
-        try:
-            parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise RelayError(f"Не удалось создать локальный каталог для скачивания: {parent}") from exc
-    elif not parent.is_dir():
-        raise RelayError("Локальный каталог для сохранения не существует. Укажите --create-dirs или создайте его вручную.")
-
-    temporary = target.with_name(f".{target.name}.ssh-relay-{uuid.uuid4().hex}.tmp")
-    started = time.monotonic()
-    try:
-        sftp = client.open_sftp()
-    except Exception as exc:
-        raise RelayError("Не удалось открыть SFTP-канал через активную SSH-сессию.") from exc
-    received = 0
-    try:
-        try:
-            remote_stat = sftp.stat(remote_source)
-        except OSError as exc:
-            raise RelayError(f"Удалённый файл не найден или недоступен: {remote_source}") from exc
-
-        mode = getattr(remote_stat, "st_mode", 0)
-        if stat.S_ISDIR(mode):
-            raise RelayError("Удалённый путь указывает на каталог. Скачивание каталогов не поддерживается.")
-        if mode and not stat.S_ISREG(mode):
-            raise RelayError("Удалённый путь не является обычным файлом. Скачивание специальных файлов не поддерживается.")
-
-        remote_size = int(getattr(remote_stat, "st_size", 0) or 0)
-        if remote_size > max_size:
-            raise RelayError(
-                f"Размер удалённого файла {format_bytes(remote_size)} превышает лимит "
-                f"{format_bytes(max_size)}. Перезапустите daemon с большим --download-max-size, "
-                "если это безопасно."
-            )
-
-        try:
-            with sftp.open(remote_source, "rb") as remote_file, temporary.open("xb") as output:
-                while True:
-                    chunk = remote_file.read(BUFFER_SIZE)
-                    if not chunk:
-                        break
-                    received += len(chunk)
-                    if received > max_size:
-                        raise RelayError(
-                            f"Скачивание остановлено: получено больше лимита {format_bytes(max_size)}."
-                        )
-                    if time.monotonic() - started > timeout_seconds:
-                        raise RelayError(
-                            f"Превышено время скачивания файла: {timeout_seconds} с. "
-                            "Relay предназначен для коротких контролируемых передач."
-                        )
-                    output.write(chunk)
-                output.flush()
-                os.fsync(output.fileno())
-        except RelayError:
-            raise
-        except OSError as exc:
-            raise RelayError(f"Ошибка при скачивании или записи файла: {exc}") from exc
-
-        if target.exists() and not overwrite:
-            raise RelayError("Локальный файл появился во время скачивания. Повторите команду с --overwrite при необходимости.")
-        os.replace(temporary, target)
-        return {
-            "ok": True,
-            "remote_path": remote_source,
-            "local_path": str(target),
-            "bytes_downloaded": received,
-        }
-    finally:
-        try:
-            sftp.close()
-        finally:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-
-def remote_parent_directory(remote_path: str) -> str:
-    """Возвращает родительский каталог POSIX-пути на удалённой стороне."""
-    stripped = remote_path.rstrip("/")
-    if not stripped:
-        raise RelayError("Удалённый путь должен указывать на файл, а не на корень файловой системы.")
-    name = posixpath.basename(stripped)
-    if not name or name in {".", ".."}:
-        raise RelayError("Удалённый путь должен указывать на файл с допустимым именем.")
-    parent = posixpath.dirname(stripped)
-    return parent or "."
-
-
-def ensure_remote_directory(sftp: Any, remote_directory: str) -> None:
-    """Создаёт родительские каталоги на удалённой стороне через SFTP."""
-    if remote_directory in {"", "."}:
-        return
-    normalized = posixpath.normpath(remote_directory)
-    if normalized == "/":
-        return
-
-    current = "/" if normalized.startswith("/") else ""
-    for part in normalized.strip("/").split("/"):
-        if not part or part == ".":
-            continue
-        current = posixpath.join(current, part) if current else part
-        try:
-            attrs = sftp.stat(current)
-            mode = getattr(attrs, "st_mode", 0)
-            if mode and not stat.S_ISDIR(mode):
-                raise RelayError(f"Удалённый путь {current} существует, но не является каталогом.")
-        except RelayError:
-            raise
-        except OSError:
-            try:
-                sftp.mkdir(current)
-            except OSError as exc:
-                raise RelayError(f"Не удалось создать удалённый каталог: {current}") from exc
-
-
-def remote_temporary_path(remote_path: str) -> str:
-    """Возвращает временный POSIX-путь рядом с удалённым целевым файлом."""
-    stripped = remote_path.rstrip("/")
-    parent = remote_parent_directory(stripped)
-    name = posixpath.basename(stripped)
-    temporary_name = f".{name}.ssh-relay-{uuid.uuid4().hex}.tmp"
-    if parent in {"", "."}:
-        return temporary_name
-    return posixpath.join(parent, temporary_name)
-
-
-def upload_file_content(
-    client: Any,
-    local_path: str,
-    content: bytes,
-    remote_path: str,
-    *,
-    overwrite: bool,
-    create_dirs: bool,
-    max_size: int,
-    timeout_seconds: int,
-) -> dict[str, Any]:
-    """Загружает переданное клиентом содержимое файла через SFTP на удалённый сервер."""
-    if not local_path.strip():
-        raise RelayError("Передан пустой путь локального файла.")
-    if not remote_path.strip():
-        raise RelayError("Передан пустой путь удалённого файла.")
-    if remote_path.endswith("/"):
-        raise RelayError("Удалённый путь должен указывать на файл, а не на каталог.")
-    if "\x00" in remote_path:
-        raise RelayError("Удалённый путь содержит недопустимый нулевой символ.")
-
-    local_size = len(content)
-    if local_size > max_size:
-        raise RelayError(
-            f"Размер локального файла {format_bytes(local_size)} превышает лимит "
-            f"{format_bytes(max_size)}. Перезапустите daemon с большим --upload-max-size, "
-            "если это безопасно."
-        )
-
-    remote_target = normalize_remote_sftp_path(remote_path).rstrip("/")
-    remote_parent = remote_parent_directory(remote_target)
-    temporary = remote_temporary_path(remote_target)
-    started = time.monotonic()
-
-    try:
-        sftp = client.open_sftp()
-    except Exception as exc:
-        raise RelayError("Не удалось открыть SFTP-канал через активную SSH-сессию.") from exc
-
-    sent = 0
-    try:
-        if create_dirs:
-            ensure_remote_directory(sftp, remote_parent)
-        else:
-            try:
-                attrs = sftp.stat(remote_parent)
-                mode = getattr(attrs, "st_mode", 0)
-                if mode and not stat.S_ISDIR(mode):
-                    raise RelayError("Удалённый родительский путь существует, но не является каталогом.")
-            except RelayError:
-                raise
-            except OSError as exc:
-                raise RelayError(
-                    "Удалённый каталог назначения не существует. Укажите --create-dirs или создайте его вручную."
-                ) from exc
-
-        try:
-            existing = sftp.stat(remote_target)
-            mode = getattr(existing, "st_mode", 0)
-            if mode and stat.S_ISDIR(mode):
-                raise RelayError("Удалённый путь указывает на каталог, а не на файл.")
-            if mode and not stat.S_ISREG(mode):
-                raise RelayError("Удалённый путь существует, но не является обычным файлом.")
-            if not overwrite:
-                raise RelayError("Удалённый файл уже существует. Укажите --overwrite для перезаписи.")
-        except RelayError:
-            raise
-        except OSError:
-            pass
-
-        try:
-            sftp.stat(temporary)
-        except OSError:
-            pass
-        else:
-            raise RelayError("Временный удалённый файл уже существует. Повторите команду.")
-
-        try:
-            with sftp.open(temporary, "wb") as remote_file:
-                for offset in range(0, local_size, BUFFER_SIZE):
-                    chunk = content[offset:offset + BUFFER_SIZE]
-                    sent += len(chunk)
-                    if sent > max_size:
-                        raise RelayError(f"Загрузка остановлена: отправлено больше лимита {format_bytes(max_size)}.")
-                    if time.monotonic() - started > timeout_seconds:
-                        raise RelayError(
-                            f"Превышено время загрузки файла: {timeout_seconds} с. "
-                            "Relay предназначен для коротких контролируемых передач."
-                        )
-                    remote_file.write(chunk)
-                remote_file.flush()
-        except RelayError:
-            raise
-        except OSError as exc:
-            raise RelayError(f"Ошибка при чтении или загрузке файла: {exc}") from exc
-
-        try:
-            sftp.stat(remote_target)
-            target_exists = True
-        except OSError:
-            target_exists = False
-        if target_exists and not overwrite:
-            raise RelayError("Удалённый файл появился во время загрузки. Повторите команду с --overwrite при необходимости.")
-
-        if overwrite:
-            try:
-                sftp.posix_rename(temporary, remote_target)
-            except AttributeError:
-                try:
-                    sftp.remove(remote_target)
-                except OSError:
-                    pass
-                sftp.rename(temporary, remote_target)
-            except OSError:
-                try:
-                    sftp.remove(remote_target)
-                except OSError:
-                    pass
-                sftp.rename(temporary, remote_target)
-        else:
-            sftp.rename(temporary, remote_target)
-
-        return {
-            "ok": True,
-            "local_path": local_path,
-            "remote_path": remote_target,
-            "bytes_uploaded": sent,
-        }
-    finally:
-        try:
-            sftp.remove(temporary)
-        except OSError:
-            pass
-        finally:
-            sftp.close()
-
-
-def session_display_name(session: dict[str, Any]) -> str:
-    return str(session.get("name") or DEFAULT_SESSION_NAME)
-
-
-def format_session_target(session: dict[str, Any]) -> str:
-    return f"{session['user']}@{session['host']}:{session['port']}"
-
-
-def start_detached_daemon(args: argparse.Namespace) -> int:
-    """Запускает daemon в отдельном процессе и ждёт появления активной сессии."""
-    if not args.identity_file:
-        print("--detach поддерживается только вместе с --identity-file, чтобы не скрывать password prompt.", file=sys.stderr)
-        return 2
-    if args.ask_key_passphrase:
-        print("--detach несовместим с --ask-key-passphrase.", file=sys.stderr)
-        return 2
-    if args.enable_sudo:
-        print("--detach несовместим с --enable-sudo, потому что sudo-пароль вводится интерактивно.", file=sys.stderr)
-        return 2
-
-    session_name = validate_session_name(args.name)
-    if check_existing_session(session_name):
-        return 1
-
-    command = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "daemon",
-        "--name", session_name,
-        "--host", args.host,
-        "--port", str(args.port),
-        "--user", args.user,
-        "--identity-file", args.identity_file,
-        "--command-timeout", str(args.command_timeout),
-        "--download-timeout", str(args.download_timeout),
-        "--download-max-size", str(args.download_max_size),
-        "--upload-timeout", str(args.upload_timeout),
-        "--upload-max-size", str(args.upload_max_size),
-    ]
-    if args.known_hosts:
-        command.extend(["--known-hosts", args.known_hosts])
-
-    log_path = Path(args.detach_log).expanduser() if args.detach_log else state_directory() / f"{session_name}.daemon.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("ab") as log:
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        subprocess.Popen(command, stdout=log, stderr=log, stdin=subprocess.DEVNULL, creationflags=creationflags)
-
-    deadline = time.monotonic() + 15
-    last_error = "daemon не успел создать активную сессию."
-    while time.monotonic() < deadline:
-        try:
-            session = read_session(session_name)
-            result = request_daemon(session, "status")
-            if result.get("ok") and result.get("status") == "active":
-                print(f"Сессия {session_name} запущена в фоне: {format_session_target(session)}")
-                print(f"Лог daemon: {log_path}")
-                return 0
-        except RelayError as exc:
-            last_error = str(exc)
-        time.sleep(0.5)
-
-    print(f"Не удалось подтвердить запуск detached daemon: {last_error}", file=sys.stderr)
-    print(f"Проверьте лог: {log_path}", file=sys.stderr)
-    return 1
-
-
-def check_existing_session(name: str) -> bool:
-    path = existing_session_file_path(name)
-    if not path.exists():
-        return False
-    try:
-        session = read_session(name)
-        result = request_daemon(session, "status")
-        if result.get("ok"):
-            print(
-                f"Сессия {name} уже активна: {format_session_target(session)}.",
-                file=sys.stderr,
-            )
-            print(f"Сначала завершите её командой: stop --name {name}", file=sys.stderr)
-            return True
-    except RelayError:
-        remove_session_file(name)
-    return False
-
-
 def daemon(args: argparse.Namespace) -> int:
-    if getattr(args, "detach", False):
-        return start_detached_daemon(args)
-
+    """Запускает прежний daemon, сохраняя путь внешнего CLI для ``--detach``."""
+    original_file = _core.__file__
+    _core.__file__ = __file__
     try:
-        session_name = validate_session_name(args.name)
-    except RelayError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
+        return int(_core.daemon(args))
+    finally:
+        _core.__file__ = original_file
 
-    if args.ask_key_passphrase and not args.identity_file:
-        print("Параметр --ask-key-passphrase допустим только вместе с --identity-file.", file=sys.stderr)
-        return 2
 
-    if check_existing_session(session_name):
-        return 1
-
-    identity_file: str | None = None
-    password: str | None = None
-    passphrase: str | None = None
-    sudo_password: str | None = None
-    if args.identity_file:
-        identity_path = Path(args.identity_file).expanduser()
-        if not identity_path.is_file():
-            print(f"Файл ключа или сертификата не найден: {identity_path}", file=sys.stderr)
-            return 1
-        identity_file = str(identity_path)
-
-    try:
-        paramiko = load_paramiko()
-    except RelayError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    if identity_file:
-        if args.ask_key_passphrase:
-            passphrase = getpass.getpass(f"Passphrase SSH-ключа для {args.user}@{args.host}: ")
-    else:
-        password = getpass.getpass(f"SSH-пароль для {args.user}@{args.host}: ")
-
-    def open_ssh_client() -> Any:
-        """Открывает проверенное SSH-соединение, пригодное для последующего reconnect."""
-        new_client = paramiko.SSHClient()
+def _job_context(args: argparse.Namespace, *, require_job: bool = True) -> tuple[dict[str, Any], str | None, float]:
+    session_name = validate_session_name(args.name)  # noqa: F405
+    job_name: str | None = None
+    if require_job:
         try:
-            if args.known_hosts:
-                new_client.load_system_host_keys(args.known_hosts)
+            job_name = relay_jobs.validate_job_name(args.job)
+        except ValueError as exc:
+            raise RelayError(str(exc)) from exc  # noqa: F405
+    session = read_session(session_name)  # noqa: F405
+    response_timeout = (
+        int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT))  # noqa: F405
+        + int(session.get("reconnect_wait", DEFAULT_RECONNECT_WAIT))  # noqa: F405
+        + 10
+    )
+    return session, job_name, response_timeout
+
+
+def _run_job_control(
+    session: dict[str, Any],
+    remote_command: str,
+    *,
+    response_timeout: float,
+) -> dict[str, Any]:
+    """Выполняет одну короткую служебную job-команду без risky receipt и автоповтора."""
+    return request_daemon(  # noqa: F405
+        session,
+        "exec",
+        command=remote_command,
+        risky=False,
+        receipt_path=DEFAULT_RISKY_RECEIPT_PATH,  # noqa: F405
+        response_timeout=response_timeout,
+    )
+
+
+def _service_error(result: dict[str, Any]) -> str | None:
+    if not result.get("ok"):
+        return str(result.get("protocol_error", "неизвестная ошибка"))
+    code = int(result.get("exit_code", 1))
+    stdout = str(result.get("stdout", ""))
+    reason = relay_jobs.classify_job_command_failure(code, stdout)
+    messages = {
+        "job_not_found": "Job не найден.",
+        "job_active_exists": "Активная задача с таким именем уже существует.",
+        "job_unknown_existing": "Для этого имени найдено неполное состояние с неизвестным результатом; новый запуск запрещён.",
+        "setsid_missing": "На удалённой машине не найден setsid.",
+        "base64_missing": "На удалённой машине не найден base64.",
+        "launcher_failed": "Не удалось подтвердить запуск detached job-runner.",
+        "identity_mismatch": "Сохранённая идентичность процесса не подтверждена; остановка запрещена.",
+        "still_running": "После SIGTERM задача продолжает работать; при необходимости повторите с --force.",
+        "start_locked": "Одновременный запуск job с таким именем уже обрабатывается.",
+    }
+    if reason:
+        return messages.get(reason, f"Служебная job-команда завершилась с ошибкой: {reason}.")
+    if code != 0:
+        stderr = str(result.get("stderr", "")).strip()
+        return stderr or f"Служебная job-команда завершилась с кодом {code}."
+    return None
+
+
+def _status_from_control(result: dict[str, Any]) -> dict[str, Any]:
+    error = _service_error(result)
+    if error:
+        raise RelayError(error)  # noqa: F405
+    return relay_jobs.parse_job_status(str(result.get("stdout", "")))
+
+
+def print_job_status(result: dict[str, Any]) -> None:
+    print(f"Job: {result.get('job', '?')}")
+    print(f"Состояние: {result.get('state', 'unknown')}")
+    print(f"PID: {result.get('pid') if result.get('pid') is not None else '-'}")
+    print(f"Время работы: {int(result.get('elapsed', 0) or 0)} с")
+    print(f"Код завершения: {result.get('exit_code') if result.get('exit_code') is not None else '-'}")
+    print(f"Размер журнала: {format_bytes(int(result.get('log_size', 0) or 0))}")  # noqa: F405
+    log_age = int(result.get("log_age", -1) if result.get("log_age") is not None else -1)
+    print(f"Возраст журнала: {log_age} с" if log_age >= 0 else "Возраст журнала: -")
+
+
+def job_start_cmd(args: argparse.Namespace) -> int:
+    try:
+        session, job_name, response_timeout = _job_context(args)
+        assert job_name is not None
+        remote_command = relay_jobs.build_job_start_command(job_name, args.remote_command)
+        result = _run_job_control(session, remote_command, response_timeout=response_timeout)
+    except DaemonUnavailableError as exc:  # noqa: F405
+        print(str(exc), file=sys.stderr)
+        print(
+            "Результат job start неизвестен. Не повторяйте запуск автоматически; после восстановления relay "
+            f"проверьте job status --name {args.name} --job {args.job} или job list.",
+            file=sys.stderr,
+        )
+        return 1
+    except (RelayError, ValueError) as exc:  # noqa: F405
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if not result.get("ok"):
+        message = str(result.get("protocol_error", "неизвестная ошибка"))
+        print(f"Ошибка relay: {message}", file=sys.stderr)
+        if "Результат операции неизвестен" in message:
+            print(
+                "Не повторяйте job start автоматически; после reconnect сначала проверьте job status/job list.",
+                file=sys.stderr,
+            )
+        return 1
+    error = _service_error(result)
+    if error:
+        print(f"Ошибка relay: {error}", file=sys.stderr)
+        return 1
+    status = relay_jobs.parse_job_status(str(result.get("stdout", "")))
+    print_job_status(status)
+    print("Запуск механизма job подтверждён; это не подтверждение успешного завершения длительной команды.")
+    return 0
+
+
+def _job_status_request(session: dict[str, Any], job_name: str, response_timeout: float) -> dict[str, Any]:
+    result = _run_job_control(
+        session,
+        relay_jobs.build_job_status_command(job_name),
+        response_timeout=response_timeout,
+    )
+    return _status_from_control(result)
+
+
+def job_status_cmd(args: argparse.Namespace) -> int:
+    try:
+        session, job_name, response_timeout = _job_context(args)
+        assert job_name is not None
+        status = _job_status_request(session, job_name, response_timeout)
+    except (RelayError, ValueError) as exc:  # noqa: F405
+        print(str(exc), file=sys.stderr)
+        return 1
+    print_job_status(status)
+    return 0 if status.get("state") in {"running", "succeeded", "failed"} else 1
+
+
+def job_tail_cmd(args: argparse.Namespace) -> int:
+    try:
+        session, job_name, response_timeout = _job_context(args)
+        assert job_name is not None
+        command = relay_jobs.build_job_tail_command(job_name, lines=args.lines, max_bytes=args.max_bytes)
+        result = _run_job_control(session, command, response_timeout=response_timeout)
+    except (RelayError, ValueError) as exc:  # noqa: F405
+        print(str(exc), file=sys.stderr)
+        return 1
+    error = _service_error(result)
+    if error:
+        print(f"Ошибка relay: {error}", file=sys.stderr)
+        return 1
+    sys.stdout.write(str(result.get("stdout", "")))
+    return 0
+
+
+def job_wait_cmd(args: argparse.Namespace) -> int:
+    try:
+        session, job_name, response_timeout = _job_context(args)
+        assert job_name is not None
+    except (RelayError, ValueError) as exc:  # noqa: F405
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    deadline = time.monotonic() + args.timeout
+    last_status: dict[str, Any] = {"job": job_name, "state": "unknown"}
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print_job_status(last_status)
+            print(
+                f"Локальный предел ожидания {args.timeout:g} с истёк; удалённая задача не остановлена.",
+                file=sys.stderr,
+            )
+            return 124
+        try:
+            daemon_status = request_daemon(session, "status", response_timeout=min(5.0, remaining))  # noqa: F405
+            if daemon_status.get("ssh_status", daemon_status.get("status")) != "connected":
+                last_status = {"job": job_name, "state": "unknown"}
             else:
-                new_client.load_system_host_keys()
-            new_client.set_missing_host_key_policy(paramiko.RejectPolicy())
-            new_client.connect(
-                args.host,
-                port=args.port,
-                username=args.user,
-                password=password,
-                key_filename=identity_file,
-                passphrase=passphrase,
-                look_for_keys=False,
-                allow_agent=False,
-                timeout=10,
-            )
-            transport = new_client.get_transport()
-            if transport is None or not transport.is_active() or not transport.is_authenticated():
-                raise RelayError("SSH-транспорт не перешёл в активное аутентифицированное состояние.")
-            transport.set_keepalive(SSH_KEEPALIVE_INTERVAL)
-            return new_client
-        except Exception:
-            new_client.close()
-            raise
-
-    try:
-        client = open_ssh_client()
-    except Exception as exc:
-        password = None
-        passphrase = None
-        print(f"Не удалось установить SSH-соединение: {exc}", file=sys.stderr)
-        if identity_file:
+                last_status = _job_status_request(
+                    session,
+                    job_name,
+                    min(response_timeout, max(1.0, remaining)),
+                )
+        except DaemonUnavailableError as exc:  # noqa: F405
+            print(str(exc), file=sys.stderr)
             print(
-                "Проверьте доступность сервера, файл ключа или сертификата, его passphrase "
-                "и наличие подтверждённого ключа сервера в known_hosts.",
+                "Локальный wait прерван; это не означает завершение или ошибку удалённой задачи.",
                 file=sys.stderr,
             )
-        else:
-            print(
-                "Проверьте доступность сервера, пароль и наличие подтверждённого ключа сервера в known_hosts.",
-                file=sys.stderr,
-            )
-        return 1
-
-    if args.enable_sudo:
-        sudo_password = getpass.getpass(f"sudo-пароль для {args.user}@{args.host}: ")
-        try:
-            verify_sudo_password(client, sudo_password, args.command_timeout)
-        except RelayError as exc:
-            sudo_password = None
-            password = None
-            passphrase = None
-            client.close()
+            return 1
+        except RelayError as exc:  # noqa: F405
             print(str(exc), file=sys.stderr)
             return 1
-        print("Режим sudo включён: пароль проверен и хранится только в памяти daemon.")
 
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        server.bind(("127.0.0.1", 0))
-        server.listen(5)
-        server.settimeout(0.5)
-    except OSError as exc:
-        server.close()
-        sudo_password = None
-        password = None
-        passphrase = None
-        client.close()
-        print(f"Не удалось открыть локальный порт relay: {exc}", file=sys.stderr)
-        return 1
-
-    auth_token = str(uuid.uuid4())
-    daemon_port = server.getsockname()[1]
-    session = {
-        "schema_version": 2,
-        "name": session_name,
-        "version": __version__,
-        "host": args.host,
-        "port": args.port,
-        "user": args.user,
-        "daemon_port": daemon_port,
-        "auth_token": auth_token,
-        "pid": os.getpid(),
-        "sudo_enabled": bool(args.enable_sudo),
-        "command_timeout": args.command_timeout,
-        "download_timeout": args.download_timeout,
-        "download_max_size": args.download_max_size,
-        "upload_timeout": args.upload_timeout,
-        "upload_max_size": args.upload_max_size,
-        "reconnect_wait": DEFAULT_RECONNECT_WAIT,
-    }
-    try:
-        session_path = write_session(session_name, session)
-    except OSError as exc:
-        server.close()
-        sudo_password = None
-        password = None
-        passphrase = None
-        client.close()
-        print(f"Не удалось безопасно записать файл сессии: {exc}", file=sys.stderr)
-        return 1
-
-    stop_event = threading.Event()
-    reconnect_event = threading.Event()
-    command_lock = threading.Lock()
-    client_lock = threading.Lock()
-    connection_condition = threading.Condition()
-    connection_state = "connected"
-    connection_error: str | None = None
-    reconnect_attempt = 0
-    cleanup_done = False
-
-    def client_is_active(candidate: Any) -> bool:
-        try:
-            transport = candidate.get_transport()
-            return bool(transport is not None and transport.is_active() and transport.is_authenticated())
-        except Exception:
-            return False
-
-    def current_client() -> Any:
-        with client_lock:
-            return client
-
-    def mark_connection_lost(error: object | None = None) -> None:
-        """Переводит SSH в восстановление и будит reconnect-worker."""
-        nonlocal connection_state, connection_error
-        error_text = str(error).strip() if error is not None else ""
-        should_report = False
-        with connection_condition:
-            if stop_event.is_set():
-                return
-            if connection_state == "connected":
-                should_report = True
-                connection_state = "reconnecting"
-                connection_error = error_text or "SSH-транспорт недоступен."
-            elif error_text:
-                connection_error = error_text
-            connection_condition.notify_all()
-        reconnect_event.set()
-        if should_report:
-            print(f"SSH-соединение потеряно: {connection_error}", file=sys.stderr, flush=True)
-            print("Запущено автоматическое восстановление SSH-соединения.", file=sys.stderr, flush=True)
-
-    def connection_snapshot() -> dict[str, Any]:
-        candidate = current_client()
-        if not client_is_active(candidate):
-            mark_connection_lost()
-        with connection_condition:
-            return {
-                "ssh_status": connection_state,
-                "last_error": connection_error,
-                "reconnect_attempt": reconnect_attempt,
-            }
-
-    def wait_for_connection(timeout_seconds: float) -> Any:
-        """Ждёт восстановления SSH, но не выполняет и не повторяет удалённую операцию."""
-        candidate = current_client()
-        if client_is_active(candidate):
-            with connection_condition:
-                if connection_state != "connected":
-                    connection_condition.notify_all()
-            return candidate
-
-        mark_connection_lost()
-        deadline = time.monotonic() + timeout_seconds
-        with connection_condition:
-            while True:
-                if stop_event.is_set():
-                    raise RelayError("Daemon завершает работу; удалённый запрос не выполнялся.")
-                if connection_state == "connected":
-                    candidate = current_client()
-                    if client_is_active(candidate):
-                        return candidate
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    details = f" Последняя ошибка: {connection_error}" if connection_error else ""
-                    raise RelayError(
-                        "SSH-соединение сейчас восстанавливается. Daemon работает, но удалённый запрос "
-                        f"не выполнялся за {int(timeout_seconds)} с ожидания. Повторите команду позднее.{details}"
-                    )
-                connection_condition.wait(timeout=remaining)
-
-    def run_remote_operation(operation_name: str, operation: Any) -> dict[str, Any]:
-        """Запускает операцию только на рабочем SSH и не повторяет её после обрыва."""
-        with command_lock:
-            operation_client = wait_for_connection(DEFAULT_RECONNECT_WAIT)
-            try:
-                return operation(operation_client)
-            except Exception as exc:
-                if not client_is_active(operation_client):
-                    mark_connection_lost(exc)
-                    raise RelayError(
-                        f"SSH-соединение потеряно во время {operation_name}. Результат операции неизвестен; "
-                        "операция автоматически не повторялась. Relay восстанавливает соединение для следующих запросов."
-                    ) from exc
-                raise
-
-    def reconnect_worker() -> None:
-        """Последовательно восстанавливает SSH с ограниченным backoff."""
-        nonlocal client, connection_state, connection_error, reconnect_attempt
-        delay_index = 0
-        while not stop_event.is_set():
-            reconnect_event.wait(timeout=0.5)
-            if stop_event.is_set():
-                return
-            if not reconnect_event.is_set():
-                continue
-
-            candidate = current_client()
-            if client_is_active(candidate):
-                with connection_condition:
-                    connection_state = "connected"
-                    connection_error = None
-                    reconnect_attempt = 0
-                    connection_condition.notify_all()
-                reconnect_event.clear()
-                delay_index = 0
-                continue
-
-            with connection_condition:
-                connection_state = "reconnecting"
-                reconnect_attempt += 1
-                attempt = reconnect_attempt
-                connection_condition.notify_all()
-
-            print(
-                f"Попытка восстановления SSH-соединения {attempt}: {args.user}@{args.host}:{args.port}",
-                file=sys.stderr,
-                flush=True,
-            )
-            try:
-                new_client = open_ssh_client()
-            except Exception as exc:
-                if stop_event.is_set():
-                    return
-                delay = RECONNECT_DELAYS[min(delay_index, len(RECONNECT_DELAYS) - 1)]
-                delay_index += 1
-                with connection_condition:
-                    connection_state = "disconnected"
-                    connection_error = str(exc).strip() or exc.__class__.__name__
-                    connection_condition.notify_all()
-                print(
-                    f"Восстановить SSH-соединение не удалось: {connection_error}. "
-                    f"Следующая попытка через {delay} с.",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                stop_event.wait(delay)
-                continue
-
-            if stop_event.is_set():
-                new_client.close()
-                return
-
-            with client_lock:
-                old_client = client
-                client = new_client
-            if old_client is not new_client:
-                try:
-                    old_client.close()
-                except Exception:
-                    pass
-
-            with connection_condition:
-                connection_state = "connected"
-                connection_error = None
-                reconnect_attempt = 0
-                connection_condition.notify_all()
-            reconnect_event.clear()
-            delay_index = 0
-            print(
-                f"SSH-соединение восстановлено: {args.user}@{args.host}:{args.port}",
-                file=sys.stderr,
-                flush=True,
-            )
-
-    def connection_monitor() -> None:
-        """Контролирует состояние транспорта между локальными запросами."""
-        while not stop_event.wait(SSH_MONITOR_INTERVAL):
-            candidate = current_client()
-            if not client_is_active(candidate):
-                mark_connection_lost()
-
-    def cleanup() -> None:
-        nonlocal cleanup_done, sudo_password, password, passphrase, connection_state
-        if cleanup_done:
-            return
-        cleanup_done = True
-        stop_event.set()
-        reconnect_event.set()
-        with connection_condition:
-            connection_state = "stopping"
-            connection_condition.notify_all()
-        sudo_password = None
-        password = None
-        passphrase = None
-        remove_session_file(session_name, auth_token)
-        try:
-            current_client().close()
-        except Exception:
-            pass
-
-    atexit.register(cleanup)
-    threading.Thread(target=reconnect_worker, name=f"ssh-relay-reconnect-{session_name}", daemon=True).start()
-    threading.Thread(target=connection_monitor, name=f"ssh-relay-monitor-{session_name}", daemon=True).start()
-
-    def handle_client(conn: socket.socket) -> None:
-        with conn:
-            conn.settimeout(5)
-
-            def reply(message: dict[str, Any]) -> None:
-                try:
-                    send_message(conn, message)
-                except OSError:
-                    pass
-
-            try:
-                request = read_message(conn)
-                if request.get("auth_token") != auth_token:
-                    reply({"ok": False, "protocol_error": "Доступ к relay отклонён."})
-                    return
-
-                action = request.get("action")
-                if action == "status":
-                    snapshot = connection_snapshot()
-                    reply({
-                        "ok": True,
-                        "status": "active" if snapshot["ssh_status"] == "connected" else snapshot["ssh_status"],
-                        "daemon_status": "active",
-                        "ssh_status": snapshot["ssh_status"],
-                        "last_error": snapshot["last_error"],
-                        "reconnect_attempt": snapshot["reconnect_attempt"],
-                        "version": __version__,
-                        "sudo_enabled": bool(args.enable_sudo),
-                        "name": session_name,
-                    })
-                    return
-                if action == "stop":
-                    reply({"ok": True, "status": "stopping"})
-                    stop_event.set()
-                    reconnect_event.set()
-                    with connection_condition:
-                        connection_condition.notify_all()
-                    return
-                if action not in {"exec", "sudo_exec", "download", "upload"}:
-                    reply({"ok": False, "protocol_error": "Неизвестное действие relay."})
-                    return
-                if action == "sudo_exec" and not args.enable_sudo:
-                    reply({
-                        "ok": False,
-                        "protocol_error": "Режим sudo не включён. Перезапустите daemon с параметром --enable-sudo.",
-                    })
-                    return
-
-                if action == "download":
-                    remote_path = request.get("remote_path")
-                    local_path = request.get("local_path")
-                    overwrite = request.get("overwrite")
-                    create_dirs = request.get("create_dirs")
-                    if not isinstance(remote_path, str) or not isinstance(local_path, str):
-                        reply({"ok": False, "protocol_error": "Для скачивания нужны удалённый и локальный путь."})
-                        return
-                    if not isinstance(overwrite, bool) or not isinstance(create_dirs, bool):
-                        reply({"ok": False, "protocol_error": "Некорректные параметры скачивания."})
-                        return
-                    result = run_remote_operation(
-                        "скачивания файла",
-                        lambda active_client: download_remote_file(
-                            active_client,
-                            remote_path,
-                            local_path,
-                            overwrite=overwrite,
-                            create_dirs=create_dirs,
-                            max_size=args.download_max_size,
-                            timeout_seconds=args.download_timeout,
-                        ),
-                    )
-                    reply(result)
-                    return
-
-                if action == "upload":
-                    local_path = request.get("local_path")
-                    remote_path = request.get("remote_path")
-                    content_b64 = request.get("content_b64")
-                    overwrite = request.get("overwrite")
-                    create_dirs = request.get("create_dirs")
-                    if not isinstance(local_path, str) or not isinstance(remote_path, str):
-                        reply({"ok": False, "protocol_error": "Для загрузки нужны локальный и удалённый путь."})
-                        return
-                    if not isinstance(content_b64, str):
-                        reply({"ok": False, "protocol_error": "Для загрузки нужно содержимое файла."})
-                        return
-                    if not isinstance(overwrite, bool) or not isinstance(create_dirs, bool):
-                        reply({"ok": False, "protocol_error": "Некорректные параметры загрузки."})
-                        return
-                    try:
-                        content = base64.b64decode(content_b64.encode("ascii"), validate=True)
-                    except (ValueError, UnicodeEncodeError):
-                        reply({"ok": False, "protocol_error": "Содержимое загружаемого файла повреждено."})
-                        return
-                    result = run_remote_operation(
-                        "загрузки файла",
-                        lambda active_client: upload_file_content(
-                            active_client,
-                            local_path,
-                            content,
-                            remote_path,
-                            overwrite=overwrite,
-                            create_dirs=create_dirs,
-                            max_size=args.upload_max_size,
-                            timeout_seconds=args.upload_timeout,
-                        ),
-                    )
-                    reply(result)
-                    return
-
-                command = request.get("command")
-                if not isinstance(command, str) or not command.strip():
-                    reply({"ok": False, "protocol_error": "Передана пустая удалённая команда."})
-                    return
-                risky = request.get("risky", False)
-                receipt_path = request.get("receipt_path", DEFAULT_RISKY_RECEIPT_PATH)
-                if not isinstance(risky, bool):
-                    reply({"ok": False, "protocol_error": "Некорректный флаг risky."})
-                    return
-                if not isinstance(receipt_path, str) or not receipt_path.strip():
-                    reply({"ok": False, "protocol_error": "Некорректный путь risky receipt."})
-                    return
-
-                if action == "sudo_exec" and sudo_password is None:
-                    result = {
-                        "ok": False,
-                        "protocol_error": "Режим sudo недоступен: sudo-пароль отсутствует в памяти daemon.",
-                    }
-                else:
-                    def execute_with_optional_receipt(active_client: Any) -> dict[str, Any]:
-                        if action == "sudo_exec":
-                            command_result = execute_sudo_command(
-                                active_client,
-                                command,
-                                args.command_timeout,
-                                sudo_password,
-                            )
-                        else:
-                            command_result = execute_remote_command(
-                                active_client,
-                                command,
-                                args.command_timeout,
-                            )
-                        if command_result.get("ok") and command_result.get("exit_code") == 0 and risky:
-                            receipt = execute_risky_receipt(
-                                active_client,
-                                session=session,
-                                action=action,
-                                command=command,
-                                sudo=(action == "sudo_exec"),
-                                receipt_path=receipt_path,
-                                timeout_seconds=args.command_timeout,
-                                sudo_password=sudo_password,
-                            )
-                            command_result["risky_receipt"] = {
-                                "path": receipt.get("receipt_path"),
-                                "exit_code": receipt.get("exit_code"),
-                            }
-                            if receipt.get("exit_code") != 0:
-                                return {
-                                    "ok": False,
-                                    "protocol_error": "Удалённая команда выполнена, но risky receipt записать не удалось.",
-                                    "command_result": command_result,
-                                    "receipt_result": receipt,
-                                }
-                        return command_result
-
-                    result = run_remote_operation(
-                        "выполнения sudo-команды" if action == "sudo_exec" else "выполнения команды",
-                        execute_with_optional_receipt,
-                    )
-                reply(result)
-            except (socket.timeout, TimeoutError):
-                reply({"ok": False, "protocol_error": "Истекло время ожидания локального запроса."})
-            except RelayError as exc:
-                reply({"ok": False, "protocol_error": str(exc)})
-            except Exception as exc:
-                reply({"ok": False, "protocol_error": f"Внутренняя ошибка daemon: {exc}"})
-
-    print(f"SSH-соединение установлено: {args.user}@{args.host}:{args.port}")
-    print(f"Имя сессии: {session_name}")
-    print(f"Relay слушает локальный адрес 127.0.0.1:{daemon_port}")
-    print(f"Файл сессии: {session_path}")
-    print(f"Режим sudo: {'включён' if args.enable_sudo else 'выключен'}")
-    print(
-        f"Автовосстановление SSH: включено, ожидание запроса до {DEFAULT_RECONNECT_WAIT} с, "
-        f"keepalive {SSH_KEEPALIVE_INTERVAL} с"
-    )
-    print(f"Для завершения нажмите Ctrl+C или выполните команду: stop --name {session_name}")
-
-    try:
-        while not stop_event.is_set():
-            try:
-                conn, _ = server.accept()
-            except socket.timeout:
-                continue
-            threading.Thread(target=handle_client, args=(conn,), daemon=True).start()
-    except KeyboardInterrupt:
-        print("\nПолучен Ctrl+C, сессия завершается.")
-    finally:
-        server.close()
-        cleanup()
-    return 0
-
-
-def print_command_result(result: dict[str, Any]) -> int:
-    if not result.get("ok"):
-        print(f"Ошибка relay: {result.get('protocol_error', 'неизвестная ошибка')}", file=sys.stderr)
-        return 1
-    if result.get("stdout"):
-        sys.stdout.write(result["stdout"])
-    if result.get("stderr"):
-        sys.stderr.write(result["stderr"])
-    return int(result.get("exit_code", 1))
-
-
-def exec_cmd(args: argparse.Namespace) -> int:
-    try:
-        session_name = validate_session_name(args.name)
-        session = read_session(session_name)
-        response_timeout = (
-            int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT))
-            + int(session.get("reconnect_wait", DEFAULT_RECONNECT_WAIT))
-            + 10
-        )
-        result = request_daemon(
-            session,
-            "exec",
-            command=args.remote_command,
-            risky=bool(args.risky),
-            receipt_path=args.receipt_path,
-            response_timeout=response_timeout,
-        )
-    except DaemonUnavailableError as exc:
-        remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
-        print(str(exc), file=sys.stderr)
-        return 1
-    except RelayError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    return print_command_result(result)
-
-
-def sudo_exec_cmd(args: argparse.Namespace) -> int:
-    try:
-        session_name = validate_session_name(args.name)
-        session = read_session(session_name)
-        response_timeout = (
-            int(session.get("command_timeout", DEFAULT_COMMAND_TIMEOUT))
-            + int(session.get("reconnect_wait", DEFAULT_RECONNECT_WAIT))
-            + 10
-        )
-        result = request_daemon(
-            session,
-            "sudo_exec",
-            command=args.remote_command,
-            risky=bool(args.risky),
-            receipt_path=args.receipt_path,
-            response_timeout=response_timeout,
-        )
-    except DaemonUnavailableError as exc:
-        remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
-        print(str(exc), file=sys.stderr)
-        return 1
-    except RelayError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    return print_command_result(result)
-
-
-def download_cmd(args: argparse.Namespace) -> int:
-    try:
-        session_name = validate_session_name(args.name)
-        session = read_session(session_name)
-        local_path = Path(args.local_path).expanduser().resolve(strict=False)
-        response_timeout = (
-            int(session.get("download_timeout", DEFAULT_DOWNLOAD_TIMEOUT))
-            + int(session.get("reconnect_wait", DEFAULT_RECONNECT_WAIT))
-            + 10
-        )
-        result = request_daemon(
-            session,
-            "download",
-            response_timeout=response_timeout,
-            remote_path=args.remote_path,
-            local_path=str(local_path),
-            overwrite=bool(args.overwrite),
-            create_dirs=bool(args.create_dirs),
-        )
-    except DaemonUnavailableError as exc:
-        remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
-        print(str(exc), file=sys.stderr)
-        return 1
-    except RelayError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    if not result.get("ok"):
-        print(f"Ошибка relay: {result.get('protocol_error', 'неизвестная ошибка')}", file=sys.stderr)
-        return 1
-
-    bytes_downloaded = int(result.get("bytes_downloaded", 0))
-    print(f"Скачано: {format_bytes(bytes_downloaded)}")
-    print(f"Удалённый файл: {result.get('remote_path', args.remote_path)}")
-    print(f"Локальный файл: {result.get('local_path', local_path)}")
-    return 0
-
-
-def upload_cmd(args: argparse.Namespace) -> int:
-    try:
-        session_name = validate_session_name(args.name)
-        session = read_session(session_name)
-        local_path = Path(args.local_path).expanduser().resolve(strict=False)
-        if not local_path.is_file():
-            raise RelayError(f"Локальный файл не найден или не является обычным файлом: {local_path}")
-        local_size = local_path.stat().st_size
-        max_size = int(session.get("upload_max_size", DEFAULT_UPLOAD_MAX_SIZE))
-        if local_size > max_size:
-            raise RelayError(
-                f"Размер локального файла {format_bytes(local_size)} превышает лимит "
-                f"{format_bytes(max_size)}. Перезапустите daemon с большим --upload-max-size, если это безопасно."
-            )
-        content_b64 = base64.b64encode(local_path.read_bytes()).decode("ascii")
-        response_timeout = (
-            int(session.get("upload_timeout", DEFAULT_UPLOAD_TIMEOUT))
-            + int(session.get("reconnect_wait", DEFAULT_RECONNECT_WAIT))
-            + 10
-        )
-        result = request_daemon(
-            session,
-            "upload",
-            response_timeout=response_timeout,
-            local_path=str(local_path),
-            content_b64=content_b64,
-            remote_path=args.remote_path,
-            overwrite=bool(args.overwrite),
-            create_dirs=bool(args.create_dirs),
-        )
-    except DaemonUnavailableError as exc:
-        remove_session_file(getattr(args, "name", DEFAULT_SESSION_NAME))
-        print(str(exc), file=sys.stderr)
-        return 1
-    except RelayError as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-    except OSError as exc:
-        print(f"Не удалось прочитать локальный файл: {exc}", file=sys.stderr)
-        return 1
-
-    if not result.get("ok"):
-        print(f"Ошибка relay: {result.get('protocol_error', 'неизвестная ошибка')}", file=sys.stderr)
-        return 1
-
-    bytes_uploaded = int(result.get("bytes_uploaded", 0))
-    print(f"Загружено: {format_bytes(bytes_uploaded)}")
-    print(f"Локальный файл: {result.get('local_path', local_path)}")
-    print(f"Удалённый файл: {result.get('remote_path', args.remote_path)}")
-    return 0
-
-
-def stop_one_session(name: str) -> int:
-    try:
-        session = read_session(name)
-        result = request_daemon(session, "stop")
-    except DaemonUnavailableError as exc:
-        remove_session_file(name)
-        print(f"{name}: {exc}", file=sys.stderr)
-        print(f"{name}: файл неактивной сессии удалён; завершение daemon не подтверждено.", file=sys.stderr)
-        return 1
-    except RelayError as exc:
-        print(f"{name}: {exc}", file=sys.stderr)
-        return 1
-
-    if not result.get("ok"):
-        print(f"{name}: не удалось остановить relay: {result.get('protocol_error', 'неизвестная ошибка')}", file=sys.stderr)
-        return 1
-    print(f"{name}: команда завершения отправлена активному daemon.")
-    return 0
-
-
-def stop(args: argparse.Namespace) -> int:
-    if args.all:
-        names = iter_session_names()
-        if not names:
-            print("Известные сессии не найдены.")
+        state = last_status.get("state")
+        if state == "succeeded":
+            print_job_status(last_status)
             return 0
-        exit_code = 0
-        for name in names:
-            if stop_one_session(name) != 0:
-                exit_code = 1
-        return exit_code
+        if state == "failed":
+            print_job_status(last_status)
+            exit_code = last_status.get("exit_code")
+            return int(exit_code) if isinstance(exit_code, int) and 1 <= exit_code <= 255 else 1
+        time.sleep(min(args.poll_interval, max(0.0, deadline - time.monotonic())))
+
+
+def job_stop_cmd(args: argparse.Namespace) -> int:
     try:
-        name = validate_session_name(args.name)
-    except RelayError as exc:
+        session, job_name, response_timeout = _job_context(args)
+        assert job_name is not None
+        command = relay_jobs.build_job_stop_command(job_name, force=bool(args.force), grace_seconds=float(args.grace))
+        result = _run_job_control(session, command, response_timeout=response_timeout)
+    except (RelayError, ValueError) as exc:  # noqa: F405
         print(str(exc), file=sys.stderr)
-        return 2
-    return stop_one_session(name)
+        return 1
+    error = _service_error(result)
+    if error:
+        print(f"Ошибка relay: {error}", file=sys.stderr)
+        return 1
+    print_job_status(relay_jobs.parse_job_status(str(result.get("stdout", ""))))
+    return 0
 
 
-def print_status(name: str, session: dict[str, Any], result: dict[str, Any]) -> None:
-    ssh_status = str(result.get("ssh_status", result.get("status", "unknown")))
-    ssh_labels = {
-        "connected": "подключено",
-        "reconnecting": "восстанавливается",
-        "disconnected": "временно недоступно, автоповтор продолжается",
-        "stopping": "завершается",
-        "active": "состояние SSH не поддерживается старой версией daemon",
-    }
-    print(f"Сессия: {name}")
-    print("Daemon: активен")
-    print(f"SSH: {ssh_labels.get(ssh_status, ssh_status)}")
-    print(f"SSH-сервер: {format_session_target(session)}")
-    print(f"Локальный порт: {session['daemon_port']}")
-    print(f"Версия relay: {result.get('version', session['version'])}")
-    print(f"Режим sudo: {'включён' if result.get('sudo_enabled') else 'выключен'}")
-    if ssh_status != "connected":
-        print(f"Попытка восстановления: {int(result.get('reconnect_attempt', 0) or 0)}")
-        if result.get("last_error"):
-            print(f"Последняя ошибка SSH: {result['last_error']}")
-    print(f"Файл сессии: {session.get('_session_file_path', existing_session_file_path(name))}")
-
-
-def status_one_session(name: str, *, cleanup_stale: bool) -> int:
+def job_list_cmd(args: argparse.Namespace) -> int:
     try:
-        session = read_session(name)
-        result = request_daemon(session, "status")
-    except DaemonUnavailableError as exc:
-        if cleanup_stale:
-            remove_session_file(name)
-        print(f"{name}: {exc}", file=sys.stderr)
-        return 1
-    except RelayError as exc:
-        print(f"{name}: {exc}", file=sys.stderr)
-        return 1
-
-    if not result.get("ok") or result.get("daemon_status", "active") != "active":
-        print(f"{name}: daemon не подтвердил активное состояние.", file=sys.stderr)
-        return 1
-    print_status(name, session, result)
-    return 0 if result.get("ssh_status", result.get("status")) == "connected" else 1
-
-
-def status(args: argparse.Namespace) -> int:
-    if args.all:
-        names = iter_session_names()
-        if not names:
-            print("Известные сессии не найдены.")
-            return 0
-        exit_code = 0
-        first = True
-        for name in names:
-            if not first:
-                print()
-            first = False
-            if status_one_session(name, cleanup_stale=False) != 0:
-                exit_code = 1
-        return exit_code
-    try:
-        name = validate_session_name(args.name)
-    except RelayError as exc:
+        session, _, response_timeout = _job_context(args, require_job=False)
+        result = _run_job_control(session, relay_jobs.build_job_list_command(), response_timeout=response_timeout)
+    except (RelayError, ValueError) as exc:  # noqa: F405
         print(str(exc), file=sys.stderr)
-        return 2
-    return status_one_session(name, cleanup_stale=True)
-
-
-def list_sessions(_: argparse.Namespace) -> int:
-    names = iter_session_names()
-    if not names:
-        print("Известные сессии не найдены.")
+        return 1
+    error = _service_error(result)
+    if error:
+        print(f"Ошибка relay: {error}", file=sys.stderr)
+        return 1
+    items = relay_jobs.parse_job_list(str(result.get("stdout", "")))
+    if not items:
+        print("Управляемые длительные задачи не найдены.")
         return 0
-
-    print("Имя\tСостояние\tSSH\tSudo\tПорт relay\tВерсия")
-    exit_code = 0
-    for name in names:
-        try:
-            session = read_session(name)
-            result = request_daemon(session, "status")
-            ssh_status = result.get("ssh_status", result.get("status"))
-            if result.get("ok") and ssh_status == "connected":
-                state = "активна"
-                sudo = "вкл." if result.get("sudo_enabled") else "выкл."
-                version = str(result.get("version", session["version"]))
-            elif result.get("ok") and ssh_status == "reconnecting":
-                state = "восстановление"
-                sudo = "вкл." if result.get("sudo_enabled") else "выкл."
-                version = str(result.get("version", session["version"]))
-                exit_code = 1
-            elif result.get("ok") and ssh_status == "disconnected":
-                state = "SSH недоступен"
-                sudo = "вкл." if result.get("sudo_enabled") else "выкл."
-                version = str(result.get("version", session["version"]))
-                exit_code = 1
-            else:
-                state = "ошибка"
-                sudo = "?"
-                version = str(session["version"])
-                exit_code = 1
-            print(f"{name}\t{state}\t{format_session_target(session)}\t{sudo}\t{session['daemon_port']}\t{version}")
-        except RelayError:
-            exit_code = 1
-            try:
-                session = read_session(name)
-                target = format_session_target(session)
-                port = session.get("daemon_port", "?")
-                version = session.get("version", "?")
-            except RelayError:
-                target = "?"
-                port = "?"
-                version = "?"
-            print(f"{name}\tнедоступна\t{target}\t?\t{port}\t{version}")
-    return exit_code
+    print("Job\tСостояние\tPID\tКод завершения")
+    for item in items:
+        print(
+            f"{item.get('job', '?')}\t{item.get('state', 'unknown')}\t"
+            f"{item.get('pid') if item.get('pid') is not None else '-'}\t"
+            f"{item.get('exit_code') if item.get('exit_code') is not None else '-'}"
+        )
+    return 0
 
 
-def add_session_name_argument(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--name",
-        "-n",
-        default=DEFAULT_SESSION_NAME,
-        help=f"Имя relay-сессии, по умолчанию {DEFAULT_SESSION_NAME}.",
-    )
+def _top_level_subparsers(parser: argparse.ArgumentParser) -> argparse._SubParsersAction:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action
+    raise RuntimeError("В базовом parser не найдены подкоманды.")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = RussianArgumentParser(
-        description="Локальный SSH-relay для коротких неинтерактивных удалённых команд.",
-    )
-    parser.add_argument("-v", "--version", action="version", version=f"ssh_relay {__version__}", help="Показать версию и выйти.")
-    subparsers = parser.add_subparsers(dest="command", required=True, parser_class=RussianArgumentParser)
+    parser = _core.build_parser()
+    subparsers = _top_level_subparsers(parser)
 
-    daemon_parser = subparsers.add_parser(
-        "daemon", help="Открыть SSH-сессию и запустить локальный relay."
+    # При --detach прежняя реализация должна повторно запустить внешний ssh_relay.py,
+    # а не внутренний модуль ssh_relay_core.py.
+    subparsers.choices["daemon"].set_defaults(handler=daemon)
+
+    job_parser = subparsers.add_parser("job", help="Управлять длительными неинтерактивными задачами.")
+    job_subparsers = job_parser.add_subparsers(
+        dest="job_command",
+        required=True,
+        parser_class=RussianArgumentParser,  # noqa: F405
     )
-    add_session_name_argument(daemon_parser)
-    daemon_parser.add_argument("--host", required=True, help="Имя или адрес SSH-сервера.")
-    daemon_parser.add_argument("--port", type=parse_port, default=22, help="Порт SSH-сервера, по умолчанию 22.")
-    daemon_parser.add_argument("--user", "-u", default=getpass.getuser(), help="Имя SSH-пользователя.")
-    daemon_parser.add_argument(
-        "--identity-file",
-        "-i",
-        help=(
-            "Путь к приватному SSH-ключу или OpenSSH-сертификату *-cert.pub; "
-            "если не задан, запрашивается SSH-пароль."
-        ),
+
+    start_parser = job_subparsers.add_parser("start", help="Запустить detached длительную задачу.")
+    add_session_name_argument(start_parser)  # noqa: F405
+    start_parser.add_argument("--job", required=True, help="Безопасное имя задачи.")
+    start_parser.add_argument("remote_command", help="Неинтерактивная команда для удалённого Linux shell.")
+    start_parser.set_defaults(handler=job_start_cmd)
+
+    status_parser = job_subparsers.add_parser("status", help="Показать сохранённое состояние длительной задачи.")
+    add_session_name_argument(status_parser)  # noqa: F405
+    status_parser.add_argument("--job", required=True, help="Имя длительной задачи.")
+    status_parser.set_defaults(handler=job_status_cmd)
+
+    tail_parser = job_subparsers.add_parser("tail", help="Показать ограниченный хвост журнала длительной задачи.")
+    add_session_name_argument(tail_parser)  # noqa: F405
+    tail_parser.add_argument("--job", required=True, help="Имя длительной задачи.")
+    tail_parser.add_argument(
+        "--lines",
+        type=parse_tail_lines,
+        default=relay_jobs.DEFAULT_TAIL_LINES,
+        help=f"Число последних строк, по умолчанию {relay_jobs.DEFAULT_TAIL_LINES}, максимум {relay_jobs.MAX_TAIL_LINES}.",
     )
-    daemon_parser.add_argument(
-        "--ask-key-passphrase",
+    tail_parser.add_argument(
+        "--bytes",
+        dest="max_bytes",
+        type=parse_tail_bytes,
+        default=relay_jobs.DEFAULT_TAIL_BYTES,
+        help=f"Лимит прочитанных байт, по умолчанию {format_bytes(relay_jobs.DEFAULT_TAIL_BYTES)}, максимум {format_bytes(relay_jobs.MAX_TAIL_BYTES)}.",  # noqa: F405
+    )
+    tail_parser.set_defaults(handler=job_tail_cmd)
+
+    wait_parser = job_subparsers.add_parser("wait", help="Локально опрашивать состояние до завершения или timeout.")
+    add_session_name_argument(wait_parser)  # noqa: F405
+    wait_parser.add_argument("--job", required=True, help="Имя длительной задачи.")
+    wait_parser.add_argument(
+        "--poll-interval",
+        type=parse_positive_float_seconds,
+        default=relay_jobs.DEFAULT_WAIT_POLL_INTERVAL,
+        help=f"Интервал опроса в секундах, по умолчанию {relay_jobs.DEFAULT_WAIT_POLL_INTERVAL:g}.",
+    )
+    wait_parser.add_argument(
+        "--timeout",
+        type=parse_positive_float_seconds,
+        default=relay_jobs.DEFAULT_WAIT_TIMEOUT,
+        help=f"Локальный предел ожидания, по умолчанию {relay_jobs.DEFAULT_WAIT_TIMEOUT:g} с; job не останавливает.",
+    )
+    wait_parser.set_defaults(handler=job_wait_cmd)
+
+    stop_parser = job_subparsers.add_parser("stop", help="Безопасно остановить задачу по сохранённой идентичности.")
+    add_session_name_argument(stop_parser)  # noqa: F405
+    stop_parser.add_argument("--job", required=True, help="Имя длительной задачи.")
+    stop_parser.add_argument(
+        "--grace",
+        type=parse_nonnegative_float_seconds,
+        default=relay_jobs.DEFAULT_STOP_GRACE,
+        help=f"Ожидание после SIGTERM, по умолчанию {relay_jobs.DEFAULT_STOP_GRACE:g} с, максимум 60.",
+    )
+    stop_parser.add_argument(
+        "--force",
         action="store_true",
-        help="Запросить passphrase для зашифрованного ключа, указанного через --identity-file.",
+        help="После неуспешного SIGTERM выполнить отдельную ступень SIGKILL.",
     )
-    daemon_parser.add_argument(
-        "--known-hosts",
-        help="Путь к проверенному файлу known_hosts; по умолчанию используется ~/.ssh/known_hosts.",
-    )
-    daemon_parser.add_argument(
-        "--command-timeout",
-        type=parse_positive_seconds,
-        default=DEFAULT_COMMAND_TIMEOUT,
-        help=f"Предельное время одной команды в секундах, по умолчанию {DEFAULT_COMMAND_TIMEOUT}.",
-    )
-    daemon_parser.add_argument(
-        "--download-timeout",
-        type=parse_positive_seconds,
-        default=DEFAULT_DOWNLOAD_TIMEOUT,
-        help=f"Предельное время одного скачивания в секундах, по умолчанию {DEFAULT_DOWNLOAD_TIMEOUT}.",
-    )
-    daemon_parser.add_argument(
-        "--download-max-size",
-        type=parse_size_bytes,
-        default=DEFAULT_DOWNLOAD_MAX_SIZE,
-        help=f"Предельный размер одного скачиваемого файла, по умолчанию {format_bytes(DEFAULT_DOWNLOAD_MAX_SIZE)}.",
-    )
-    daemon_parser.add_argument(
-        "--upload-timeout",
-        type=parse_positive_seconds,
-        default=DEFAULT_UPLOAD_TIMEOUT,
-        help=f"Предельное время одной загрузки файла в секундах, по умолчанию {DEFAULT_UPLOAD_TIMEOUT}.",
-    )
-    daemon_parser.add_argument(
-        "--upload-max-size",
-        type=parse_size_bytes,
-        default=DEFAULT_UPLOAD_MAX_SIZE,
-        help=f"Предельный размер одного загружаемого файла, по умолчанию {format_bytes(DEFAULT_UPLOAD_MAX_SIZE)}.",
-    )
-    daemon_parser.add_argument(
-        "--enable-sudo",
-        action="store_true",
-        help="Включить явный режим sudo с ручным вводом sudo-пароля в терминале daemon.",
-    )
-    daemon_parser.add_argument(
-        "--detach",
-        action="store_true",
-        help="Запустить daemon в отдельном фоне и дождаться активной сессии. Требует --identity-file без passphrase prompt и без sudo.",
-    )
-    daemon_parser.add_argument(
-        "--detach-log",
-        help="Путь к лог-файлу detached daemon; по умолчанию используется каталог состояния ssh_relay.",
-    )
-    daemon_parser.set_defaults(handler=daemon)
+    stop_parser.set_defaults(handler=job_stop_cmd)
 
-    exec_parser = subparsers.add_parser("exec", help="Выполнить одну команду через активный relay.")
-    add_session_name_argument(exec_parser)
-    exec_parser.add_argument(
-        "--risky",
-        action="store_true",
-        help="После успешной команды записать JSONL receipt об изменении на удалённом хосте.",
-    )
-    exec_parser.add_argument(
-        "--receipt-path",
-        default=DEFAULT_RISKY_RECEIPT_PATH,
-        help=f"Удалённый JSONL-файл для --risky, по умолчанию {DEFAULT_RISKY_RECEIPT_PATH}.",
-    )
-    exec_parser.add_argument("remote_command", help="Неинтерактивная команда для удалённого сервера.")
-    exec_parser.set_defaults(handler=exec_cmd)
-
-    sudo_exec_parser = subparsers.add_parser(
-        "sudo-exec",
-        help="Выполнить одну неинтерактивную команду через sudo в активном relay.",
-    )
-    add_session_name_argument(sudo_exec_parser)
-    sudo_exec_parser.add_argument(
-        "--risky",
-        action="store_true",
-        help="После успешной sudo-команды записать JSONL receipt об изменении на удалённом хосте.",
-    )
-    sudo_exec_parser.add_argument(
-        "--receipt-path",
-        default=DEFAULT_RISKY_RECEIPT_PATH,
-        help=f"Удалённый JSONL-файл для --risky, по умолчанию {DEFAULT_RISKY_RECEIPT_PATH}.",
-    )
-    sudo_exec_parser.add_argument("remote_command", help="Неинтерактивная команда для удалённого сервера без префикса sudo.")
-    sudo_exec_parser.set_defaults(handler=sudo_exec_cmd)
-
-    download_parser = subparsers.add_parser("download", help="Скачать один файл с удалённого сервера через активный relay.")
-    add_session_name_argument(download_parser)
-    download_parser.add_argument("remote_path", help="Путь удалённого файла для скачивания.")
-    download_parser.add_argument("local_path", help="Локальный путь для сохранения файла.")
-    download_parser.add_argument("--overwrite", action="store_true", help="Перезаписать локальный файл, если он уже существует.")
-    download_parser.add_argument("--create-dirs", action="store_true", help="Создать локальный каталог назначения, если он отсутствует.")
-    download_parser.set_defaults(handler=download_cmd)
-
-    upload_parser = subparsers.add_parser("upload", help="Загрузить один файл на удалённый сервер через активный relay.")
-    add_session_name_argument(upload_parser)
-    upload_parser.add_argument("local_path", help="Путь локального файла для загрузки.")
-    upload_parser.add_argument("remote_path", help="Удалённый путь для сохранения файла.")
-    upload_parser.add_argument("--overwrite", action="store_true", help="Перезаписать удалённый файл, если он уже существует.")
-    upload_parser.add_argument("--create-dirs", action="store_true", help="Создать удалённый каталог назначения, если он отсутствует.")
-    upload_parser.set_defaults(handler=upload_cmd)
-
-    stop_parser = subparsers.add_parser("stop", help="Корректно остановить активный daemon.")
-    add_session_name_argument(stop_parser)
-    stop_parser.add_argument("--all", action="store_true", help="Остановить все известные relay-сессии через их токены.")
-    stop_parser.set_defaults(handler=stop)
-
-    status_parser = subparsers.add_parser("status", help="Проверить активную сессию daemon.")
-    add_session_name_argument(status_parser)
-    status_parser.add_argument("--all", action="store_true", help="Проверить все известные relay-сессии.")
-    status_parser.set_defaults(handler=status)
-
-    list_parser = subparsers.add_parser("list", help="Показать все известные relay-сессии.")
-    list_parser.set_defaults(handler=list_sessions)
+    list_parser = job_subparsers.add_parser("list", help="Показать длительные задачи выбранной relay-сессии.")
+    add_session_name_argument(list_parser)  # noqa: F405
+    list_parser.set_defaults(handler=job_list_cmd)
     return parser
 
 
 def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
+    args = build_parser().parse_args()
     return int(args.handler(args))
 
 
