@@ -160,7 +160,7 @@ class CliContractTests(unittest.TestCase):
         with contextlib.redirect_stderr(stderr):
             exit_code = args.handler(args)
         self.assertEqual(2, exit_code)
-        self.assertIn("Некорректное имя сессии", stderr.getvalue())
+        self.assertIn("Недопустимое имя сессии", stderr.getvalue())
 
     def test_transfer_idle_timeout_rejects_zero_and_negative_values(self) -> None:
         cases = [
