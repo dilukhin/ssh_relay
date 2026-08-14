@@ -15,6 +15,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# Загружаем CLI-расширения до test_transfers: тот модуль устанавливает собственный
+# FAKE_CORE, и полный unittest discover не должен зависеть от порядка выполнения тестов.
+import ssh_relay  # noqa: F401
 import ssh_relay_core as core
 
 
@@ -23,10 +26,23 @@ DAEMON_RUNNER = Path(__file__).with_name("daemon_fake_runner.py")
 
 
 class DaemonSessionIntegrationTests(unittest.TestCase):
-    def wait_session(self, path: Path, *, token: str | None = None, timeout: float = 5.0) -> dict:
+    def wait_session(
+        self,
+        path: Path,
+        *,
+        process: subprocess.Popen[str],
+        token: str | None = None,
+        timeout: float = 5.0,
+    ) -> dict:
         deadline = time.monotonic() + timeout
         last_error: Exception | None = None
         while time.monotonic() < deadline:
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                self.fail(
+                    f"Тестовый daemon завершился до появления session-файла, код {process.returncode}.\n"
+                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                )
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if token is None or data.get("auth_token") == token:
@@ -57,9 +73,10 @@ class DaemonSessionIntegrationTests(unittest.TestCase):
                     text=True,
                 )
                 original_session: dict | None = None
+                streams_collected = False
                 try:
                     session_path = core.session_file_path("ci-session")
-                    session_data = self.wait_session(session_path)
+                    session_data = self.wait_session(session_path, process=process)
                     original_token = str(session_data["auth_token"])
                     original_session = core.read_session("ci-session")
 
@@ -68,7 +85,12 @@ class DaemonSessionIntegrationTests(unittest.TestCase):
                     self.assertEqual("active", status.get("daemon_status"))
 
                     session_path.unlink()
-                    restored = self.wait_session(session_path, token=original_token, timeout=4.0)
+                    restored = self.wait_session(
+                        session_path,
+                        process=process,
+                        token=original_token,
+                        timeout=4.0,
+                    )
                     self.assertEqual(original_token, restored["auth_token"])
                     self.assertEqual(original_session["daemon_port"], restored["daemon_port"])
                     self.assertEqual(original_session["pid"], restored["pid"])
@@ -88,6 +110,7 @@ class DaemonSessionIntegrationTests(unittest.TestCase):
                     stop_result = core.request_daemon(original_session, "stop")
                     self.assertTrue(stop_result.get("ok"))
                     stdout, stderr = process.communicate(timeout=5.0)
+                    streams_collected = True
                     self.assertEqual(0, process.returncode, stdout + stderr)
 
                     # Cleanup старого daemon не должен удалить регистрацию с чужим токеном.
@@ -105,6 +128,8 @@ class DaemonSessionIntegrationTests(unittest.TestCase):
                         except subprocess.TimeoutExpired:
                             process.terminate()
                             process.communicate(timeout=5.0)
+                    elif not streams_collected:
+                        process.communicate()
 
 
 if __name__ == "__main__":
