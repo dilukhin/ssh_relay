@@ -14,6 +14,7 @@ from typing import Any
 
 STATUS_RETRY_DELAYS = (0.1, 0.3)
 SESSION_GUARD_INTERVAL = 1.0
+REDACTED_SECRET = "[СКРЫТО]"
 
 
 def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
@@ -31,6 +32,96 @@ def _caused_by_connection_refused(exc: BaseException) -> bool:
             return True
         current = current.__cause__ or current.__context__
     return False
+
+
+def _redact_known_secrets(text: str, secrets: tuple[str | None, ...]) -> str:
+    """Скрывает только явно известные relay секреты, не маскируя полезную диагностику целиком."""
+    redacted = text
+    for secret in secrets:
+        if secret:
+            redacted = redacted.replace(secret, REDACTED_SECRET)
+    return redacted
+
+
+def _install_exception_redaction(core: Any) -> None:
+    """Не позволяет исключениям Paramiko/канала случайно вывести переданные секреты."""
+    if getattr(core, "_secret_redaction_installed", False):
+        return
+    if not hasattr(core, "load_paramiko") or not hasattr(core, "execute_remote_command"):
+        return
+
+    original_load_paramiko = core.load_paramiko
+    original_execute_remote_command = core.execute_remote_command
+
+    class SSHClientProxy:
+        def __init__(self, client: Any) -> None:
+            self._client = client
+
+        def connect(self, *args: Any, **kwargs: Any) -> Any:
+            redacted_error: str | None = None
+            try:
+                return self._client.connect(*args, **kwargs)
+            except Exception as exc:
+                original = str(exc)
+                redacted = _redact_known_secrets(
+                    original,
+                    (
+                        str(kwargs.get("password")) if kwargs.get("password") is not None else None,
+                        str(kwargs.get("passphrase")) if kwargs.get("passphrase") is not None else None,
+                    ),
+                )
+                if redacted == original:
+                    raise
+                redacted_error = redacted or exc.__class__.__name__
+            # Поднимаем новое исключение уже вне except, чтобы исходное исключение
+            # с секретом не осталось ни в __cause__, ни в __context__.
+            raise core.RelayError(redacted_error)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._client, name)
+
+    class ParamikoProxy:
+        def __init__(self, module: Any) -> None:
+            self._module = module
+
+        def SSHClient(self) -> SSHClientProxy:
+            return SSHClientProxy(self._module.SSHClient())
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._module, name)
+
+    def protected_load_paramiko() -> Any:
+        return ParamikoProxy(original_load_paramiko())
+
+    def protected_execute_remote_command(
+        client: Any,
+        command: str,
+        timeout_seconds: int,
+        stdin_data: bytes | None = None,
+    ) -> dict[str, Any]:
+        redacted_error: str | None = None
+        try:
+            return original_execute_remote_command(
+                client,
+                command,
+                timeout_seconds,
+                stdin_data=stdin_data,
+            )
+        except Exception as exc:
+            if stdin_data is None:
+                raise
+            stdin_text = stdin_data.decode("utf-8", errors="replace")
+            original = str(exc)
+            redacted = _redact_known_secrets(original, (stdin_text, stdin_text.rstrip("\r\n")))
+            if redacted == original:
+                raise
+            redacted_error = redacted or exc.__class__.__name__
+        # Секретное исходное исключение не сохраняется в exception chain.
+        raise core.RelayError(redacted_error)
+
+    core.load_paramiko = protected_load_paramiko
+    core.execute_remote_command = protected_execute_remote_command
+    core._secret_redaction_installed = True
 
 
 def restore_session_file_if_missing(core: Any, name: str, session: dict[str, Any]) -> Path | None:
@@ -71,7 +162,8 @@ def restore_session_file_if_missing(core: Any, name: str, session: dict[str, Any
 
 
 def install(core: Any) -> None:
-    """Устанавливает защиту session-файла поверх существующего core без смены протокола."""
+    """Устанавливает защиту session-файла и секретов поверх core без смены протокола."""
+    _install_exception_redaction(core)
     if getattr(core, "_session_safety_installed", False):
         return
 
