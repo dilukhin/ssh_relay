@@ -20,6 +20,7 @@ CONNECT_LOG = CONTROL_DIR / "connect.log"
 COMMAND_LOG = CONTROL_DIR / "commands.log"
 EVENTS_LOG = CONTROL_DIR / "events.log"
 RECONNECT_FAILURES = CONTROL_DIR / "reconnect_failures.txt"
+BLOCK_RELEASE = CONTROL_DIR / "release_blocked"
 
 
 def append_line(path: Path, value: str) -> None:
@@ -94,6 +95,19 @@ class FakeChannel:
             self.stdout.extend(b"second-ok\n")
             self.finished = True
             append_line(EVENTS_LOG, "end:second")
+            return
+        if command == "test:blocked":
+            append_line(EVENTS_LOG, "start:blocked")
+            deadline = time.monotonic() + 5.0
+            while not BLOCK_RELEASE.exists():
+                if not self.transport.active:
+                    raise OSError("тестовый SSH transport закрыт во время занятой команды")
+                if time.monotonic() >= deadline:
+                    raise OSError("тестовая занятая команда не получила release")
+                time.sleep(0.02)
+            self.stdout.extend(b"blocked-ok\n")
+            self.finished = True
+            append_line(EVENTS_LOG, "end:blocked")
             return
 
         self.stdout.extend(f"executed:{command}\n".encode("utf-8"))
