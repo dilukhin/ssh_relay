@@ -9,7 +9,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import ssh_relay
 import ssh_relay_core as core
 
 
@@ -186,11 +185,15 @@ def fake_getpass(prompt: str) -> str:
 
 
 def main() -> int:
+    # Сначала подменяем внешнюю SSH-сторону, затем импортируем CLI. Так production
+    # install-слои оборачивают fake тем же порядком, что и настоящий Paramiko.
     core.load_paramiko = lambda: FakeParamiko
     core.getpass.getpass = fake_getpass
     core.DEFAULT_RECONNECT_WAIT = 1
     core.RECONNECT_DELAYS = (0.10, 0.10, 0.10)
     core.SSH_MONITOR_INTERVAL = 0.05
+
+    import ssh_relay
 
     arguments = [
         "daemon",

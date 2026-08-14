@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 import argparse
 import base64
@@ -804,13 +804,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--poll-interval",
         type=parse_positive_float_seconds,
         default=relay_jobs.DEFAULT_WAIT_POLL_INTERVAL,
-        help=f"Интервал опроса в секундах, по умолчанию {relay_jobs.DEFAULT_WAIT_POLL_INTERVAL:g}.",
+        help=f"Интервал опроса в секундах, по умолчанию {relay_jobs.DEFAULT_WAIT_POLL_INTERVAL:g}."
     )
     wait_parser.add_argument(
         "--timeout",
         type=parse_positive_float_seconds,
         default=relay_jobs.DEFAULT_WAIT_TIMEOUT,
-        help=f"Локальный предел ожидания, по умолчанию {relay_jobs.DEFAULT_WAIT_TIMEOUT:g} с; job не останавливает.",
+        help=f"Локальный предел ожидания, по умолчанию {relay_jobs.DEFAULT_WAIT_TIMEOUT:g} с; job не останавливает."
     )
     wait_parser.set_defaults(handler=job_wait_cmd)
 
@@ -821,12 +821,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--grace",
         type=parse_nonnegative_float_seconds,
         default=relay_jobs.DEFAULT_STOP_GRACE,
-        help=f"Ожидание после SIGTERM, по умолчанию {relay_jobs.DEFAULT_STOP_GRACE:g} с, максимум 60.",
+        help=f"Ожидание после SIGTERM, по умолчанию {relay_jobs.DEFAULT_STOP_GRACE:g} с, максимум 60."
     )
     stop_parser.add_argument(
         "--force",
         action="store_true",
-        help="После неуспешного SIGTERM выполнить отдельную ступень SIGKILL.",
+        help="После неуспешного SIGTERM выполнить отдельную ступень SIGKILL."
     )
     stop_parser.set_defaults(handler=job_stop_cmd)
 
