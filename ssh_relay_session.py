@@ -21,41 +21,6 @@ def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in session.items() if not str(key).startswith("_")}
 
 
-def _parse_message(core: Any, raw: bytes) -> dict[str, Any] | None:
-    """Разбирает уже полученный полный JSON; для неполного сообщения возвращает None."""
-    try:
-        result = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    if not isinstance(result, dict):
-        raise core.RelayError("Получено сообщение relay неверного формата.")
-    return result
-
-
-def read_message_without_eof(core: Any, sock: Any) -> dict[str, Any]:
-    """Читает один JSON-объект, не требуя EOF после уже полного сообщения."""
-    parts: list[bytes] = []
-    size = 0
-    while True:
-        chunk = sock.recv(core.BUFFER_SIZE)
-        if not chunk:
-            break
-        size += len(chunk)
-        if size > core.MAX_MESSAGE_SIZE:
-            raise core.RelayError("Полученное сообщение превышает допустимый размер.")
-        parts.append(chunk)
-        result = _parse_message(core, b"".join(parts))
-        if result is not None:
-            return result
-
-    if not parts:
-        raise core.RelayError("Получено пустое сообщение от relay.")
-    result = _parse_message(core, b"".join(parts))
-    if result is None:
-        raise core.RelayError("Получено повреждённое сообщение от relay.")
-    return result
-
-
 def restore_session_file_if_missing(core: Any, name: str, session: dict[str, Any]) -> Path | None:
     """Публикует целый session-файл атомарно и не перезаписывает чужую сессию."""
     path = core.session_file_path(name)
@@ -228,7 +193,6 @@ def install(core: Any) -> None:
         print(f"{name}: команда завершения отправлена активному daemon.")
         return 0
 
-    core.read_message = lambda sock: read_message_without_eof(core, sock)
     core.request_daemon = protected_request_daemon
     core.remove_session_file = protected_remove_session_file
     core.write_session = protected_write_session
