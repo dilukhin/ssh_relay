@@ -121,6 +121,10 @@ class DaemonSessionIntegrationTests(unittest.TestCase):
             }
             child_env = os.environ.copy()
             child_env.update(overrides)
+            # Hosted Windows runner имеет англоязычную cp1252 при redirect в PIPE.
+            # Daemon печатает русскую диагностику, поэтому для test subprocess явно
+            # задаём UTF-8, не меняя кодировку production CLI.
+            child_env["PYTHONIOENCODING"] = "utf-8"
 
             with patch.dict(os.environ, overrides, clear=False):
                 process = subprocess.Popen(
@@ -130,6 +134,8 @@ class DaemonSessionIntegrationTests(unittest.TestCase):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                 )
                 original_session: dict | None = None
                 streams_collected = False
