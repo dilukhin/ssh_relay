@@ -4,13 +4,13 @@
 
 Пользователь вручную запускает `daemon` и проходит SSH-аутентификацию. После этого CLI-агент, в частности OpenCode, работает только через локальный relay: `exec`/`sudo-exec` для коротких команд, `job` для длительных удалённых процессов и `upload`/`download` для SFTP-передач. Прямой `ssh` агенту не нужен.
 
-Текущая версия: `0.8.1`.
+Текущая версия: `0.8.2`.
 
 Внутренняя структура:
 
 * `ssh_relay.py` — основной CLI и фактическая версия;
 * `ssh_relay_core.py` — daemon, reconnect, SFTP и существующий `--risky`;
-* `ssh_relay_session.py` — защита локальной регистрации живого daemon и безопасный retry `status`;
+* `ssh_relay_session.py` — защита локальной регистрации живого daemon, безопасный retry `status` и редукция известных relay-секретов в диагностике зависимостей;
 * `ssh_relay_jobs.py` — протокол управляемых длительных удалённых задач;
 * `ssh_relay_transfers.py` — прогресс, чанки, таймауты и безопасные частичные файлы для длительных передач.
 
@@ -121,7 +121,7 @@ py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro -i "$e
 py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro -i "%USERPROFILE%\.ssh\id_ed25519"
 ```
 
-Для зашифрованного ключа используйте `--ask-key-passphrase`. Пароль, passphrase и sudo-пароль не записываются в session-файл. При reconnect необходимые секреты остаются только в памяти daemon до его остановки.
+Для зашифрованного ключа используйте `--ask-key-passphrase`. Пароль, passphrase и sudo-пароль не записываются в session-файл. При reconnect необходимые секреты остаются только в памяти daemon до его остановки. Начиная с `0.8.2`, если SSH-библиотека включает известный relay пароль или passphrase в текст исключения, relay заменяет этот секрет на `[СКРЫТО]` перед выводом диагностики; то же правило применяется к sudo-паролю при исключениях выполнения sudo-команды.
 
 `--detach` доступен только с `--identity-file` без интерактивного passphrase и без `--enable-sudo`.
 
@@ -133,7 +133,7 @@ Daemon сохраняет локальный TCP-server и session-файл пр
 
 Начиная с `0.8.1`, временная недоступность локального control-plane сама по себе не удаляет session-файл. Read-only запрос `status` безопасно повторяется до трёх попыток с короткими задержками; `exec`, `sudo-exec`, `upload`, `download` и `stop` автоматически не повторяются, потому что после потери ответа результат операции может быть неизвестен.
 
-Живой daemon контролирует собственный session-файл. Если файл отсутствует, daemon восстанавливает его с тем же токеном из памяти через создание `O_EXCL`; существующий файл никогда не перезаписывается этим механизмом. Поэтому другой daemon с тем же именем и новым токеном не должен быть затронут.
+Живой daemon контролирует собственный session-файл. Если файл отсутствует, daemon сначала полностью записывает и закрывает временный файл, затем атомарно публикует его через hard link без перезаписи существующего имени. Поэтому другой daemon с тем же именем и новым токеном не должен быть затронут.
 
 Если SSH недоступен **до начала** новой операции, relay может ждать восстановления. Если разрыв произошёл **после начала** команды или чанка передачи, relay не считает его подтверждённым автоматически.
 
@@ -331,7 +331,7 @@ Session-файлы:
 
 ## Безопасность
 
-* SSH-пароль, passphrase и sudo-пароль не сохраняются на диск и не выводятся в логи.
+* SSH-пароль, passphrase и sudo-пароль не сохраняются на диск и не выводятся в логи; известные relay-секреты редактируются из текста исключений зависимостей перед диагностическим выводом.
 * Приватный ключ не копируется в session-файл.
 * Session token не выводится в CLI; защищайте session-файл.
 * `known_hosts` обязателен; неизвестный host key автоматически не принимается.
@@ -346,7 +346,7 @@ Session-файлы:
 Без SSH-сервера:
 
 ```powershell
-py -m py_compile .\ssh_relay.py .\ssh_relay_core.py .\ssh_relay_session.py .\ssh_relay_jobs.py .\ssh_relay_transfers.py .\tests\test_session_safety.py .\tests\test_jobs.py .\tests\test_transfers.py
+py -m py_compile .\ssh_relay.py .\ssh_relay_core.py .\ssh_relay_session.py .\ssh_relay_jobs.py .\ssh_relay_transfers.py .\tests\daemon_fake_runner.py .\tests\daemon_exec_fake_runner.py .\tests\daemon_security_fake_runner.py .\tests\test_session_safety.py .\tests\test_daemon_session_integration.py .\tests\test_core_exec_reconnect.py .\tests\test_security.py .\tests\test_jobs.py .\tests\test_transfers.py
 py -m unittest discover -s .\tests -v
 py .\ssh_relay.py --version
 py .\ssh_relay.py --help
