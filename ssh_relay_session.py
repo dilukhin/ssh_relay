@@ -58,6 +58,7 @@ def _install_exception_redaction(core: Any) -> None:
             self._client = client
 
         def connect(self, *args: Any, **kwargs: Any) -> Any:
+            redacted_error: str | None = None
             try:
                 return self._client.connect(*args, **kwargs)
             except Exception as exc:
@@ -71,7 +72,10 @@ def _install_exception_redaction(core: Any) -> None:
                 )
                 if redacted == original:
                     raise
-                raise core.RelayError(redacted or exc.__class__.__name__) from exc
+                redacted_error = redacted or exc.__class__.__name__
+            # Поднимаем новое исключение уже вне except, чтобы исходное исключение
+            # с секретом не осталось ни в __cause__, ни в __context__.
+            raise core.RelayError(redacted_error)
 
         def __getattr__(self, name: str) -> Any:
             return getattr(self._client, name)
@@ -95,6 +99,7 @@ def _install_exception_redaction(core: Any) -> None:
         timeout_seconds: int,
         stdin_data: bytes | None = None,
     ) -> dict[str, Any]:
+        redacted_error: str | None = None
         try:
             return original_execute_remote_command(
                 client,
@@ -110,7 +115,9 @@ def _install_exception_redaction(core: Any) -> None:
             redacted = _redact_known_secrets(original, (stdin_text, stdin_text.rstrip("\r\n")))
             if redacted == original:
                 raise
-            raise core.RelayError(redacted or exc.__class__.__name__) from exc
+            redacted_error = redacted or exc.__class__.__name__
+        # Секретное исходное исключение не сохраняется в exception chain.
+        raise core.RelayError(redacted_error)
 
     core.load_paramiko = protected_load_paramiko
     core.execute_remote_command = protected_execute_remote_command
