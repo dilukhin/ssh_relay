@@ -392,7 +392,7 @@ class CliIntegrationTests(unittest.TestCase):
         with mock.patch.object(self.relay._core, "daemon", side_effect=fake_daemon):
             self.assertEqual(self.relay.daemon(object()), 0)
         self.assertEqual(Path(observed["file"]).name, "ssh_relay.py")
-        self.assertEqual(observed["version"], "0.7.0")
+        self.assertEqual(observed["version"], self.relay.__version__)
         self.assertEqual(self.relay._core.__file__, original_file)
 
     def test_job_tail_limits_are_rejected_by_argparse(self):

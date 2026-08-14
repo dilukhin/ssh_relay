@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  windows-control-plane:
+    name: Windows control-plane
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@v4
+
+      - name: Настроить Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Проверить синтаксис
+        run: >-
+          python -m py_compile
+          ssh_relay.py
+          ssh_relay_core.py
+          ssh_relay_session.py
+          ssh_relay_jobs.py
+          ssh_relay_transfers.py
+          tests/test_session_safety.py
+          tests/test_daemon_session_integration.py
+
+      - name: Проверить session control-plane
+        run: python -m unittest discover -s tests -p "test_*session*.py" -v
+
+  ubuntu-tests:
+    name: Ubuntu full tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@v4
+
+      - name: Настроить Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Проверить синтаксис
+        run: >-
+          python -m py_compile
+          ssh_relay.py
+          ssh_relay_core.py
+          ssh_relay_session.py
+          ssh_relay_jobs.py
+          ssh_relay_transfers.py
+          tests/test_session_safety.py
+          tests/test_daemon_session_integration.py
+          tests/test_jobs.py
+          tests/test_transfers.py
+
+      - name: Выполнить полный набор тестов
+        run: python -m unittest discover -s tests -v
