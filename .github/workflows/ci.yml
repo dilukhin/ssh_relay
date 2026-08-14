@@ -49,6 +49,7 @@ jobs:
           tests/test_real_sftp_integration.py
           tests/test_cli_contract.py
           tests/test_protocol_hardening.py
+          tests/test_daemon_busy_shutdown.py
           tests/test_transfers.py
 
       - name: Проверить session control-plane
@@ -71,6 +72,9 @@ jobs:
 
       - name: Проверить hardening локального протокола
         run: python -m unittest discover -s tests -p "test_protocol_hardening.py" -v
+
+      - name: Проверить stop/status при занятом daemon
+        run: python -m unittest discover -s tests -p "test_daemon_busy_shutdown.py" -v
 
       - name: Проверить transfer client logic
         run: python -m unittest discover -s tests -p "test_transfers.py" -v
@@ -114,6 +118,7 @@ jobs:
           tests/test_real_sftp_integration.py
           tests/test_cli_contract.py
           tests/test_protocol_hardening.py
+          tests/test_daemon_busy_shutdown.py
           tests/test_jobs.py
           tests/test_transfers.py
 
