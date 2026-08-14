@@ -47,6 +47,8 @@ def _install_exception_redaction(core: Any) -> None:
     """Не позволяет исключениям Paramiko/канала случайно вывести переданные секреты."""
     if getattr(core, "_secret_redaction_installed", False):
         return
+    if not hasattr(core, "load_paramiko") or not hasattr(core, "execute_remote_command"):
+        return
 
     original_load_paramiko = core.load_paramiko
     original_execute_remote_command = core.execute_remote_command
