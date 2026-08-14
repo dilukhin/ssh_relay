@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Тестовый daemon с управляемым fake Paramiko для exec/reconnect."""
+"""Тестовый daemon с управляемым fake Paramiko для exec/reconnect/hardening."""
 
 from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -17,6 +18,7 @@ CONTROL_DIR = Path(os.environ["SSH_RELAY_FAKE_CONTROL"])
 CONTROL_DIR.mkdir(parents=True, exist_ok=True)
 CONNECT_LOG = CONTROL_DIR / "connect.log"
 COMMAND_LOG = CONTROL_DIR / "commands.log"
+EVENTS_LOG = CONTROL_DIR / "events.log"
 RECONNECT_FAILURES = CONTROL_DIR / "reconnect_failures.txt"
 
 
@@ -79,6 +81,19 @@ class FakeChannel:
             self.transport.active = False
             raise OSError("тестовый обрыв SSH во время команды")
         if command == "test:hang":
+            return
+        if command == "test:serialized-first":
+            append_line(EVENTS_LOG, "start:first")
+            time.sleep(0.35)
+            self.stdout.extend(b"first-ok\n")
+            self.finished = True
+            append_line(EVENTS_LOG, "end:first")
+            return
+        if command == "test:serialized-second":
+            append_line(EVENTS_LOG, "start:second")
+            self.stdout.extend(b"second-ok\n")
+            self.finished = True
+            append_line(EVENTS_LOG, "end:second")
             return
 
         self.stdout.extend(f"executed:{command}\n".encode("utf-8"))
