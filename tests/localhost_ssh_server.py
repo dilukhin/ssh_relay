@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Локальный Paramiko SSH-server для интеграционных тестов relay."""
+"""Локальный Paramiko SSH/SFTP-server для интеграционных тестов relay."""
 
 from __future__ import annotations
 
+import errno
+import os
+import posixpath
 import socket
 import threading
 import time
-from pathlib import Path
-from typing import Any
+from pathlib import Path, PurePosixPath
 
 import paramiko
 
@@ -45,8 +47,109 @@ class _RelayTestServer(paramiko.ServerInterface):
         return True
 
 
+class _RootedSFTPServer(paramiko.SFTPServerInterface):
+    """Минимальный SFTP-интерфейс, жёстко ограниченный временным каталогом теста."""
+
+    def __init__(self, server: paramiko.ServerInterface, *, root: str) -> None:
+        super().__init__(server)
+        self.root = Path(root).resolve()
+
+    @staticmethod
+    def _error(exc: OSError) -> int:
+        return paramiko.SFTPServer.convert_errno(exc.errno or errno.EIO)
+
+    def _local(self, path: str) -> Path:
+        normalized = posixpath.normpath("/" + str(path).replace("\\", "/").lstrip("/"))
+        relative = PurePosixPath(normalized.lstrip("/"))
+        candidate = self.root.joinpath(*relative.parts).resolve(strict=False)
+        if candidate != self.root and self.root not in candidate.parents:
+            raise PermissionError(errno.EACCES, "Выход за корень тестового SFTP запрещён", path)
+        return candidate
+
+    def canonicalize(self, path: str) -> str:
+        return posixpath.normpath("/" + str(path).replace("\\", "/").lstrip("/"))
+
+    def stat(self, path: str):
+        try:
+            return paramiko.SFTPAttributes.from_stat(os.stat(self._local(path)))
+        except OSError as exc:
+            return self._error(exc)
+
+    def lstat(self, path: str):
+        try:
+            return paramiko.SFTPAttributes.from_stat(os.lstat(self._local(path)))
+        except OSError as exc:
+            return self._error(exc)
+
+    def open(self, path: str, flags: int, attr: paramiko.SFTPAttributes):
+        try:
+            local = self._local(path)
+            mode = int(getattr(attr, "st_mode", 0) or 0o666)
+            fd = os.open(local, flags, mode)
+            if flags & os.O_RDWR:
+                file_mode = "r+b"
+            elif flags & os.O_WRONLY:
+                file_mode = "ab" if flags & os.O_APPEND else "wb"
+            else:
+                file_mode = "rb"
+            stream = os.fdopen(fd, file_mode, buffering=0)
+        except OSError as exc:
+            return self._error(exc)
+
+        handle = paramiko.SFTPHandle(flags)
+        handle.filename = str(local)
+        if flags & os.O_RDWR:
+            handle.readfile = stream
+            handle.writefile = stream
+        elif flags & os.O_WRONLY:
+            handle.writefile = stream
+        else:
+            handle.readfile = stream
+        return handle
+
+    def mkdir(self, path: str, attr: paramiko.SFTPAttributes) -> int:
+        try:
+            mode = int(getattr(attr, "st_mode", 0) or 0o777)
+            os.mkdir(self._local(path), mode)
+            return paramiko.SFTP_OK
+        except OSError as exc:
+            return self._error(exc)
+
+    def rmdir(self, path: str) -> int:
+        try:
+            os.rmdir(self._local(path))
+            return paramiko.SFTP_OK
+        except OSError as exc:
+            return self._error(exc)
+
+    def remove(self, path: str) -> int:
+        try:
+            os.remove(self._local(path))
+            return paramiko.SFTP_OK
+        except OSError as exc:
+            return self._error(exc)
+
+    def rename(self, oldpath: str, newpath: str) -> int:
+        try:
+            source = self._local(oldpath)
+            target = self._local(newpath)
+            if target.exists():
+                return paramiko.SFTP_FAILURE
+            os.rename(source, target)
+            return paramiko.SFTP_OK
+        except OSError as exc:
+            return self._error(exc)
+
+    def posix_rename(self, oldpath: str, newpath: str) -> int:
+        try:
+            os.replace(self._local(oldpath), self._local(newpath))
+            return paramiko.SFTP_OK
+        except OSError as exc:
+            return self._error(exc)
+
+
 class LoopbackSSHServer:
-    """Минимальный SSH-server с password auth и exec только для CI."""
+    """Минимальный SSH-server с password auth, exec и опциональным rooted SFTP."""
 
     def __init__(
         self,
@@ -54,10 +157,14 @@ class LoopbackSSHServer:
         *,
         username: str = "donpedro",
         password: str = "relay-test-password",
+        sftp_root: Path | None = None,
     ) -> None:
         self.host_key = host_key
         self.username = username
         self.password = password
+        self.sftp_root = sftp_root.resolve() if sftp_root is not None else None
+        if self.sftp_root is not None:
+            self.sftp_root.mkdir(parents=True, exist_ok=True)
         self._stop = threading.Event()
         self._listener: socket.socket | None = None
         self._accept_thread: threading.Thread | None = None
@@ -194,6 +301,13 @@ class LoopbackSSHServer:
             self.connection_count += 1
         try:
             transport.add_server_key(self.host_key)
+            if self.sftp_root is not None:
+                transport.set_subsystem_handler(
+                    "sftp",
+                    paramiko.SFTPServer,
+                    _RootedSFTPServer,
+                    root=str(self.sftp_root),
+                )
             transport.start_server(server=_RelayTestServer(self))
             while not self._stop.is_set() and transport.is_active():
                 channel = transport.accept(timeout=0.2)

@@ -46,6 +46,7 @@ jobs:
           tests/test_security.py
           tests/test_security_redaction.py
           tests/test_real_ssh_integration.py
+          tests/test_real_sftp_integration.py
           tests/test_transfers.py
 
       - name: Проверить session control-plane
@@ -59,6 +60,9 @@ jobs:
 
       - name: Проверить настоящий loopback SSH
         run: python -m unittest discover -s tests -p "test_real_ssh_integration.py" -v
+
+      - name: Проверить настоящий loopback SFTP
+        run: python -m unittest discover -s tests -p "test_real_sftp_integration.py" -v
 
       - name: Проверить transfer client logic
         run: python -m unittest discover -s tests -p "test_transfers.py" -v
@@ -99,6 +103,7 @@ jobs:
           tests/test_security.py
           tests/test_security_redaction.py
           tests/test_real_ssh_integration.py
+          tests/test_real_sftp_integration.py
           tests/test_jobs.py
           tests/test_transfers.py
 
