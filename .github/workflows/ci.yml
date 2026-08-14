@@ -23,6 +23,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Установить Paramiko
+        run: python -m pip install --disable-pip-version-check paramiko
+
       - name: Проверить синтаксис
         run: >-
           python -m py_compile
@@ -34,12 +37,16 @@ jobs:
           tests/daemon_fake_runner.py
           tests/daemon_exec_fake_runner.py
           tests/daemon_security_fake_runner.py
+          tests/daemon_real_ssh_runner.py
+          tests/localhost_ssh_server.py
           tests/test_session_safety.py
           tests/test_session_lifecycle.py
           tests/test_daemon_session_integration.py
           tests/test_core_exec_reconnect.py
           tests/test_security.py
           tests/test_security_redaction.py
+          tests/test_real_ssh_integration.py
+          tests/test_transfers.py
 
       - name: Проверить session control-plane
         run: python -m unittest discover -s tests -p "test_*session*.py" -v
@@ -49,6 +56,12 @@ jobs:
 
       - name: Проверить security-контракт
         run: python -m unittest discover -s tests -p "test_security*.py" -v
+
+      - name: Проверить настоящий loopback SSH
+        run: python -m unittest discover -s tests -p "test_real_ssh_integration.py" -v
+
+      - name: Проверить transfer client logic
+        run: python -m unittest discover -s tests -p "test_transfers.py" -v
 
   ubuntu-tests:
     name: Ubuntu full tests
@@ -63,6 +76,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Установить Paramiko
+        run: python -m pip install --disable-pip-version-check paramiko
+
       - name: Проверить синтаксис
         run: >-
           python -m py_compile
@@ -74,12 +90,15 @@ jobs:
           tests/daemon_fake_runner.py
           tests/daemon_exec_fake_runner.py
           tests/daemon_security_fake_runner.py
+          tests/daemon_real_ssh_runner.py
+          tests/localhost_ssh_server.py
           tests/test_session_safety.py
           tests/test_session_lifecycle.py
           tests/test_daemon_session_integration.py
           tests/test_core_exec_reconnect.py
           tests/test_security.py
           tests/test_security_redaction.py
+          tests/test_real_ssh_integration.py
           tests/test_jobs.py
           tests/test_transfers.py
 
