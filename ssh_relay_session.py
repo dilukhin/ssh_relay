@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -20,36 +21,76 @@ def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in session.items() if not str(key).startswith("_")}
 
 
+def _parse_message(core: Any, raw: bytes) -> dict[str, Any] | None:
+    """Разбирает уже полученный полный JSON; для неполного сообщения возвращает None."""
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(result, dict):
+        raise core.RelayError("Получено сообщение relay неверного формата.")
+    return result
+
+
+def read_message_without_eof(core: Any, sock: Any) -> dict[str, Any]:
+    """Читает один JSON-объект, не требуя EOF после уже полного сообщения."""
+    parts: list[bytes] = []
+    size = 0
+    while True:
+        chunk = sock.recv(core.BUFFER_SIZE)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > core.MAX_MESSAGE_SIZE:
+            raise core.RelayError("Полученное сообщение превышает допустимый размер.")
+        parts.append(chunk)
+        result = _parse_message(core, b"".join(parts))
+        if result is not None:
+            return result
+
+    if not parts:
+        raise core.RelayError("Получено пустое сообщение от relay.")
+    result = _parse_message(core, b"".join(parts))
+    if result is None:
+        raise core.RelayError("Получено повреждённое сообщение от relay.")
+    return result
+
+
 def restore_session_file_if_missing(core: Any, name: str, session: dict[str, Any]) -> Path | None:
-    """Атомарно создаёт отсутствующий session-файл, не перезаписывая чужую сессию."""
+    """Публикует целый session-файл атомарно и не перезаписывает чужую сессию."""
     path = core.session_file_path(name)
     if path.exists():
         return None
 
     core.prepare_session_directory()
     data = json.dumps(_session_payload(session), ensure_ascii=False, indent=2)
+    temporary = path.with_name(f".{path.name}.restore-{uuid.uuid4().hex}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    try:
-        fd = os.open(path, flags, 0o600)
-    except FileExistsError:
-        return None
-
+    fd = os.open(temporary, flags, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as output:
             output.write(data)
             output.flush()
             os.fsync(output.fileno())
         if os.name != "nt":
+            os.chmod(temporary, 0o600)
+
+        try:
+            # Hard link создаёт целевой dir entry только после закрытия временного
+            # файла и атомарно отказывает, если имя уже занято другой сессией.
+            os.link(temporary, path)
+        except FileExistsError:
+            return None
+        if os.name != "nt":
             os.chmod(path, 0o600)
         if name == core.DEFAULT_SESSION_NAME:
             core.legacy_session_file_path().unlink(missing_ok=True)
-    except BaseException:
+        return path
+    finally:
         try:
-            path.unlink(missing_ok=True)
+            temporary.unlink(missing_ok=True)
         except OSError:
             pass
-        raise
-    return path
 
 
 def install(core: Any) -> None:
@@ -187,6 +228,7 @@ def install(core: Any) -> None:
         print(f"{name}: команда завершения отправлена активному daemon.")
         return 0
 
+    core.read_message = lambda sock: read_message_without_eof(core, sock)
     core.request_daemon = protected_request_daemon
     core.remove_session_file = protected_remove_session_file
     core.write_session = protected_write_session
