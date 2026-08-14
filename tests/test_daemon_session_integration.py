@@ -26,6 +26,36 @@ DAEMON_RUNNER = Path(__file__).with_name("daemon_fake_runner.py")
 
 
 class DaemonSessionIntegrationTests(unittest.TestCase):
+    def collect_process_diagnostics(self, process: subprocess.Popen[str], port: int | None = None) -> str:
+        netstat_lines: list[str] = []
+        if os.name == "nt" and port is not None:
+            try:
+                netstat = subprocess.run(
+                    ["netstat", "-ano"],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=5,
+                    check=False,
+                ).stdout
+                needle = f":{port}"
+                netstat_lines = [line for line in netstat.splitlines() if needle in line or str(process.pid) in line]
+            except Exception as exc:  # pragma: no cover - только диагностика CI
+                netstat_lines = [f"netstat недоступен: {exc}"]
+
+        if process.poll() is None:
+            process.terminate()
+        try:
+            stdout, stderr = process.communicate(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate(timeout=5.0)
+        return (
+            f"PID subprocess: {process.pid}; код завершения: {process.returncode}; port: {port}\n"
+            f"netstat:\n" + "\n".join(netstat_lines) + "\n"
+            f"stdout:\n{stdout}\nstderr:\n{stderr}"
+        )
+
     def fail_if_process_exited(self, process: subprocess.Popen[str]) -> None:
         if process.poll() is None:
             return
@@ -76,9 +106,12 @@ class DaemonSessionIntegrationTests(unittest.TestCase):
             except core.RelayError as exc:
                 last_error = exc
             time.sleep(0.05)
+        diagnostics = self.collect_process_diagnostics(process, int(session["daemon_port"]))
         if last_error is not None:
-            raise AssertionError(f"Control-plane daemon не стал доступен: {last_error}") from last_error
-        raise AssertionError("Control-plane daemon не подтвердил активное состояние.")
+            raise AssertionError(
+                f"Control-plane daemon не стал доступен: {last_error}\n{diagnostics}"
+            ) from last_error
+        raise AssertionError(f"Control-plane daemon не подтвердил активное состояние.\n{diagnostics}")
 
     def test_live_daemon_restores_missing_session_without_overwriting_foreign_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -91,7 +124,7 @@ class DaemonSessionIntegrationTests(unittest.TestCase):
 
             with patch.dict(os.environ, overrides, clear=False):
                 process = subprocess.Popen(
-                    [sys.executable, str(DAEMON_RUNNER)],
+                    [sys.executable, "-u", str(DAEMON_RUNNER)],
                     cwd=str(ROOT),
                     env=child_env,
                     stdout=subprocess.PIPE,
@@ -103,6 +136,7 @@ class DaemonSessionIntegrationTests(unittest.TestCase):
                 try:
                     session_path = core.session_file_path("ci-session")
                     session_data = self.wait_session(session_path, process=process)
+                    self.assertEqual(process.pid, int(session_data["pid"]))
                     original_token = str(session_data["auth_token"])
                     original_session = core.read_session("ci-session")
 
