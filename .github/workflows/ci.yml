@@ -43,6 +43,7 @@ jobs:
           tests/test_session_lifecycle.py
           tests/test_daemon_session_integration.py
           tests/test_core_exec_reconnect.py
+          tests/test_core_reliability_paths.py
           tests/test_security.py
           tests/test_security_redaction.py
           tests/test_real_ssh_integration.py
@@ -113,6 +114,7 @@ jobs:
           tests/test_session_lifecycle.py
           tests/test_daemon_session_integration.py
           tests/test_core_exec_reconnect.py
+          tests/test_core_reliability_paths.py
           tests/test_security.py
           tests/test_security_redaction.py
           tests/test_real_ssh_integration.py
