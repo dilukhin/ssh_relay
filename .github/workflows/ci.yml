@@ -48,6 +48,7 @@ jobs:
           tests/test_real_ssh_integration.py
           tests/test_real_sftp_integration.py
           tests/test_cli_contract.py
+          tests/test_cli_control_paths.py
           tests/test_protocol_hardening.py
           tests/test_daemon_busy_shutdown.py
           tests/test_transfers.py
@@ -68,7 +69,7 @@ jobs:
         run: python -m unittest discover -s tests -p "test_real_sftp_integration.py" -v
 
       - name: Проверить публичный CLI-контракт
-        run: python -m unittest discover -s tests -p "test_cli_contract.py" -v
+        run: python -m unittest discover -s tests -p "test_cli*.py" -v
 
       - name: Проверить hardening локального протокола
         run: python -m unittest discover -s tests -p "test_protocol_hardening.py" -v
@@ -117,6 +118,7 @@ jobs:
           tests/test_real_ssh_integration.py
           tests/test_real_sftp_integration.py
           tests/test_cli_contract.py
+          tests/test_cli_control_paths.py
           tests/test_protocol_hardening.py
           tests/test_daemon_busy_shutdown.py
           tests/test_jobs.py
