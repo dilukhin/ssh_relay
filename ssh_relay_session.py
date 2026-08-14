@@ -21,6 +21,18 @@ def _session_payload(session: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in session.items() if not str(key).startswith("_")}
 
 
+def _caused_by_connection_refused(exc: BaseException) -> bool:
+    """Проверяет цепочку исключений на подтверждённый отказ локального listener."""
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, ConnectionRefusedError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 def restore_session_file_if_missing(core: Any, name: str, session: dict[str, Any]) -> Path | None:
     """Публикует целый session-файл атомарно и не перезаписывает чужую сессию."""
     path = core.session_file_path(name)
@@ -168,6 +180,63 @@ def install(core: Any) -> None:
         assert last_error is not None
         raise last_error
 
+    def protected_check_existing_session(name: str) -> bool:
+        """Не допускает второй daemon, если состояние существующей регистрации неоднозначно."""
+        path = core.existing_session_file_path(name)
+        if not path.exists():
+            return False
+
+        try:
+            session = core.read_session(name)
+        except core.RelayError as exc:
+            print(f"Сессия {name} зарегистрирована, но session-файл не удалось прочитать: {exc}", file=sys.stderr)
+            print(
+                "Автоматический запуск второго daemon запрещён. Удалите повреждённый session-файл вручную "
+                "только после проверки, что старый daemon действительно не работает.",
+                file=sys.stderr,
+            )
+            return True
+
+        try:
+            result = core.request_daemon(session, "status")
+        except core.DaemonUnavailableError as exc:
+            if _caused_by_connection_refused(exc):
+                token = str(session.get("auth_token") or "")
+                if token:
+                    original_remove_session_file(name, token)
+                if core.existing_session_file_path(name).exists():
+                    print(
+                        f"Регистрация сессии {name} изменилась во время проверки; "
+                        "запуск второго daemon запрещён.",
+                        file=sys.stderr,
+                    )
+                    return True
+                print(
+                    f"Старая регистрация сессии {name} удалена: локальный порт daemon не слушает.",
+                    file=sys.stderr,
+                )
+                return False
+
+            print(f"Сессия {name} зарегистрирована, но состояние daemon не подтверждено: {exc}", file=sys.stderr)
+            print(
+                "Запуск второго daemon с тем же именем запрещён, пока состояние первой сессии неизвестно.",
+                file=sys.stderr,
+            )
+            return True
+        except core.RelayError as exc:
+            print(f"Сессия {name} зарегистрирована, но проверка daemon завершилась ошибкой: {exc}", file=sys.stderr)
+            print("Запуск второго daemon с тем же именем запрещён.", file=sys.stderr)
+            return True
+
+        if result.get("ok"):
+            print(f"Сессия {name} уже активна.", file=sys.stderr)
+            print(f"Сначала завершите её командой: stop --name {name}", file=sys.stderr)
+            return True
+
+        print(f"Сессия {name} существует, но daemon не подтвердил активное состояние.", file=sys.stderr)
+        print("Запуск второго daemon с тем же именем запрещён.", file=sys.stderr)
+        return True
+
     def protected_stop_one_session(name: str) -> int:
         try:
             session = core.read_session(name)
@@ -196,5 +265,6 @@ def install(core: Any) -> None:
     core.request_daemon = protected_request_daemon
     core.remove_session_file = protected_remove_session_file
     core.write_session = protected_write_session
+    core.check_existing_session = protected_check_existing_session
     core.stop_one_session = protected_stop_one_session
     core._session_safety_installed = True

@@ -37,6 +37,9 @@ class SessionSafetyTests(unittest.TestCase):
         def session_file_path(name: str) -> Path:
             return sessions_directory() / f"{name}.json"
 
+        def existing_session_file_path(name: str) -> Path:
+            return session_file_path(name)
+
         def legacy_session_file_path() -> Path:
             return root / ".ssh_relay_session.json"
 
@@ -56,7 +59,7 @@ class SessionSafetyTests(unittest.TestCase):
 
         def original_request_daemon(session, action, *, response_timeout=5, **payload):
             calls["request"].append((action, response_timeout, dict(payload)))
-            return {"ok": True, "status": "active"}
+            return {"ok": True, "status": "active", "daemon_status": "active"}
 
         core = types.SimpleNamespace(
             DEFAULT_SESSION_NAME="default",
@@ -65,12 +68,14 @@ class SessionSafetyTests(unittest.TestCase):
             state_directory=state_directory,
             sessions_directory=sessions_directory,
             session_file_path=session_file_path,
+            existing_session_file_path=existing_session_file_path,
             legacy_session_file_path=legacy_session_file_path,
             prepare_session_directory=prepare_session_directory,
             write_session=original_write_session,
             remove_session_file=original_remove_session_file,
             request_daemon=original_request_daemon,
             read_session=lambda name: {"name": name, "auth_token": "token"},
+            check_existing_session=lambda name: False,
             stop_one_session=lambda name: 0,
         )
         return core, calls
@@ -111,6 +116,59 @@ class SessionSafetyTests(unittest.TestCase):
             with self.assertRaises(FakeDaemonUnavailableError):
                 core.request_daemon({"auth_token": "token"}, "exec", command="hostname")
             self.assertEqual(1, attempts["exec"])
+
+    def test_ambiguous_existing_session_blocks_second_daemon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            core, calls = self.make_core(Path(tmp))
+            core.prepare_session_directory()
+            core.session_file_path("default").write_text("{}", encoding="utf-8")
+
+            def unavailable(*args, **kwargs):
+                raise FakeDaemonUnavailableError("временный timeout")
+
+            core.request_daemon = unavailable
+            session_safety.install(core)
+            stderr = io.StringIO()
+            with patch.object(session_safety.time, "sleep", return_value=None), redirect_stderr(stderr):
+                self.assertTrue(core.check_existing_session("default"))
+            self.assertTrue(core.session_file_path("default").exists())
+            self.assertEqual([], calls["remove"])
+            self.assertIn("запрещён", stderr.getvalue())
+
+    def test_connection_refused_existing_session_is_cleaned_by_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            core, calls = self.make_core(Path(tmp))
+            core.prepare_session_directory()
+            core.session_file_path("default").write_text("{}", encoding="utf-8")
+
+            def refused(*args, **kwargs):
+                try:
+                    raise ConnectionRefusedError("listener отсутствует")
+                except ConnectionRefusedError as cause:
+                    raise FakeDaemonUnavailableError("daemon недоступен") from cause
+
+            core.request_daemon = refused
+            session_safety.install(core)
+            stderr = io.StringIO()
+            with patch.object(session_safety.time, "sleep", return_value=None), redirect_stderr(stderr):
+                self.assertFalse(core.check_existing_session("default"))
+            self.assertFalse(core.session_file_path("default").exists())
+            self.assertEqual([("default", "token")], calls["remove"])
+            self.assertIn("порт daemon не слушает", stderr.getvalue())
+
+    def test_corrupted_existing_session_blocks_second_daemon(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            core, calls = self.make_core(Path(tmp))
+            core.prepare_session_directory()
+            core.session_file_path("default").write_text("not-json", encoding="utf-8")
+            core.read_session = lambda name: (_ for _ in ()).throw(FakeRelayError("повреждён"))
+            session_safety.install(core)
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                self.assertTrue(core.check_existing_session("default"))
+            self.assertTrue(core.session_file_path("default").exists())
+            self.assertEqual([], calls["remove"])
+            self.assertIn("вручную", stderr.getvalue())
 
     def test_restore_creates_only_missing_file(self):
         with tempfile.TemporaryDirectory() as tmp:
