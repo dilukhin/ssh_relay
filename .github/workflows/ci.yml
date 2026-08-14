@@ -35,6 +35,7 @@ jobs:
           tests/daemon_exec_fake_runner.py
           tests/daemon_security_fake_runner.py
           tests/test_session_safety.py
+          tests/test_session_lifecycle.py
           tests/test_daemon_session_integration.py
           tests/test_core_exec_reconnect.py
           tests/test_security.py
@@ -74,6 +75,7 @@ jobs:
           tests/daemon_exec_fake_runner.py
           tests/daemon_security_fake_runner.py
           tests/test_session_safety.py
+          tests/test_session_lifecycle.py
           tests/test_daemon_session_integration.py
           tests/test_core_exec_reconnect.py
           tests/test_security.py
