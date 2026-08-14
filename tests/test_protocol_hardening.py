@@ -44,10 +44,10 @@ class MessageProtocolUnitTests(unittest.TestCase):
 
     def test_empty_malformed_utf8_and_non_object_are_rejected(self) -> None:
         cases = [
-            (b"", "Пустой запрос"),
-            (b"{", "Некорректный JSON-запрос"),
-            (b"\xff", "Некорректный JSON-запрос"),
-            (b"[]", "Некорректный формат запроса"),
+            (b"", "Получено пустое сообщение от relay"),
+            (b"{", "Получено повреждённое сообщение от relay"),
+            (b"\xff", "Получено повреждённое сообщение от relay"),
+            (b"[]", "Получено сообщение relay неверного формата"),
         ]
         for payload, expected in cases:
             with self.subTest(payload=payload):
@@ -58,7 +58,7 @@ class MessageProtocolUnitTests(unittest.TestCase):
     def test_oversized_message_is_rejected_before_json_parsing(self) -> None:
         with self.assertRaises(core.RelayError) as captured:
             self.read_payload(b"123456789", max_size=8)
-        self.assertIn("Слишком большой локальный запрос", str(captured.exception))
+        self.assertIn("Полученное сообщение превышает допустимый размер", str(captured.exception))
 
 
 class _OutputChannel:
@@ -262,9 +262,9 @@ class DaemonHardeningIntegrationTests(unittest.TestCase):
 
     def test_malformed_requests_return_structured_error_and_daemon_survives(self) -> None:
         cases = [
-            (b"", "Пустой запрос"),
-            (b"{", "Некорректный JSON-запрос"),
-            (b"[]", "Некорректный формат запроса"),
+            (b"", "Получено пустое сообщение от relay"),
+            (b"{", "Получено повреждённое сообщение от relay"),
+            (b"[]", "Получено сообщение relay неверного формата"),
         ]
         for payload, expected in cases:
             with self.subTest(payload=payload):
@@ -277,7 +277,7 @@ class DaemonHardeningIntegrationTests(unittest.TestCase):
         ).encode("utf-8")
         response = self.raw_exchange(wrong_type)
         self.assertFalse(response.get("ok"))
-        self.assertIn("Поле command должно быть строкой", str(response.get("protocol_error")))
+        self.assertIn("Передана пустая удалённая команда", str(response.get("protocol_error")))
 
         status = core.request_daemon(self.session, "status", response_timeout=1)
         self.assertTrue(status.get("ok"))
