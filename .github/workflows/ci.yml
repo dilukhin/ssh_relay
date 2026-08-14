@@ -128,5 +128,5 @@ jobs:
       - name: Объединить coverage дочерних Python-процессов
         run: python -m coverage combine
 
-      - name: Показать subprocess-aware coverage production-модулей
+      - name: Проверить subprocess-aware coverage production-модулей
         run: python -m coverage report
