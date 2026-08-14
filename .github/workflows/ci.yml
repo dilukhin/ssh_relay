@@ -31,11 +31,17 @@ jobs:
           ssh_relay_session.py
           ssh_relay_jobs.py
           ssh_relay_transfers.py
+          tests/daemon_fake_runner.py
+          tests/daemon_exec_fake_runner.py
           tests/test_session_safety.py
           tests/test_daemon_session_integration.py
+          tests/test_core_exec_reconnect.py
 
       - name: Проверить session control-plane
         run: python -m unittest discover -s tests -p "test_*session*.py" -v
+
+      - name: Проверить exec и reconnect
+        run: python -m unittest discover -s tests -p "test_core*.py" -v
 
   ubuntu-tests:
     name: Ubuntu full tests
@@ -58,8 +64,11 @@ jobs:
           ssh_relay_session.py
           ssh_relay_jobs.py
           ssh_relay_transfers.py
+          tests/daemon_fake_runner.py
+          tests/daemon_exec_fake_runner.py
           tests/test_session_safety.py
           tests/test_daemon_session_integration.py
+          tests/test_core_exec_reconnect.py
           tests/test_jobs.py
           tests/test_transfers.py
 
