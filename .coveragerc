@@ -1,0 +1,12 @@
+[run]
+branch = True
+parallel = True
+patch =
+    subprocess
+include =
+    ssh_relay*.py
+
+[report]
+show_missing = True
+precision = 2
+fail_under = 59
