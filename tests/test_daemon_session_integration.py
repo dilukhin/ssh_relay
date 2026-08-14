@@ -26,6 +26,15 @@ DAEMON_RUNNER = Path(__file__).with_name("daemon_fake_runner.py")
 
 
 class DaemonSessionIntegrationTests(unittest.TestCase):
+    def fail_if_process_exited(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            return
+        stdout, stderr = process.communicate()
+        self.fail(
+            f"Тестовый daemon завершился раньше времени, код {process.returncode}.\n"
+            f"stdout:\n{stdout}\nstderr:\n{stderr}"
+        )
+
     def wait_session(
         self,
         path: Path,
@@ -37,12 +46,7 @@ class DaemonSessionIntegrationTests(unittest.TestCase):
         deadline = time.monotonic() + timeout
         last_error: Exception | None = None
         while time.monotonic() < deadline:
-            if process.poll() is not None:
-                stdout, stderr = process.communicate()
-                self.fail(
-                    f"Тестовый daemon завершился до появления session-файла, код {process.returncode}.\n"
-                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
-                )
+            self.fail_if_process_exited(process)
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if token is None or data.get("auth_token") == token:
@@ -53,6 +57,28 @@ class DaemonSessionIntegrationTests(unittest.TestCase):
         if last_error is not None:
             raise AssertionError(f"Session-файл не стал доступен: {last_error}") from last_error
         raise AssertionError("Session-файл не появился с ожидаемым токеном.")
+
+    def wait_status(
+        self,
+        session: dict,
+        *,
+        process: subprocess.Popen[str],
+        timeout: float = 5.0,
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            self.fail_if_process_exited(process)
+            try:
+                result = core.request_daemon(session, "status", response_timeout=1)
+                if result.get("ok") and result.get("daemon_status") == "active":
+                    return result
+            except core.RelayError as exc:
+                last_error = exc
+            time.sleep(0.05)
+        if last_error is not None:
+            raise AssertionError(f"Control-plane daemon не стал доступен: {last_error}") from last_error
+        raise AssertionError("Control-plane daemon не подтвердил активное состояние.")
 
     def test_live_daemon_restores_missing_session_without_overwriting_foreign_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -80,8 +106,7 @@ class DaemonSessionIntegrationTests(unittest.TestCase):
                     original_token = str(session_data["auth_token"])
                     original_session = core.read_session("ci-session")
 
-                    status = core.request_daemon(original_session, "status")
-                    self.assertTrue(status.get("ok"))
+                    status = self.wait_status(original_session, process=process)
                     self.assertEqual("active", status.get("daemon_status"))
 
                     session_path.unlink()
@@ -104,6 +129,7 @@ class DaemonSessionIntegrationTests(unittest.TestCase):
                     foreign["auth_token"] = "foreign-token"
                     session_path.write_text(json.dumps(foreign, ensure_ascii=False, indent=2), encoding="utf-8")
                     time.sleep(2.2)
+                    self.fail_if_process_exited(process)
                     still_foreign = json.loads(session_path.read_text(encoding="utf-8"))
                     self.assertEqual("foreign-token", still_foreign["auth_token"])
 
