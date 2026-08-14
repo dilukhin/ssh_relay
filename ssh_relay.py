@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 import argparse
 import base64
@@ -15,11 +15,17 @@ from typing import Any
 
 import ssh_relay_core as _core
 import ssh_relay_jobs as relay_jobs
+import ssh_relay_session as relay_session
 import ssh_relay_transfers as relay_transfers
 from ssh_relay_core import *  # noqa: F403 — сохраняем публичный интерфейс прежнего модуля.
 
 _core.__version__ = __version__
+relay_session.install(_core)
 relay_transfers.install(_core)
+request_daemon = _core.request_daemon
+remove_session_file = _core.remove_session_file
+write_session = _core.write_session
+stop_one_session = _core.stop_one_session
 
 
 def parse_positive_float_seconds(value: str) -> float:
