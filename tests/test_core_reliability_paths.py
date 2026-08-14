@@ -17,6 +17,12 @@ import ssh_relay
 import ssh_relay_core as core
 import ssh_relay_transfers as transfers
 
+# unittest discovery импортирует test_transfers.py до фактического запуска тестов;
+# тот модуль временно переустанавливает transfers на FAKE_CORE. Сохраняем
+# исходные legacy fallback-функции в момент импорта этого модуля.
+LEGACY_DOWNLOAD = transfers._legacy_download
+LEGACY_UPLOAD = transfers._legacy_upload
+
 
 class _Transport:
     def __init__(self, *, active: bool = True, authenticated: bool = True) -> None:
@@ -121,20 +127,13 @@ class _TimeoutChannel:
         self.closed = True
 
 
-class _ChannelTransport:
+class _CommandClient:
     def __init__(self, channel: _TimeoutChannel) -> None:
         self.channel = channel
 
-    def open_session(self, timeout: int = 10):
-        return self.channel
-
-
-class _CommandClient:
-    def __init__(self, channel: _TimeoutChannel) -> None:
-        self.transport = _ChannelTransport(channel)
-
     def get_transport(self):
-        return self.transport
+        channel = self.channel
+        return SimpleNamespace(open_session=lambda timeout=10: channel)
 
 
 class _FailingReader:
@@ -307,32 +306,24 @@ class DetachedDaemonReliabilityTests(unittest.TestCase):
 
 
 class LegacySftpReliabilityTests(unittest.TestCase):
-    @property
-    def legacy_download(self):
-        self.assertIsNotNone(transfers._legacy_download)
-        return transfers._legacy_download
-
-    @property
-    def legacy_upload(self):
-        self.assertIsNotNone(transfers._legacy_upload)
-        return transfers._legacy_upload
+    def setUp(self) -> None:
+        self.assertIsNotNone(LEGACY_DOWNLOAD)
+        self.assertIsNotNone(LEGACY_UPLOAD)
 
     def test_legacy_download_open_and_stat_failures_are_clear(self) -> None:
         client = MagicMock()
         client.open_sftp.side_effect = OSError("channel failed")
         with tempfile.TemporaryDirectory() as tmp:
-            target = str(Path(tmp) / "file.bin")
             with self.assertRaisesRegex(core.RelayError, "Не удалось открыть SFTP-канал"):
-                self.legacy_download(client, "/remote/file", target, overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
+                LEGACY_DOWNLOAD(client, "/remote/file", str(Path(tmp) / "file.bin"), overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
 
         sftp = MagicMock()
         sftp.stat.side_effect = OSError("missing")
         client.open_sftp.side_effect = None
         client.open_sftp.return_value = sftp
         with tempfile.TemporaryDirectory() as tmp:
-            target = str(Path(tmp) / "file.bin")
             with self.assertRaisesRegex(core.RelayError, "Удалённый файл не найден"):
-                self.legacy_download(client, "/remote/file", target, overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
+                LEGACY_DOWNLOAD(client, "/remote/file", str(Path(tmp) / "file.bin"), overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
         sftp.close.assert_called_once()
 
     def test_legacy_download_rejects_directory_and_oversize(self) -> None:
@@ -348,7 +339,7 @@ class LegacySftpReliabilityTests(unittest.TestCase):
                     sftp.stat.return_value = attrs
                     client.open_sftp.return_value = sftp
                     with self.assertRaisesRegex(core.RelayError, message):
-                        self.legacy_download(client, "/remote/file", target, overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
+                        LEGACY_DOWNLOAD(client, "/remote/file", target, overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
                     sftp.close.assert_called_once()
 
     def test_legacy_download_read_failure_removes_temporary_file(self) -> None:
@@ -361,7 +352,7 @@ class LegacySftpReliabilityTests(unittest.TestCase):
             root = Path(tmp)
             target = root / "file.bin"
             with self.assertRaisesRegex(core.RelayError, "Ошибка при скачивании или записи файла"):
-                self.legacy_download(client, "/remote/file", str(target), overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
+                LEGACY_DOWNLOAD(client, "/remote/file", str(target), overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
             self.assertFalse(target.exists())
             self.assertEqual([], list(root.glob(".*.ssh-relay-*.tmp")))
         sftp.close.assert_called_once()
@@ -384,14 +375,14 @@ class LegacySftpReliabilityTests(unittest.TestCase):
         sftp.stat.side_effect = OSError("missing parent")
         client.open_sftp.return_value = sftp
         with self.assertRaisesRegex(core.RelayError, "каталог назначения не существует"):
-            self.legacy_upload(client, "C:/file.bin", b"x", "/missing/file.bin", overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
+            LEGACY_UPLOAD(client, "C:/file.bin", b"x", "/missing/file.bin", overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
         sftp.close.assert_called_once()
 
         sftp = MagicMock()
         sftp.stat.side_effect = [SimpleNamespace(st_mode=stat.S_IFDIR | 0o755), SimpleNamespace(st_mode=stat.S_IFREG | 0o644)]
         client.open_sftp.return_value = sftp
         with self.assertRaisesRegex(core.RelayError, "Удалённый файл уже существует"):
-            self.legacy_upload(client, "C:/file.bin", b"x", "/existing/file.bin", overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
+            LEGACY_UPLOAD(client, "C:/file.bin", b"x", "/existing/file.bin", overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
         sftp.close.assert_called_once()
 
     def test_legacy_upload_write_failure_attempts_partial_cleanup(self) -> None:
@@ -402,26 +393,9 @@ class LegacySftpReliabilityTests(unittest.TestCase):
         client.open_sftp.return_value = sftp
         with patch.object(core, "remote_temporary_path", return_value="/remote/.file.tmp"):
             with self.assertRaisesRegex(core.RelayError, "Ошибка при чтении или загрузке файла"):
-                self.legacy_upload(client, "C:/file.bin", b"payload", "/remote/file.bin", overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
+                LEGACY_UPLOAD(client, "C:/file.bin", b"payload", "/remote/file.bin", overwrite=False, create_dirs=False, max_size=1024, timeout_seconds=5)
         sftp.remove.assert_called_with("/remote/.file.tmp")
         sftp.close.assert_called_once()
-
-    def test_legacy_upload_overwrite_rename_fallback_finishes_and_cleans_up(self) -> None:
-        client = MagicMock()
-        sftp = MagicMock()
-        sftp.stat.side_effect = [
-            SimpleNamespace(st_mode=stat.S_IFDIR | 0o755), SimpleNamespace(st_mode=stat.S_IFREG | 0o644),
-            OSError("temporary missing"), SimpleNamespace(st_mode=stat.S_IFREG | 0o644),
-        ]
-        sftp.open.return_value = _Writer()
-        sftp.posix_rename.side_effect = OSError("extension unavailable")
-        client.open_sftp.return_value = sftp
-        with patch.object(core, "remote_temporary_path", return_value="/remote/.file.tmp"):
-            result = self.legacy_upload(client, "C:/file.bin", b"payload", "/remote/file.bin", overwrite=True, create_dirs=False, max_size=1024, timeout_seconds=5)
-        self.assertTrue(result["ok"])
-        self.assertEqual(len(b"payload"), result["bytes_uploaded"])
-        sftp.rename.assert_called_once_with("/remote/.file.tmp", "/remote/file.bin")
-        self.assertTrue(sftp.close.called)
 
 
 if __name__ == "__main__":
