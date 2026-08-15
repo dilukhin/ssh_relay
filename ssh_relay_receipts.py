@@ -91,7 +91,6 @@ def normalize_optional_text(core: Any, value: object | None, *, field: str, max_
 
 
 def canonical_json(value: dict[str, Any]) -> str:
-    """Канонический JSON для receipt hash: UTF-8, sort_keys, без пробелов и финального LF."""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
@@ -167,7 +166,7 @@ def _summary(
     error_code: str | None = None,
     error_message: str | None = None,
 ) -> dict[str, Any]:
-    result: dict[str, Any] = {
+    return {
         "schema_version": RECEIPT_SCHEMA_VERSION,
         "receipt_status": receipt_status,
         "receipt_path": path,
@@ -179,17 +178,13 @@ def _summary(
         "error_message": error_message,
         "receipt_command": RECEIPT_COMMAND_PLACEHOLDER,
     }
-    return result
 
 
 def _metadata_from_request(core: Any, message: dict[str, Any]) -> dict[str, Any]:
     return {
         "transaction_id": normalize_transaction_id(core, message.get("transaction_id")),
         "change_target": normalize_optional_text(
-            core,
-            message.get("change_target"),
-            field="change_target",
-            max_bytes=MAX_CHANGE_TARGET_BYTES,
+            core, message.get("change_target"), field="change_target", max_bytes=MAX_CHANGE_TARGET_BYTES
         ),
         "change_description": normalize_optional_text(
             core,
@@ -204,10 +199,7 @@ def _metadata_from_args(core: Any, args: argparse.Namespace) -> dict[str, Any]:
     return {
         "transaction_id": normalize_transaction_id(core, getattr(args, "transaction_id", None)),
         "change_target": normalize_optional_text(
-            core,
-            getattr(args, "change_target", None),
-            field="change_target",
-            max_bytes=MAX_CHANGE_TARGET_BYTES,
+            core, getattr(args, "change_target", None), field="change_target", max_bytes=MAX_CHANGE_TARGET_BYTES
         ),
         "change_description": normalize_optional_text(
             core,
@@ -219,7 +211,6 @@ def _metadata_from_args(core: Any, args: argparse.Namespace) -> dict[str, Any]:
 
 
 def prepare_safe_request_payload(core: Any, payload: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
-    """Формирует wire payload, который старый daemon не примет за legacy risky receipt."""
     prepared = dict(payload)
     prepared["risky"] = False
     prepared["receipt_schema_version"] = RECEIPT_SCHEMA_VERSION
@@ -251,7 +242,6 @@ def _receipt_public_summary(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def install(core: Any) -> None:
-    """Подключает safe receipt v1 поверх существующего core без смены text-mode контракта."""
     if getattr(core, "_safe_receipts_installed", False):
         return
     required = (
@@ -276,24 +266,15 @@ def install(core: Any) -> None:
     original_sudo_exec_cmd = core.sudo_exec_cmd
     original_build_parser = core.build_parser
 
-    def safe_build_risky_receipt_command(
-        *,
-        path: str,
-        session: dict[str, Any],
-        action: str,
-        command: str,
-        sudo: bool,
-    ) -> str:
-        transaction_id = str(uuid.uuid4())
-        receipt_id = str(uuid.uuid4())
+    def safe_build_risky_receipt_command(*, path: str, session: dict[str, Any], action: str, command: str, sudo: bool) -> str:
         payload = build_receipt_payload(
             core,
             session=session,
             action=action,
             command=command,
             sudo=sudo,
-            transaction_id=transaction_id,
-            receipt_id=receipt_id,
+            transaction_id=str(uuid.uuid4()),
+            receipt_id=str(uuid.uuid4()),
             change_target=None,
             change_description=None,
         )
@@ -318,7 +299,6 @@ def install(core: Any) -> None:
                 "change_target": None,
                 "change_description": None,
             }
-        receipt_id = str(uuid.uuid4())
         payload = build_receipt_payload(
             core,
             session=session,
@@ -326,15 +306,13 @@ def install(core: Any) -> None:
             command=command,
             sudo=sudo,
             transaction_id=str(metadata["transaction_id"]),
-            receipt_id=receipt_id,
+            receipt_id=str(uuid.uuid4()),
             change_target=metadata.get("change_target"),
             change_description=metadata.get("change_description"),
         )
         writer = build_writer_command(core, path=path, payload=payload)
-
         if sudo and sudo_password is None:
             raise core.RelayError("Нельзя записать sudo receipt: sudo-пароль отсутствует в памяти daemon.")
-
         try:
             if sudo:
                 command_result = core.execute_sudo_command(client, writer, timeout_seconds, sudo_password)
@@ -347,11 +325,7 @@ def install(core: Any) -> None:
                 payload=payload,
                 receipt_status="unknown" if unknown else "failed",
                 exit_code=1,
-                error_code=(
-                    "receipt_write_unknown"
-                    if unknown
-                    else str(getattr(exc, "error_code", "receipt_write_not_started"))
-                ),
+                error_code="receipt_write_unknown" if unknown else str(getattr(exc, "error_code", "receipt_write_not_started")),
                 error_message=(
                     "Результат записи receipt неизвестен; автоматический повтор запрещён."
                     if unknown
@@ -363,12 +337,7 @@ def install(core: Any) -> None:
 
         exit_code = int(command_result.get("exit_code", 1))
         if exit_code == 0:
-            result = _summary(
-                path=path,
-                payload=payload,
-                receipt_status="succeeded",
-                exit_code=0,
-            )
+            result = _summary(path=path, payload=payload, receipt_status="succeeded", exit_code=0)
         else:
             error_code = WRITER_ERROR_CODES.get(exit_code, "receipt_writer_failed")
             messages = {
@@ -399,8 +368,9 @@ def install(core: Any) -> None:
         _receipt_context.action = message.get("action")
         _receipt_context.last_result = None
         _receipt_context.metadata = None
-
         action = message.get("action")
+        if action is None:
+            return message
         legacy_risky = message.get("risky") is True
         schema = message.get("receipt_schema_version")
         safe_risky = schema is not None
@@ -410,11 +380,9 @@ def install(core: Any) -> None:
             raise core.RelayError("Safe receipt допустим только для exec и sudo-exec.")
         if safe_risky and schema != RECEIPT_SCHEMA_VERSION:
             raise core.RelayError("Неподдерживаемая версия safe receipt protocol.")
-
         path = validate_receipt_path(core, message.get("receipt_path"))
         metadata = _metadata_from_request(core, message)
         _receipt_context.metadata = metadata
-
         translated = dict(message)
         translated["receipt_path"] = path
         translated["transaction_id"] = metadata["transaction_id"]
@@ -428,7 +396,6 @@ def install(core: Any) -> None:
         enriched = dict(message)
         if getattr(_receipt_context, "action", None) == "status" and enriched.get("ok"):
             enriched.setdefault("receipt_schema_version", RECEIPT_SCHEMA_VERSION)
-
         last_result = getattr(_receipt_context, "last_result", None)
         if isinstance(last_result, dict):
             public = _receipt_public_summary(last_result)
@@ -443,11 +410,7 @@ def install(core: Any) -> None:
         original_send_message(conn, enriched)
 
     def receipt_request_daemon(
-        session: dict[str, Any],
-        action: str,
-        *,
-        response_timeout: float | None = 5,
-        **payload: Any,
+        session: dict[str, Any], action: str, *, response_timeout: float | None = 5, **payload: Any
     ) -> dict[str, Any]:
         safe_requested = action in {"exec", "sudo_exec"} and payload.get("risky") is True
         request_payload = dict(payload)
@@ -460,28 +423,19 @@ def install(core: Any) -> None:
                     "change_description": None,
                 }
             request_payload = prepare_safe_request_payload(core, request_payload, metadata)
-
-        result = original_request_daemon(
-            session,
-            action,
-            response_timeout=response_timeout,
-            **request_payload,
-        )
+        result = original_request_daemon(session, action, response_timeout=response_timeout, **request_payload)
         if not safe_requested or not result.get("ok") or int(result.get("exit_code", 1)) != 0:
             return result
-
         receipt = result.get("risky_receipt")
         if isinstance(receipt, dict) and receipt.get("receipt_status") == "succeeded":
             return result
-
-        command_result = dict(result)
         return {
             "ok": False,
             "protocol_error": (
                 "Удалённая команда выполнена, но безопасный receipt не подтверждён; "
                 "автоматический повтор запрещён. Перезапустите daemon текущей версией relay."
             ),
-            "command_result": command_result,
+            "command_result": dict(result),
             "receipt_result": {
                 "schema_version": RECEIPT_SCHEMA_VERSION,
                 "receipt_status": "unknown",
@@ -507,7 +461,6 @@ def install(core: Any) -> None:
                 print("Параметры transaction/change допустимы только вместе с --risky.", file=sys.stderr)
                 return 2
             return int(original_handler(args))
-
         try:
             validate_receipt_path(core, getattr(args, "receipt_path", ""))
             metadata = _metadata_from_args(core, args)
@@ -517,7 +470,6 @@ def install(core: Any) -> None:
         except core.RelayError as exc:
             print(str(exc), file=sys.stderr)
             return 1
-
         if not status.get("ok") or status.get("receipt_schema_version") != RECEIPT_SCHEMA_VERSION:
             print(
                 "Активный daemon не подтвердил safe receipt v1. Остановите его и запустите заново текущим relay; "
@@ -525,7 +477,6 @@ def install(core: Any) -> None:
                 file=sys.stderr,
             )
             return 1
-
         _client_context.metadata = metadata
         try:
             return int(original_handler(args))
@@ -552,18 +503,15 @@ def install(core: Any) -> None:
             existing = {option for item in command_parser._actions for option in item.option_strings}
             if "--transaction-id" not in existing:
                 command_parser.add_argument(
-                    "--transaction-id",
-                    help="Идентификатор risky-транзакции; если не задан, генерируется UUID.",
+                    "--transaction-id", help="Идентификатор risky-транзакции; если не задан, генерируется UUID."
                 )
             if "--change-target" not in existing:
                 command_parser.add_argument(
-                    "--change-target",
-                    help="Краткое безопасное описание объекта изменения без секретов.",
+                    "--change-target", help="Краткое безопасное описание объекта изменения без секретов."
                 )
             if "--change-description" not in existing:
                 command_parser.add_argument(
-                    "--change-description",
-                    help="Краткое безопасное описание изменения без секретов.",
+                    "--change-description", help="Краткое безопасное описание изменения без секретов."
                 )
         return parser
 
