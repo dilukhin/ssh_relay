@@ -193,12 +193,14 @@ class MachineCliContractTests(unittest.TestCase):
         self.assertEqual("unknown", payload["operation_status"])
         self.assertEqual("command_result_unknown", payload["error_code"])
 
-    def test_risky_json_is_blocked_before_daemon_until_receipt_contract(self) -> None:
+    def test_risky_json_is_routed_to_final_p0_contract(self) -> None:
         parser = ssh_relay.build_parser()
         args = parser.parse_args(["exec", "--json", "--risky", "--name", "ci-machine", "true"])
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with patch.object(core, "request_daemon") as request, redirect_stdout(stdout), redirect_stderr(stderr):
+        with patch.object(core, "read_session", side_effect=core.RelayError("session missing")), patch.object(
+            core, "request_daemon"
+        ) as request, redirect_stdout(stdout), redirect_stderr(stderr):
             code = int(args.handler(args))
         payload = json.loads(stdout.getvalue())
         request.assert_not_called()
@@ -206,7 +208,8 @@ class MachineCliContractTests(unittest.TestCase):
         self.assertEqual("", stderr.getvalue())
         self.assertTrue(payload["risky"])
         self.assertEqual("not_attempted", payload["receipt_status"])
-        self.assertEqual("risky_machine_contract_not_ready", payload["error_code"])
+        self.assertEqual("session_unavailable", payload["error_code"])
+        self.assertNotEqual("risky_machine_contract_not_ready", payload["error_code"])
 
     def test_text_mode_still_defaults_json_false(self) -> None:
         args = ssh_relay.build_parser().parse_args(["exec", "true"])
