@@ -8,16 +8,16 @@ from typing import Any
 REDACTED_STDIN = "[СКРЫТО]"
 
 
-def _caused_by_connection_refused(exc: BaseException) -> bool:
-    """Ищет подтверждённый отказ локального listener в exception chain."""
+def _find_connection_refused(exc: BaseException) -> ConnectionRefusedError | None:
+    """Возвращает подтверждённый отказ локального listener из exception chain."""
     current: BaseException | None = exc
     visited: set[int] = set()
     while current is not None and id(current) not in visited:
         visited.add(id(current))
         if isinstance(current, ConnectionRefusedError):
-            return True
+            return current
         current = current.__cause__ or current.__context__
-    return False
+    return None
 
 
 def _decode_chunks(chunks: list[bytes]) -> str:
@@ -88,13 +88,20 @@ def install(core: Any) -> None:
                 **payload,
             )
         except core.DaemonUnavailableError as exc:
+            refused = _find_connection_refused(exc)
             # ConnectionRefused доказывает, что локальный daemon запрос не получил.
+            # Одновременно сохраняем прежний непосредственный cause для compatibility/tests.
+            if refused is not None:
+                raise DaemonRequestError(
+                    str(exc),
+                    request_sent=False,
+                    error_code="daemon_unavailable",
+                ) from refused
             # Любой другой transport failure трактуем консервативно как возможную доставку.
-            request_sent = not _caused_by_connection_refused(exc)
             raise DaemonRequestError(
                 str(exc),
-                request_sent=request_sent,
-                error_code="daemon_response_lost" if request_sent else "daemon_unavailable",
+                request_sent=True,
+                error_code="daemon_response_lost",
             ) from exc
         except core.RelayError as exc:
             # Повреждённый/неполный ответ возможен только после локальной отправки запроса.

@@ -122,7 +122,7 @@ class DaemonRequestOutcomeTests(unittest.TestCase):
                 core.request_daemon(self.session, "exec", command="true")
         self.assertFalse(captured.exception.request_sent)
         self.assertEqual("daemon_unavailable", captured.exception.error_code)
-        self.assertIsInstance(captured.exception.__cause__, core.DaemonUnavailableError)
+        self.assertIsInstance(captured.exception.__cause__, ConnectionRefusedError)
 
     def test_send_failure_after_connect_is_unknown(self) -> None:
         sock = _Socket(send_error=OSError("send failed"))
