@@ -4,15 +4,20 @@
 
 Пользователь вручную запускает `daemon` и проходит SSH-аутентификацию. После этого CLI-агент, в частности OpenCode, работает только через локальный relay: `exec`/`sudo-exec` для коротких команд, `job` для длительных удалённых процессов и `upload`/`download` для SFTP-передач. Прямой `ssh` агенту не нужен.
 
-Текущая версия: `0.8.2`.
+Текущая версия: `0.9.0`.
 
 Внутренняя структура:
 
 * `ssh_relay.py` — основной CLI и фактическая версия;
-* `ssh_relay_core.py` — daemon, reconnect, SFTP и существующий `--risky`;
-* `ssh_relay_session.py` — защита локальной регистрации живого daemon, безопасный retry `status` и редукция известных relay-секретов в диагностике зависимостей;
+* `ssh_relay_core.py` — daemon, reconnect, SFTP и базовый протокол коротких команд;
+* `ssh_relay_session.py` — защита локальной регистрации живого daemon, безопасный retry `status`, подключение machine/receipt-слоёв и редукция известных relay-секретов в диагностике зависимостей;
+* `ssh_relay_outcomes.py` — структурированные границы `not_started`/`unknown` и базовый JSON-контракт коротких команд;
+* `ssh_relay_receipts.py` — safe risky receipt v1 и корреляция транзакций;
+* `ssh_relay_p0_contract.py` — единый machine result для risky-команд, включая `partial_success`;
 * `ssh_relay_jobs.py` — протокол управляемых длительных удалённых задач;
 * `ssh_relay_transfers.py` — прогресс, чанки, таймауты и безопасные частичные файлы для длительных передач.
+
+Каноническая спецификация машинного интерфейса находится в `MACHINE_CONTRACT.md`.
 
 ## Возможности
 
@@ -20,6 +25,9 @@
 * обязательная проверка host key через доверенный `known_hosts`;
 * `exec` для коротких команд с раздельными stdout/stderr и исходным exit code;
 * `sudo-exec` при явном `daemon --enable-sudo`;
+* `exec --json` и `sudo-exec --json` с машинно различимыми исходами `succeeded`, `not_started`, `command_failed`, `partial_success`, `unknown`;
+* safe `--risky` receipt без полного текста команды, stdout/stderr и session token;
+* `transaction_id`, заранее созданный `receipt_id`, `command_hash` и `receipt_hash` для risky-корреляции;
 * `job start/status/tail/wait/stop/list` для длительных неинтерактивных процессов;
 * `download` и `upload` одного обычного файла через SFTP;
 * наблюдаемый прогресс длительной передачи без чтения всего файла в память;
@@ -28,8 +36,7 @@
 * SSH keepalive и автоматический reconnect с backoff `1, 2, 5, 10, 30` секунд;
 * сохранение session-файла при неоднозначной локальной ошибке и восстановление исчезнувшей регистрации живым daemon;
 * локальный TCP-server только на `127.0.0.1` и токен сессии;
-* `status`, `status --all`, `list`, `stop`, `stop --all`;
-* существующий `--risky`/agent-safe receipt для коротких `exec`/`sudo-exec`.
+* `status`, `status --all`, `list`, `stop`, `stop --all`.
 
 ## Ключевое различие: `job` и file transfer
 
@@ -47,7 +54,9 @@
 
 `upload`/`download` работают только с обычными файлами, доступными текущему SSH-пользователю. Не поддерживаются каталоги, рекурсивная передача, специальные файлы, `sudo-upload` и `sudo-download`.
 
-Автоматическое resume в ветке `0.8.x` **не поддерживается**. Размер частичного файла сам по себе недостаточен для доказательства, что это префикс того же исходного файла. Relay не имитирует безопасное resume без надёжной проверки идентичности данных.
+Автоматическое resume в `0.9.0` **не поддерживается**. Размер частичного файла сам по себе недостаточен для доказательства, что это префикс того же исходного файла. Relay не имитирует безопасное resume без надёжной проверки идентичности данных.
+
+Machine JSON и safe receipt реализованы только для коротких `exec`/`sudo-exec`. Они не расширяют поддержку интерактивного stdin/PTY и не добавляют автоматический retry. `operation_status=unknown` и `partial_success` запрещено автоматически повторять.
 
 ## Требования
 
@@ -86,8 +95,8 @@ Fingerprint, полученный через сеть, нужно сверить
 
 ```text
 py .\ssh_relay.py daemon [--name NAME] --host HOST --user USER [--port PORT] [-i PATH] [--ask-key-passphrase] [--known-hosts PATH] [--command-timeout SECONDS] [--download-timeout SECONDS] [--download-max-size SIZE] [--upload-timeout SECONDS] [--upload-max-size SIZE] [--enable-sudo] [--detach] [--detach-log PATH]
-py .\ssh_relay.py exec [--name NAME] [--risky] [--receipt-path REMOTE_JSONL] "COMMAND"
-py .\ssh_relay.py sudo-exec [--name NAME] [--risky] [--receipt-path REMOTE_JSONL] "COMMAND"
+py .\ssh_relay.py exec [--name NAME] [--json] [--risky] [--receipt-path REMOTE_JSONL] [--transaction-id ID] [--change-target TEXT] [--change-description TEXT] "COMMAND"
+py .\ssh_relay.py sudo-exec [--name NAME] [--json] [--risky] [--receipt-path REMOTE_JSONL] [--transaction-id ID] [--change-target TEXT] [--change-description TEXT] "COMMAND"
 py .\ssh_relay.py job start [--name NAME] --job JOB "COMMAND"
 py .\ssh_relay.py job status [--name NAME] --job JOB
 py .\ssh_relay.py job tail [--name NAME] --job JOB [--lines N] [--bytes SIZE]
@@ -125,7 +134,7 @@ py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro -i "%U
 
 `--detach` доступен только с `--identity-file` без интерактивного passphrase и без `--enable-sudo`.
 
-После обновления daemon старую активную сессию нужно остановить и запустить заново. Клиент `0.8.x` откажется запускать новый протокол длительных `upload`/`download` через daemon старее `0.8.0`, чтобы старый daemon не интерпретировал служебные чанки как обычную передачу.
+После обновления daemon старую активную сессию нужно остановить и запустить заново. Клиент `0.9.0` откажется запускать протокол длительных `upload`/`download` через daemon старее `0.8.0`, чтобы старый daemon не интерпретировал служебные чанки как обычную передачу. Перед risky-командой клиент также требует capability safe receipt v1; старый daemon без capability получает только read-only `status`, а пользовательская risky-команда не отправляется.
 
 ## Автоматический reconnect
 
@@ -152,13 +161,37 @@ py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro --enab
 py .\ssh_relay.py sudo-exec --name prod "whoami"
 ```
 
-Для короткой изменяющей команды сохраняется существующий `--risky`:
+Для короткой изменяющей команды используется safe `--risky` receipt v1:
 
 ```powershell
-py .\ssh_relay.py exec --name prod --risky "mkdir -p ~/work/app"
+py .\ssh_relay.py exec --name prod --risky --transaction-id deploy-001 --change-target "~/work/app" --change-description "создан каталог приложения" "mkdir -p ~/work/app"
 ```
 
-При exit code `0` receipt пишется в `~/.local/state/agent-safe/changes.jsonl` либо путь из `--receipt-path`.
+При подтверждённом exit code `0` receipt пишется в `~/.local/state/agent-safe/changes.jsonl` либо путь из `--receipt-path`. Receipt содержит hash команды и корреляционные идентификаторы, но не содержит полный текст команды, stdout/stderr, session token, SSH/sudo-пароли и приватные ключи.
+
+Повторный `transaction_id` не делает команду идемпотентной: writer отклоняет duplicate receipt. Если команда уже успела успешно выполниться, итог является `partial_success`, и повторять команду автоматически нельзя.
+
+### Машинный режим 0.9
+
+Для внешнего агента используйте `--json`:
+
+```powershell
+py .\ssh_relay.py exec --name prod --json "hostname"
+py .\ssh_relay.py sudo-exec --name prod --json "whoami"
+py .\ssh_relay.py exec --name prod --json --risky --transaction-id deploy-001 --change-target "/etc/app.conf" --change-description "обновлена конфигурация" "true"
+```
+
+Process exit code машинного режима:
+
+* `0` — `succeeded`;
+* `10` — `not_started`;
+* `11` — `command_failed`;
+* `12` — `partial_success`: команда завершилась успешно, но receipt failed/unknown;
+* `13` — `unknown`: команда могла быть запущена, но достоверный результат потерян.
+
+Remote exit code хранится отдельно в `command_exit_code`. Полный текст команды в JSON не включается. Для risky-команды `transaction_id` и `receipt_id` создаются до изменяющего запроса, поэтому они остаются доступны даже при неизвестном результате.
+
+`operation_status=unknown` и `partial_success` нельзя автоматически retry. Полная схема, failure matrix, `receipt_status` и правила hash описаны в `MACHINE_CONTRACT.md`.
 
 ## job — длительные удалённые процессы
 
@@ -209,7 +242,7 @@ py .\ssh_relay.py job stop --name prod --job build-app --force
 * `--download-timeout` — общий аварийный предел всего download;
 * `--upload-timeout` — общий аварийный предел всего upload.
 
-Они по-прежнему задаются при старте daemon и **не меняют смысл** в `0.8.0`.
+Они по-прежнему задаются при старте daemon и **не меняют смысл** в `0.9.0`.
 
 Дополнительно у `download` и `upload` есть `--idle-timeout`, по умолчанию 60 секунд. Это максимальный интервал без подтверждения одного сетевого шага/чанка. Пока чанки подтверждаются быстрее этого интервала, transfer считается живым. Общий аварийный предел при этом всё равно действует.
 
@@ -287,11 +320,13 @@ py .\ssh_relay.py upload --name prod ".\archive.bin" "/srv/incoming/archive.bin"
 
 ## agent-safe
 
-`upload` меняет удалённое состояние, однако существующий agent-safe receipt имеет контракт короткой команды `status=done`. В `0.8.0` для transfer не создаётся новый несовместимый receipt-формат и `--risky` к `upload` не добавляется.
+Safe receipt v1 относится только к коротким `exec`/`sudo-exec`. `upload` также меняет удалённое состояние, но для transfer в `0.9.0` не создаётся новый несовместимый lifecycle receipt и `--risky` к `upload` не добавляется.
 
 Это явное ограничение: если для file transfer потребуется lifecycle receipt, его нужно проектировать отдельно с состояниями начала/завершения/ошибки и стабильным transfer ID. До этого upload остаётся существующей явной изменяющей командой relay без agent-safe receipt.
 
 `download` обычно не меняет удалённое состояние; локальный overwrite по-прежнему требует `--overwrite`.
+
+Внешний агент должен интерпретировать machine result по полям и process exit code, а не разбирать русский `error_message`. Для `partial_success`/`unknown` повтор risky-команды запрещён до read-only проверки состояния.
 
 ## status, list, stop
 
@@ -320,13 +355,14 @@ Session-файлы:
 1. Не используй прямой ssh.
 2. status --name <session>.
 3. Короткая диагностика: exec "hostname && whoami && pwd".
-4. Короткие команды — exec/sudo-exec.
-5. Длительные удалённые процессы — job.
-6. Большие upload/download — собственный transfer-механизм, не job.
-7. Рост байтов/процента означает живую передачу.
-8. Idle timeout и общий timeout — разные причины остановки.
-9. После обрыва не повторяй upload/download вслепую; сначала проверь partial.
-10. Не раскрывай секреты в командах, выводе, логах и receipts.
+4. Короткие команды — exec/sudo-exec; для машинной интеграции — --json.
+5. После partial_success/unknown не повторяй risky-команду автоматически.
+6. Длительные удалённые процессы — job.
+7. Большие upload/download — собственный transfer-механизм, не job.
+8. Рост байтов/процента означает живую передачу.
+9. Idle timeout и общий timeout — разные причины остановки.
+10. После обрыва не повторяй upload/download вслепую; сначала проверь partial.
+11. Не раскрывай секреты в командах, выводе, логах и receipts.
 ```
 
 ## Безопасность
@@ -336,6 +372,9 @@ Session-файлы:
 * Session token не выводится в CLI; защищайте session-файл.
 * `known_hosts` обязателен; неизвестный host key автоматически не принимается.
 * Все локальные relay-запросы идут только на `127.0.0.1` и проверяются по токену.
+* Safe risky receipt не хранит полный текст команды, stdout/stderr, session token, SSH/sudo-пароль или приватный ключ.
+* `transaction_id`, `change_target` и `change_description` не должны содержать секреты.
+* Receipt writer использует `umask 077`, права `0600`, проверку final symlink и типа файла. Portable POSIX shell не устраняет полностью symlink TOCTOU, поэтому parent directory receipt должен быть доверенным и недоступным для записи посторонним пользователям.
 * `download` не заменяет готовый локальный файл без `--overwrite`.
 * `upload` не заменяет готовый удалённый файл без `--overwrite`.
 * Частичный файл никогда не выдаётся за готовый результат.
@@ -346,16 +385,27 @@ Session-файлы:
 Без SSH-сервера:
 
 ```powershell
-py -m py_compile .\ssh_relay.py .\ssh_relay_core.py .\ssh_relay_session.py .\ssh_relay_jobs.py .\ssh_relay_transfers.py .\tests\daemon_fake_runner.py .\tests\daemon_exec_fake_runner.py .\tests\daemon_security_fake_runner.py .\tests\test_session_safety.py .\tests\test_daemon_session_integration.py .\tests\test_core_exec_reconnect.py .\tests\test_security.py .\tests\test_jobs.py .\tests\test_transfers.py
+py -m py_compile .\ssh_relay.py .\ssh_relay_core.py .\ssh_relay_session.py .\ssh_relay_outcomes.py .\ssh_relay_receipts.py .\ssh_relay_p0_contract.py .\ssh_relay_jobs.py .\ssh_relay_transfers.py
 py -m unittest discover -s .\tests -v
 py .\ssh_relay.py --version
 py .\ssh_relay.py --help
+py .\ssh_relay.py exec --help
+py .\ssh_relay.py sudo-exec --help
 py .\ssh_relay.py download --help
 py .\ssh_relay.py upload --help
 py .\ssh_relay.py job --help
 ```
 
 Перед ручным тестом изменённого daemon старую сессию обязательно остановите и запустите заново.
+
+Минимальная проверка machine-mode после перезапуска daemon:
+
+```powershell
+py .\ssh_relay.py status --name prod
+py .\ssh_relay.py exec --name prod --json "hostname && whoami && pwd"
+py .\ssh_relay.py exec --name prod --json --risky --transaction-id relay-test-001 --change-description "тестовая безопасная операция" "true"
+$LASTEXITCODE
+```
 
 Минимальный transfer-тест:
 
@@ -373,8 +423,9 @@ PowerShell проверяет код через `$LASTEXITCODE`.
 
 ## Дальнейшие доработки
 
+* read-only диагностика risky transaction/receipt для последующей проверки `unknown`;
 * доказуемое resume с проверкой идентичности источника/partial;
 * lifecycle receipts agent-safe для long-job и transfer;
 * отдельная безопасная архитектура длительных sudo-job;
 * рекурсивная передача каталогов только после отдельной оценки лимитов и угроз;
-* интеграционные тесты обрывов SFTP на тестовом SSH-сервере.
+* дополнительные fault-injection тесты обрывов SFTP.
