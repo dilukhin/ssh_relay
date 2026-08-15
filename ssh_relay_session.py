@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import ssh_relay_outcomes as relay_outcomes
+import ssh_relay_p0_contract as relay_p0_contract
 import ssh_relay_receipts as relay_receipts
 
 STATUS_RETRY_DELAYS = (0.1, 0.3)
@@ -168,6 +169,7 @@ def install(core: Any) -> None:
     """Устанавливает защиту session-файла и секретов поверх core без смены протокола."""
     relay_outcomes.install(core)
     relay_receipts.install(core)
+    relay_p0_contract.install(core)
     _install_exception_redaction(core)
     if getattr(core, "_session_safety_installed", False):
         return
