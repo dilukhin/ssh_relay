@@ -12,6 +12,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import ssh_relay_outcomes as relay_outcomes
+
 STATUS_RETRY_DELAYS = (0.1, 0.3)
 SESSION_GUARD_INTERVAL = 1.0
 REDACTED_SECRET = "[СКРЫТО]"
@@ -163,6 +165,7 @@ def restore_session_file_if_missing(core: Any, name: str, session: dict[str, Any
 
 def install(core: Any) -> None:
     """Устанавливает защиту session-файла и секретов поверх core без смены протокола."""
+    relay_outcomes.install(core)
     _install_exception_redaction(core)
     if getattr(core, "_session_safety_installed", False):
         return

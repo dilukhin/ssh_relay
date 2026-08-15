@@ -32,6 +32,7 @@ jobs:
           ssh_relay.py
           ssh_relay_core.py
           ssh_relay_session.py
+          ssh_relay_outcomes.py
           ssh_relay_jobs.py
           ssh_relay_transfers.py
           tests/daemon_fake_runner.py
@@ -44,6 +45,7 @@ jobs:
           tests/test_daemon_session_integration.py
           tests/test_core_exec_reconnect.py
           tests/test_core_reliability_paths.py
+          tests/test_core_machine_outcomes.py
           tests/test_security.py
           tests/test_security_redaction.py
           tests/test_real_ssh_integration.py
@@ -103,6 +105,7 @@ jobs:
           ssh_relay.py
           ssh_relay_core.py
           ssh_relay_session.py
+          ssh_relay_outcomes.py
           ssh_relay_jobs.py
           ssh_relay_transfers.py
           tests/daemon_fake_runner.py
@@ -115,6 +118,7 @@ jobs:
           tests/test_daemon_session_integration.py
           tests/test_core_exec_reconnect.py
           tests/test_core_reliability_paths.py
+          tests/test_core_machine_outcomes.py
           tests/test_security.py
           tests/test_security_redaction.py
           tests/test_real_ssh_integration.py
