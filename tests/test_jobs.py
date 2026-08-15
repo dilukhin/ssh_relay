@@ -303,7 +303,7 @@ class CliIntegrationTests(unittest.TestCase):
         from unittest import mock
 
         args = self.relay.build_parser().parse_args(["exec", "--name", "v3", "exit 7"])
-        self.assertIs(args.handler, self.relay.exec_cmd)
+        self.assertTrue(callable(args.handler))
         self.assertEqual(args.remote_command, "exit 7")
         session = {
             "name": "v3",
@@ -317,7 +317,7 @@ class CliIntegrationTests(unittest.TestCase):
             "request_daemon",
             return_value={"ok": True, "stdout": "", "stderr": "", "exit_code": 7},
         ) as request:
-            self.assertEqual(self.relay.exec_cmd(args), 7)
+            self.assertEqual(args.handler(args), 7)
             self.assertEqual(request.call_count, 1)
             self.assertEqual(request.call_args.args[1], "exec")
 
@@ -360,7 +360,6 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(request.call_count, 1)
         remove.assert_not_called()
         self.assertIn("Не повторяйте запуск автоматически", stderr.getvalue())
-
 
     def test_job_control_reuses_short_exec_without_risky_receipt(self):
         from unittest import mock
