@@ -115,6 +115,16 @@ class CoreExecReconnectIntegrationTests(unittest.TestCase):
             time.sleep(0.03)
         self.fail(f"SSH не перешёл в connected: {last}")
 
+    def wait_non_connected(self, timeout: float = 3.0) -> dict:
+        deadline = time.monotonic() + timeout
+        last: dict | None = None
+        while time.monotonic() < deadline:
+            last = self.status()
+            if last.get("ok") and last.get("ssh_status") != "connected":
+                return last
+            time.sleep(0.03)
+        self.fail(f"SSH остался connected: {last}")
+
     def request_exec(self, command: str, response_timeout: float = 4.0) -> dict:
         self.fail_if_process_exited()
         return core.request_daemon(
@@ -187,6 +197,61 @@ class CoreExecReconnectIntegrationTests(unittest.TestCase):
         lines = self.command_lines()
         self.assertEqual(1, lines.count("test:disconnect-after-success"))
         self.assertEqual(1, lines.count("test:success"))
+
+    def test_missing_session_is_restored_during_disconnect_then_reconnect_exec_works(self) -> None:
+        session_path = core.session_file_path("ci-core")
+        original_token = str(self.session["auth_token"])
+        original_port = int(self.session["daemon_port"])
+        original_pid = int(self.session["pid"])
+
+        self.set_reconnect_failures(100)
+        trigger = self.request_exec("test:disconnect-after-success")
+        self.assertTrue(trigger.get("ok"))
+        self.assertEqual(0, trigger.get("exit_code"))
+        self.wait_non_connected()
+
+        session_path.unlink()
+        restored = self.wait_session(session_path, timeout=4.0)
+        self.assertEqual(original_token, restored["auth_token"])
+        self.assertEqual(original_port, int(restored["daemon_port"]))
+        self.assertEqual(original_pid, int(restored["pid"]))
+        self.assertNotEqual("connected", self.status().get("ssh_status"))
+
+        self.set_reconnect_failures(0)
+        self.assertEqual("connected", self.wait_connected(timeout=4.0).get("ssh_status"))
+
+        restored_session = core.read_session("ci-core")
+        follow_up = core.request_daemon(
+            restored_session,
+            "exec",
+            command="test:success",
+            risky=False,
+            receipt_path=core.DEFAULT_RISKY_RECEIPT_PATH,
+            response_timeout=4,
+        )
+        self.assertTrue(follow_up.get("ok"))
+        self.assertEqual("stdout-ok\n", follow_up.get("stdout"))
+
+        lines = self.command_lines()
+        self.assertEqual(1, lines.count("test:disconnect-after-success"))
+        self.assertEqual(1, lines.count("test:success"))
+
+    def test_stop_while_ssh_disconnected_removes_registration_and_exits(self) -> None:
+        self.set_reconnect_failures(100)
+        trigger = self.request_exec("test:disconnect-after-success")
+        self.assertTrue(trigger.get("ok"))
+        self.wait_non_connected()
+
+        session_path = core.session_file_path("ci-core")
+        stop_result = core.request_daemon(self.session, "stop", response_timeout=2)
+        self.assertTrue(stop_result.get("ok"))
+        stdout, stderr = self.process.communicate(timeout=4)
+        self.assertEqual(0, self.process.returncode, stdout + stderr)
+
+        deadline = time.monotonic() + 2.0
+        while session_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertFalse(session_path.exists())
 
     def test_drop_during_exec_is_unknown_and_command_is_not_retried(self) -> None:
         result = self.request_exec("test:drop-during")
