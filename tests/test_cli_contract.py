@@ -50,8 +50,10 @@ class CliContractTests(unittest.TestCase):
     def test_handlers_route_to_expected_public_operations(self) -> None:
         top = self.subparsers(self.parser)
         self.assertIs(ssh_relay.daemon, top.choices["daemon"].get_default("handler"))
-        self.assertIs(core.exec_cmd, top.choices["exec"].get_default("handler"))
-        self.assertIs(core.sudo_exec_cmd, top.choices["sudo-exec"].get_default("handler"))
+        # exec/sudo-exec теперь имеют dispatch между text-mode и --json; точная
+        # семантика обоих путей проверяется отдельными CLI-тестами ниже.
+        self.assertTrue(callable(top.choices["exec"].get_default("handler")))
+        self.assertTrue(callable(top.choices["sudo-exec"].get_default("handler")))
         self.assertIs(ssh_relay.download_cmd, top.choices["download"].get_default("handler"))
         self.assertIs(ssh_relay.upload_cmd, top.choices["upload"].get_default("handler"))
         self.assertIs(core.status, top.choices["status"].get_default("handler"))
