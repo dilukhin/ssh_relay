@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import socket
 import unittest
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import ssh_relay  # noqa: F401 — устанавливает расширения поверх core.
@@ -47,12 +46,14 @@ class _Channel:
         self,
         *,
         exec_error: Exception | None = None,
+        stdin_error: Exception | None = None,
         stdout_chunks=None,
         stderr_chunks=None,
         exit_code: int = 0,
         ready: bool = True,
     ) -> None:
         self.exec_error = exec_error
+        self.stdin_error = stdin_error
         self.stdout_chunks = list(stdout_chunks or [])
         self.stderr_chunks = list(stderr_chunks or [])
         self.exit_code = exit_code
@@ -64,7 +65,8 @@ class _Channel:
             raise self.exec_error
 
     def sendall(self, _data: bytes) -> None:
-        pass
+        if self.stdin_error is not None:
+            raise self.stdin_error
 
     def shutdown_write(self) -> None:
         pass
@@ -185,6 +187,27 @@ class RemoteCommandOutcomeTests(unittest.TestCase):
         self.assertTrue(captured.exception.command_started)
         self.assertEqual("output_limit_exceeded", captured.exception.error_code)
         self.assertEqual("abcd", captured.exception.stdout)
+        self.assertTrue(channel.closed)
+
+    def test_sudo_stdin_secret_is_not_retained_in_exception_chain(self) -> None:
+        secret = "TEST_SUDO_MACHINE_OUTCOME_SECRET_4c7c"
+        channel = _Channel(stdin_error=OSError(f"send failed with stdin={secret}"))
+        client = _Client(_Transport(channel=channel))
+        with self.assertRaises(core.RemoteCommandError) as captured:
+            core.execute_remote_command(
+                client,
+                "sudo -S -p '' -- sh -c true",
+                1,
+                stdin_data=(secret + "\n").encode("utf-8"),
+            )
+        exc = captured.exception
+        self.assertTrue(exc.command_started)
+        self.assertEqual("command_result_unknown", exc.error_code)
+        self.assertNotIn(secret, str(exc))
+        self.assertNotIn(secret, exc.stdout)
+        self.assertNotIn(secret, exc.stderr)
+        self.assertIsNone(exc.__cause__)
+        self.assertIsNone(exc.__context__)
         self.assertTrue(channel.closed)
 
     def test_success_contract_is_unchanged(self) -> None:

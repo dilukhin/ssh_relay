@@ -14,6 +14,18 @@ def install(core: Any) -> None:
     if getattr(core, "_machine_outcomes_installed", False):
         return
 
+    required = (
+        "DaemonUnavailableError",
+        "RelayError",
+        "request_daemon",
+        "execute_remote_command",
+        "read_message",
+        "BUFFER_SIZE",
+        "MAX_OUTPUT_SIZE",
+    )
+    if any(not hasattr(core, name) for name in required):
+        return
+
     class DaemonRequestError(core.DaemonUnavailableError):
         """Ошибка локального запроса с признаком возможной доставки daemon."""
 
@@ -85,6 +97,7 @@ def install(core: Any) -> None:
         command_started = False
         output: list[bytes] = []
         errors: list[bytes] = []
+        sanitized_error: RemoteCommandError | None = None
         try:
             transport = client.get_transport()
             if transport is None:
@@ -148,21 +161,35 @@ def install(core: Any) -> None:
             raise
         except Exception as exc:
             if command_started:
-                raise RemoteCommandError(
+                wrapped = RemoteCommandError(
                     "SSH-канал завершился до получения достоверного результата команды.",
                     error_code="command_result_unknown",
                     command_started=True,
                     stdout=b"".join(output).decode("utf-8", errors="replace"),
                     stderr=b"".join(errors).decode("utf-8", errors="replace"),
-                ) from exc
-            raise RemoteCommandError(
-                "Не удалось открыть канал для удалённой команды; команда не запускалась.",
-                error_code="command_not_started",
-                command_started=False,
-            ) from exc
+                )
+            else:
+                wrapped = RemoteCommandError(
+                    "Не удалось открыть канал для удалённой команды; команда не запускалась.",
+                    error_code="command_not_started",
+                    command_started=False,
+                )
+
+            # stdin_data сейчас используется для sudo-пароля. Не сохраняем исходное
+            # исключение в chain: оно может содержать переданный секрет.
+            if stdin_data is not None:
+                sanitized_error = wrapped
+            else:
+                raise wrapped from exc
         finally:
             if channel is not None:
                 channel.close()
+
+        # Поднимаем вне except, чтобы секретное исходное исключение не осталось
+        # ни в __cause__, ни в __context__.
+        if sanitized_error is not None:
+            raise sanitized_error
+        raise AssertionError("Недостижимое состояние выполнения удалённой команды")
 
     core.DaemonRequestError = DaemonRequestError
     core.RemoteCommandError = RemoteCommandError
