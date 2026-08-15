@@ -19,6 +19,14 @@ import ssh_relay_core as core
 import ssh_relay_receipts as receipts
 
 
+class _ReadSocket:
+    def __init__(self, payload: dict) -> None:
+        self._chunks = [json.dumps(payload, ensure_ascii=False).encode("utf-8"), b""]
+
+    def recv(self, _size: int) -> bytes:
+        return self._chunks.pop(0)
+
+
 class RiskyReceiptTests(unittest.TestCase):
     def setUp(self) -> None:
         self.session = {
@@ -47,7 +55,6 @@ class RiskyReceiptTests(unittest.TestCase):
             change_description="обновлена конфигурация",
             timestamp_utc="2026-08-15T00:00:00Z",
         )
-
         self.assertEqual(hashlib.sha256(command.encode("utf-8")).hexdigest(), payload["command_hash"])
         self.assertNotIn("command", payload)
         self.assertNotIn("stdout", payload)
@@ -57,7 +64,6 @@ class RiskyReceiptTests(unittest.TestCase):
         serialized = receipts.canonical_json(payload)
         self.assertNotIn("test-secret", serialized)
         self.assertNotIn("test-session-token", serialized)
-
         without_hash = dict(payload)
         receipt_hash = without_hash.pop("receipt_hash")
         expected_hash = hashlib.sha256(receipts.canonical_json(without_hash).encode("utf-8")).hexdigest()
@@ -67,11 +73,9 @@ class RiskyReceiptTests(unittest.TestCase):
         for value in ("", " ", "/tmp/dir/", "/tmp/bad\nname", "x" * 4097):
             with self.subTest(path=value), self.assertRaises(core.RelayError):
                 receipts.validate_receipt_path(core, value)
-
         for value in ("bad id", "x" * 129, "\n"):
             with self.subTest(transaction=value), self.assertRaises(core.RelayError):
                 receipts.normalize_transaction_id(core, value)
-
         with self.assertRaises(core.RelayError):
             receipts.normalize_optional_text(core, "bad\nvalue", field="change_target", max_bytes=512)
         with self.assertRaises(core.RelayError):
@@ -92,26 +96,21 @@ class RiskyReceiptTests(unittest.TestCase):
         self.assertEqual("tx-safe", prepared["transaction_id"])
         self.assertNotIn("command", prepared)
 
+    def test_status_response_with_capability_is_not_treated_as_request(self) -> None:
+        response = {"ok": True, "status": "active", "receipt_schema_version": 1}
+        self.assertEqual(response, core.read_message(_ReadSocket(response)))
+
     def test_parser_exposes_safe_metadata_only_for_risky_commands(self) -> None:
         parser = ssh_relay.build_parser()
         args = parser.parse_args([
-            "exec",
-            "--name", "ci",
-            "--risky",
-            "--transaction-id", "tx-123",
-            "--change-target", "/etc/app.conf",
-            "--change-description", "обновлена конфигурация",
-            "true",
+            "exec", "--name", "ci", "--risky", "--transaction-id", "tx-123",
+            "--change-target", "/etc/app.conf", "--change-description", "обновлена конфигурация", "true",
         ])
         self.assertEqual("tx-123", args.transaction_id)
         self.assertEqual("/etc/app.conf", args.change_target)
         self.assertEqual("обновлена конфигурация", args.change_description)
-
-        args = parser.parse_args([
-            "sudo-exec", "--risky", "--transaction-id", "tx-sudo", "id"
-        ])
+        args = parser.parse_args(["sudo-exec", "--risky", "--transaction-id", "tx-sudo", "id"])
         self.assertEqual("tx-sudo", args.transaction_id)
-
         plain = parser.parse_args(["exec", "--transaction-id", "tx-invalid", "true"])
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
@@ -122,12 +121,10 @@ class RiskyReceiptTests(unittest.TestCase):
         parser = ssh_relay.build_parser()
         args = parser.parse_args(["exec", "--name", "ci", "--risky", "true"])
         calls: list[str] = []
-
         def request(_session, action, **_kwargs):
             calls.append(action)
             self.assertEqual("status", action)
             return {"ok": True, "ssh_status": "connected"}
-
         with (
             patch.object(core, "read_session", return_value=self.session),
             patch.object(core, "request_daemon", side_effect=request),
@@ -140,14 +137,8 @@ class RiskyReceiptTests(unittest.TestCase):
     def test_execute_receipt_returns_safe_summary_for_exec_and_sudo(self) -> None:
         with patch.object(core, "execute_remote_command", return_value={"ok": True, "exit_code": 0}) as execute:
             result = core.execute_risky_receipt(
-                object(),
-                session=self.session,
-                action="exec",
-                command="printf 'test-secret'",
-                sudo=False,
-                receipt_path="~/.local/state/agent-safe/changes.jsonl",
-                timeout_seconds=5,
-                sudo_password=None,
+                object(), session=self.session, action="exec", command="printf 'test-secret'", sudo=False,
+                receipt_path="~/.local/state/agent-safe/changes.jsonl", timeout_seconds=5, sudo_password=None,
             )
         self.assertEqual("succeeded", result["receipt_status"])
         self.assertEqual("safe-writer-v1", result["receipt_command"])
@@ -158,38 +149,23 @@ class RiskyReceiptTests(unittest.TestCase):
 
         with self.assertRaises(core.RelayError):
             core.execute_risky_receipt(
-                object(),
-                session=self.session,
-                action="sudo_exec",
-                command="id",
-                sudo=True,
-                receipt_path="~/changes.jsonl",
-                timeout_seconds=5,
-                sudo_password=None,
+                object(), session=self.session, action="sudo_exec", command="id", sudo=True,
+                receipt_path="~/changes.jsonl", timeout_seconds=5, sudo_password=None,
             )
 
+        sensitive_command = "printf 'ssh-relay-sensitive-sudo-command-needle'"
         with patch.object(core, "execute_sudo_command", return_value={"ok": True, "exit_code": 0}) as sudo_execute:
             sudo_result = core.execute_risky_receipt(
-                object(),
-                session=self.session,
-                action="sudo_exec",
-                command="id",
-                sudo=True,
-                receipt_path="~/changes.jsonl",
-                timeout_seconds=5,
-                sudo_password="test-sudo-secret",
+                object(), session=self.session, action="sudo_exec", command=sensitive_command, sudo=True,
+                receipt_path="~/changes.jsonl", timeout_seconds=5, sudo_password="test-sudo-secret",
             )
         self.assertEqual("succeeded", sudo_result["receipt_status"])
         self.assertNotIn("test-sudo-secret", json.dumps(sudo_result, ensure_ascii=False))
-        self.assertNotIn("id\"", sudo_execute.call_args.args[1])
+        self.assertNotIn("ssh-relay-sensitive-sudo-command-needle", sudo_execute.call_args.args[1])
         self.assertEqual("test-sudo-secret", sudo_execute.call_args.args[3])
 
     def test_receipt_transport_unknown_is_distinct_from_definite_failure(self) -> None:
-        unknown = core.RemoteCommandError(
-            "transport lost",
-            error_code="command_result_unknown",
-            command_started=True,
-        )
+        unknown = core.RemoteCommandError("transport lost", error_code="command_result_unknown", command_started=True)
         with patch.object(core, "execute_remote_command", side_effect=unknown):
             result = core.execute_risky_receipt(
                 object(), session=self.session, action="exec", command="true", sudo=False,
@@ -197,12 +173,7 @@ class RiskyReceiptTests(unittest.TestCase):
             )
         self.assertEqual("unknown", result["receipt_status"])
         self.assertEqual("receipt_write_unknown", result["error_code"])
-
-        failed = core.RemoteCommandError(
-            "not started",
-            error_code="command_not_started",
-            command_started=False,
-        )
+        failed = core.RemoteCommandError("not started", error_code="command_not_started", command_started=False)
         with patch.object(core, "execute_remote_command", side_effect=failed):
             result = core.execute_risky_receipt(
                 object(), session=self.session, action="exec", command="true", sudo=False,
@@ -214,29 +185,19 @@ class RiskyReceiptTests(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "POSIX writer проверяется только на Linux")
     def test_posix_writer_rejects_duplicate_and_symlink_and_uses_mode_0600(self) -> None:
         payload = receipts.build_receipt_payload(
-            core,
-            session=self.session,
-            action="exec",
-            command="true",
-            sudo=False,
-            transaction_id="tx-shell",
-            receipt_id="receipt-1",
-            change_target=None,
-            change_description=None,
+            core, session=self.session, action="exec", command="true", sudo=False,
+            transaction_id="tx-shell", receipt_id="receipt-1", change_target=None, change_description=None,
             timestamp_utc="2026-08-15T00:00:00Z",
         )
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "receipts" / "changes.jsonl"
             first = subprocess.run(
                 ["sh", "-c", receipts.build_writer_command(core, path=str(path), payload=payload)],
-                capture_output=True,
-                text=True,
-                check=False,
+                capture_output=True, text=True, check=False,
             )
             self.assertEqual(0, first.returncode, first.stderr)
             self.assertEqual(payload, json.loads(path.read_text(encoding="utf-8")))
             self.assertEqual(0o600, path.stat().st_mode & 0o777)
-
             duplicate = dict(payload)
             duplicate["receipt_id"] = "receipt-2"
             without_hash = dict(duplicate)
@@ -246,22 +207,17 @@ class RiskyReceiptTests(unittest.TestCase):
             ).hexdigest()
             second = subprocess.run(
                 ["sh", "-c", receipts.build_writer_command(core, path=str(path), payload=duplicate)],
-                capture_output=True,
-                text=True,
-                check=False,
+                capture_output=True, text=True, check=False,
             )
             self.assertEqual(receipts.WRITER_EXIT_DUPLICATE, second.returncode)
             self.assertEqual(1, len(path.read_text(encoding="utf-8").splitlines()))
-
             target = Path(temp_dir) / "target.jsonl"
             target.write_text("sentinel\n", encoding="utf-8")
             link = Path(temp_dir) / "link.jsonl"
             link.symlink_to(target)
             symlink = subprocess.run(
                 ["sh", "-c", receipts.build_writer_command(core, path=str(link), payload=payload)],
-                capture_output=True,
-                text=True,
-                check=False,
+                capture_output=True, text=True, check=False,
             )
             self.assertEqual(receipts.WRITER_EXIT_SYMLINK, symlink.returncode)
             self.assertEqual("sentinel\n", target.read_text(encoding="utf-8"))
