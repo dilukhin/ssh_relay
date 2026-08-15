@@ -3,28 +3,49 @@
 
 from __future__ import annotations
 
-import json
-import socket
-import time
 from typing import Any
+
+REDACTED_STDIN = "[СКРЫТО]"
+
+
+def _caused_by_connection_refused(exc: BaseException) -> bool:
+    """Ищет подтверждённый отказ локального listener в exception chain."""
+    current: BaseException | None = exc
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if isinstance(current, ConnectionRefusedError):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _decode_chunks(chunks: list[bytes]) -> str:
+    return b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def _redact_stdin(text: str, stdin_data: bytes | None) -> str:
+    if stdin_data is None:
+        return text
+    stdin_text = stdin_data.decode("utf-8", errors="replace")
+    candidates = (stdin_text, stdin_text.rstrip("\r\n"))
+    redacted = text
+    for candidate in candidates:
+        if candidate:
+            redacted = redacted.replace(candidate, REDACTED_STDIN)
+    return redacted
 
 
 def install(core: Any) -> None:
     """Добавляет машинно различимые причины отказа без изменения публичного CLI."""
     if getattr(core, "_machine_outcomes_installed", False):
         return
-
-    required = (
-        "DaemonUnavailableError",
-        "RelayError",
-        "request_daemon",
-        "execute_remote_command",
-        "read_message",
-        "BUFFER_SIZE",
-        "MAX_OUTPUT_SIZE",
-    )
+    required = ("DaemonUnavailableError", "RelayError", "request_daemon", "execute_remote_command")
     if any(not hasattr(core, name) for name in required):
         return
+
+    original_request_daemon = core.request_daemon
+    original_execute_remote_command = core.execute_remote_command
 
     class DaemonRequestError(core.DaemonUnavailableError):
         """Ошибка локального запроса с признаком возможной доставки daemon."""
@@ -59,32 +80,91 @@ def install(core: Any) -> None:
         response_timeout: float | None = 5,
         **payload: Any,
     ) -> dict[str, Any]:
-        request = {"auth_token": session["auth_token"], "action": action, **payload}
-        request_sent = False
         try:
-            with socket.create_connection(("127.0.0.1", session["daemon_port"]), timeout=5) as sock:
-                # После установления соединения ошибка отправки трактуется консервативно:
-                # daemon мог получить полный запрос до локальной ошибки сокета.
-                request_sent = True
-                sock.sendall(json.dumps(request, ensure_ascii=False).encode("utf-8"))
-                sock.shutdown(socket.SHUT_WR)
-                sock.settimeout(response_timeout)
-                try:
-                    return core.read_message(sock)
-                except core.RelayError as exc:
-                    raise DaemonRequestError(
-                        str(exc),
-                        request_sent=True,
-                        error_code="response_invalid",
-                    ) from exc
-        except DaemonRequestError:
-            raise
-        except (ConnectionError, TimeoutError, socket.timeout, OSError) as exc:
+            return original_request_daemon(
+                session,
+                action,
+                response_timeout=response_timeout,
+                **payload,
+            )
+        except core.DaemonUnavailableError as exc:
+            # ConnectionRefused доказывает, что локальный daemon запрос не получил.
+            # Любой другой transport failure трактуем консервативно как возможную доставку.
+            request_sent = not _caused_by_connection_refused(exc)
             raise DaemonRequestError(
-                "Daemon недоступен или не ответил вовремя.",
+                str(exc),
                 request_sent=request_sent,
                 error_code="daemon_response_lost" if request_sent else "daemon_unavailable",
             ) from exc
+        except core.RelayError as exc:
+            # Повреждённый/неполный ответ возможен только после локальной отправки запроса.
+            raise DaemonRequestError(
+                str(exc),
+                request_sent=True,
+                error_code="response_invalid",
+            ) from exc
+
+    class _CommandState:
+        def __init__(self) -> None:
+            self.command_started = False
+            self.stdout: list[bytes] = []
+            self.stderr: list[bytes] = []
+            self.channel: Any | None = None
+            self.channel_closed = False
+
+    class _ChannelProxy:
+        def __init__(self, channel: Any, state: _CommandState) -> None:
+            self._channel = channel
+            self._state = state
+            state.channel = channel
+
+        def exec_command(self, command: str) -> Any:
+            # Вызов может успеть отправить SSH exec-request до локальной ошибки.
+            self._state.command_started = True
+            return self._channel.exec_command(command)
+
+        def recv(self, size: int) -> bytes:
+            chunk = self._channel.recv(size)
+            self._state.stdout.append(chunk)
+            return chunk
+
+        def recv_stderr(self, size: int) -> bytes:
+            chunk = self._channel.recv_stderr(size)
+            self._state.stderr.append(chunk)
+            return chunk
+
+        def close(self) -> Any:
+            self._state.channel_closed = True
+            return self._channel.close()
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._channel, name)
+
+    class _TransportProxy:
+        def __init__(self, transport: Any, state: _CommandState) -> None:
+            self._transport = transport
+            self._state = state
+
+        def open_session(self, *args: Any, **kwargs: Any) -> _ChannelProxy:
+            channel = self._transport.open_session(*args, **kwargs)
+            return _ChannelProxy(channel, self._state)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._transport, name)
+
+    class _ClientProxy:
+        def __init__(self, client: Any, state: _CommandState) -> None:
+            self._client = client
+            self._state = state
+
+        def get_transport(self) -> Any:
+            transport = self._client.get_transport()
+            if transport is None:
+                return None
+            return _TransportProxy(transport, self._state)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._client, name)
 
     def execute_remote_command(
         client: Any,
@@ -92,101 +172,44 @@ def install(core: Any) -> None:
         timeout_seconds: int,
         stdin_data: bytes | None = None,
     ) -> dict[str, Any]:
-        """Выполняет команду и сохраняет доказуемую границу её возможного запуска."""
-        channel = None
-        command_started = False
-        output: list[bytes] = []
-        errors: list[bytes] = []
+        state = _CommandState()
         sanitized_error: RemoteCommandError | None = None
         try:
-            transport = client.get_transport()
-            if transport is None:
-                raise OSError("SSH transport отсутствует")
-            channel = transport.open_session(timeout=10)
-
-            # После открытия канала вызов exec_command может отправить запрос до ошибки,
-            # поэтому с этого момента исход команды считается потенциально изменившим remote state.
-            command_started = True
-            channel.exec_command(command)
-            if stdin_data is not None:
-                channel.sendall(stdin_data)
-            channel.shutdown_write()
-            total_size = 0
-            started = time.monotonic()
-
-            while True:
-                read_any = False
-                while channel.recv_ready():
-                    chunk = channel.recv(core.BUFFER_SIZE)
-                    output.append(chunk)
-                    total_size += len(chunk)
-                    read_any = True
-                while channel.recv_stderr_ready():
-                    chunk = channel.recv_stderr(core.BUFFER_SIZE)
-                    errors.append(chunk)
-                    total_size += len(chunk)
-                    read_any = True
-
-                stdout_text = b"".join(output).decode("utf-8", errors="replace")
-                stderr_text = b"".join(errors).decode("utf-8", errors="replace")
-                if total_size > core.MAX_OUTPUT_SIZE:
-                    raise RemoteCommandError(
-                        "Вывод удалённой команды превышает допустимый размер 4 МиБ.",
-                        error_code="output_limit_exceeded",
-                        command_started=True,
-                        stdout=stdout_text,
-                        stderr=stderr_text,
-                    )
-                if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
-                    break
-                if time.monotonic() - started > timeout_seconds:
-                    raise RemoteCommandError(
-                        f"Превышено время выполнения команды: {timeout_seconds} с.",
-                        error_code="command_timeout",
-                        command_started=True,
-                        stdout=stdout_text,
-                        stderr=stderr_text,
-                    )
-                if not read_any:
-                    time.sleep(0.01)
-
-            exit_code = channel.recv_exit_status()
-            return {
-                "ok": True,
-                "stdout": b"".join(output).decode("utf-8", errors="replace"),
-                "stderr": b"".join(errors).decode("utf-8", errors="replace"),
-                "exit_code": exit_code,
-            }
-        except RemoteCommandError:
-            raise
+            return original_execute_remote_command(
+                _ClientProxy(client, state),
+                command,
+                timeout_seconds,
+                stdin_data=stdin_data,
+            )
         except Exception as exc:
-            if command_started:
-                wrapped = RemoteCommandError(
-                    "SSH-канал завершился до получения достоверного результата команды.",
-                    error_code="command_result_unknown",
-                    command_started=True,
-                    stdout=b"".join(output).decode("utf-8", errors="replace"),
-                    stderr=b"".join(errors).decode("utf-8", errors="replace"),
-                )
-            else:
-                wrapped = RemoteCommandError(
-                    "Не удалось открыть канал для удалённой команды; команда не запускалась.",
-                    error_code="command_not_started",
-                    command_started=False,
-                )
-
-            # stdin_data сейчас используется для sudo-пароля. Не сохраняем исходное
-            # исключение в chain: оно может содержать переданный секрет.
+            started = state.command_started
+            message = str(exc) or exc.__class__.__name__
+            stdout = _decode_chunks(state.stdout)
+            stderr = _decode_chunks(state.stderr)
+            if stdin_data is not None:
+                message = _redact_stdin(message, stdin_data)
+                stdout = _redact_stdin(stdout, stdin_data)
+                stderr = _redact_stdin(stderr, stdin_data)
+            wrapped = RemoteCommandError(
+                message,
+                error_code="command_result_unknown" if started else "command_not_started",
+                command_started=started,
+                stdout=stdout,
+                stderr=stderr,
+            )
+            # stdin_data сейчас используется для sudo-пароля. Поднимаем новое исключение
+            # вне except, чтобы секрет не сохранился в __cause__/__context__.
             if stdin_data is not None:
                 sanitized_error = wrapped
             else:
                 raise wrapped from exc
         finally:
-            if channel is not None:
-                channel.close()
+            # Старый core закрывает канал в собственном finally после успешного exec-request.
+            # Если open_session успел пройти, а exec/send упал раньше этого блока, закрываем здесь.
+            if state.channel is not None and not state.channel_closed:
+                state.channel.close()
+                state.channel_closed = True
 
-        # Поднимаем вне except, чтобы секретное исходное исключение не осталось
-        # ни в __cause__, ни в __context__.
         if sanitized_error is not None:
             raise sanitized_error
         raise AssertionError("Недостижимое состояние выполнения удалённой команды")

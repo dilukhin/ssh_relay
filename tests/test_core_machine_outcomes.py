@@ -117,16 +117,16 @@ class DaemonRequestOutcomeTests(unittest.TestCase):
         self.session = {"auth_token": "token", "daemon_port": 41234}
 
     def test_connection_failure_is_not_started(self) -> None:
-        with patch("ssh_relay_outcomes.socket.create_connection", side_effect=ConnectionRefusedError("refused")):
+        with patch.object(core.socket, "create_connection", side_effect=ConnectionRefusedError("refused")):
             with self.assertRaises(core.DaemonRequestError) as captured:
                 core.request_daemon(self.session, "exec", command="true")
         self.assertFalse(captured.exception.request_sent)
         self.assertEqual("daemon_unavailable", captured.exception.error_code)
-        self.assertIsInstance(captured.exception.__cause__, ConnectionRefusedError)
+        self.assertIsInstance(captured.exception.__cause__, core.DaemonUnavailableError)
 
     def test_send_failure_after_connect_is_unknown(self) -> None:
         sock = _Socket(send_error=OSError("send failed"))
-        with patch("ssh_relay_outcomes.socket.create_connection", return_value=sock):
+        with patch.object(core.socket, "create_connection", return_value=sock):
             with self.assertRaises(core.DaemonRequestError) as captured:
                 core.request_daemon(self.session, "exec", command="true")
         self.assertTrue(captured.exception.request_sent)
@@ -134,7 +134,7 @@ class DaemonRequestOutcomeTests(unittest.TestCase):
 
     def test_response_timeout_after_send_is_unknown(self) -> None:
         sock = _Socket(recv_chunks=[socket.timeout("timed out")])
-        with patch("ssh_relay_outcomes.socket.create_connection", return_value=sock):
+        with patch.object(core.socket, "create_connection", return_value=sock):
             with self.assertRaises(core.DaemonRequestError) as captured:
                 core.request_daemon(self.session, "exec", command="true")
         self.assertTrue(captured.exception.request_sent)
@@ -142,7 +142,7 @@ class DaemonRequestOutcomeTests(unittest.TestCase):
 
     def test_invalid_response_after_send_is_unknown(self) -> None:
         sock = _Socket(recv_chunks=[b"not-json", b""])
-        with patch("ssh_relay_outcomes.socket.create_connection", return_value=sock):
+        with patch.object(core.socket, "create_connection", return_value=sock):
             with self.assertRaises(core.DaemonRequestError) as captured:
                 core.request_daemon(self.session, "exec", command="true")
         self.assertTrue(captured.exception.request_sent)
@@ -157,7 +157,7 @@ class RemoteCommandOutcomeTests(unittest.TestCase):
         self.assertFalse(captured.exception.command_started)
         self.assertEqual("command_not_started", captured.exception.error_code)
 
-    def test_exec_request_failure_is_unknown(self) -> None:
+    def test_exec_request_failure_is_unknown_and_closes_channel(self) -> None:
         channel = _Channel(exec_error=OSError("exec failed"))
         client = _Client(_Transport(channel=channel))
         with self.assertRaises(core.RemoteCommandError) as captured:
@@ -169,13 +169,14 @@ class RemoteCommandOutcomeTests(unittest.TestCase):
     def test_timeout_is_unknown_and_closes_channel(self) -> None:
         channel = _Channel(ready=False)
         client = _Client(_Transport(channel=channel))
-        with patch("ssh_relay_outcomes.time.monotonic", side_effect=[100.0, 102.0]), patch(
-            "ssh_relay_outcomes.time.sleep"
+        with patch.object(core.time, "monotonic", side_effect=[100.0, 102.0]), patch.object(
+            core.time, "sleep"
         ):
             with self.assertRaises(core.RemoteCommandError) as captured:
                 core.execute_remote_command(client, "sleep 10", 1)
         self.assertTrue(captured.exception.command_started)
-        self.assertEqual("command_timeout", captured.exception.error_code)
+        self.assertEqual("command_result_unknown", captured.exception.error_code)
+        self.assertIn("Превышено время выполнения команды", str(captured.exception))
         self.assertTrue(channel.closed)
 
     def test_output_limit_preserves_partial_output(self) -> None:
@@ -185,8 +186,9 @@ class RemoteCommandOutcomeTests(unittest.TestCase):
             with self.assertRaises(core.RemoteCommandError) as captured:
                 core.execute_remote_command(client, "printf abcd", 1)
         self.assertTrue(captured.exception.command_started)
-        self.assertEqual("output_limit_exceeded", captured.exception.error_code)
+        self.assertEqual("command_result_unknown", captured.exception.error_code)
         self.assertEqual("abcd", captured.exception.stdout)
+        self.assertIn("превышает допустимый размер", str(captured.exception))
         self.assertTrue(channel.closed)
 
     def test_sudo_stdin_secret_is_not_retained_in_exception_chain(self) -> None:
