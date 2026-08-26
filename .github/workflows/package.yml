@@ -76,7 +76,7 @@ jobs:
           & "$venv\Scripts\ssh_relay.exe" doctor
           if ($LASTEXITCODE -ne 0) { throw 'Packaged ssh_relay doctor failed' }
           $help = & "$venv\Scripts\ssh_relay.exe" --help
-          if ($LASTEXITCODE -ne 0 -or $help -notmatch 'job') { throw 'Packaged ssh_relay help contract failed' }
+          if ($LASTEXITCODE -ne 0 -or (($help -join "`n") -notmatch 'job')) { throw 'Packaged ssh_relay help contract failed' }
           Push-Location $env:RUNNER_TEMP
           try {
             & "$venv\Scripts\python.exe" -c "from pathlib import Path; import sys, ssh_relay; p=Path(ssh_relay.__file__).resolve(); r=Path(sys.prefix).resolve(); assert r in p.parents, f'ssh_relay imported outside packaged runtime: {p}'; print(p)"
