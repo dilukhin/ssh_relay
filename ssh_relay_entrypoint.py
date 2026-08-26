@@ -3,7 +3,18 @@
 
 from __future__ import annotations
 
+import os
 import sys
+
+
+def _configure_stdio() -> None:
+    """Keep the installed CLI UTF-8 safe when Windows output is redirected/captured."""
+    if os.name != "nt":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 def doctor() -> int:
@@ -25,6 +36,7 @@ def doctor() -> int:
 
 
 def main() -> int:
+    _configure_stdio()
     if sys.argv[1:] == ["doctor"]:
         return doctor()
 
