@@ -6,13 +6,16 @@ compatibility: opencode
 
 # SSH Relay
 
-Используй `ssh_relay` только через уже запущенный пользователем relay. Не запускай прямой `ssh` и не запрашивай SSH-, sudo-пароли, passphrase ключей или другие секреты.
+Используй штатно установленную команду `ssh_relay`. Не запускай прямой `ssh` и не запрашивай SSH-, sudo-пароли, passphrase ключей или другие секреты.
 
 ## Перед работой
 
-1. Проверь нужную сессию: `py ssh_relay.py status --name <session>`.
-2. При необходимости посмотри сессии: `py ssh_relay.py list`.
-3. Выполни короткую диагностику: `py ssh_relay.py exec --name <session> "hostname && whoami && pwd"`.
+1. Проверь локальный runtime: `ssh_relay doctor`.
+2. Проверь нужную сессию: `ssh_relay status --name <session>`.
+3. При необходимости посмотри сессии: `ssh_relay list`.
+4. Выполни короткую диагностику: `ssh_relay exec --name <session> "hostname && whoami && pwd"`.
+
+Если `doctor` завершается ошибкой, не обходи установленный runtime запуском `ssh_relay.py` из source checkout. Сначала исправь установленный runtime штатным менеджером окружения.
 
 Если `status` показывает восстановление SSH, не запускай рабочую операцию повторно. Дождись восстановления и проверь состояние ещё раз.
 
@@ -23,13 +26,13 @@ compatibility: opencode
 `exec` предназначен только для коротких неинтерактивных команд с ограниченным выводом:
 
 ```text
-py ssh_relay.py exec --name <session> "<command>"
+ssh_relay exec --name <session> "<command>"
 ```
 
 Для короткой root-команды допустим `sudo-exec`, только если daemon запущен с `--enable-sudo`:
 
 ```text
-py ssh_relay.py sudo-exec --name <session> "<command>"
+ssh_relay sudo-exec --name <session> "<command>"
 ```
 
 Не запускай через них сборки, долгие тесты, интерактивные программы, команды с запросом пароля или потенциально большим выводом.
@@ -39,12 +42,12 @@ py ssh_relay.py sudo-exec --name <session> "<command>"
 Сборки, CTest, интеграционные тесты и другие длительные неинтерактивные **удалённые процессы** запускай через `job`:
 
 ```text
-py ssh_relay.py job start --name <session> --job <job> "<command>"
-py ssh_relay.py job status --name <session> --job <job>
-py ssh_relay.py job tail --name <session> --job <job>
-py ssh_relay.py job wait --name <session> --job <job>
-py ssh_relay.py job stop --name <session> --job <job>
-py ssh_relay.py job list --name <session>
+ssh_relay job start --name <session> --job <job> "<command>"
+ssh_relay job status --name <session> --job <job>
+ssh_relay job tail --name <session> --job <job>
+ssh_relay job wait --name <session> --job <job>
+ssh_relay job stop --name <session> --job <job>
+ssh_relay job list --name <session>
 ```
 
 `job start` подтверждает запуск механизма job, а не успешное завершение команды. Таймаут или обрыв управляющего транспорта не означает завершение удалённого процесса. Если результат `job start` неизвестен, не повторяй запуск: сначала `job status` или `job list`.
@@ -56,8 +59,8 @@ py ssh_relay.py job list --name <session>
 Большая передача файла — **не `job`**. Используй обычные `upload`/`download`, у которых есть собственный progress и timeout отсутствия прогресса:
 
 ```text
-py ssh_relay.py upload --name <session> <local> <remote> --idle-timeout 60
-py ssh_relay.py download --name <session> <remote> <local> --idle-timeout 60
+ssh_relay upload --name <session> <local> <remote> --idle-timeout 60
+ssh_relay download --name <session> <remote> <local> --idle-timeout 60
 ```
 
 Прогресс содержит `transferred_bytes`, `total_bytes`, `percent`, `elapsed`, `speed`. Рост байтов или процента означает, что передача жива. Отсутствие текстового вывода само по себе не означает зависание.
@@ -84,7 +87,7 @@ py ssh_relay.py download --name <session> <remote> <local> --idle-timeout 60
 Для коротких изменяющих команд сохраняется существующий контракт:
 
 ```text
-py ssh_relay.py exec --name <session> --risky "<command>"
+ssh_relay exec --name <session> --risky "<command>"
 ```
 
 `job` и file transfer не создают новый несовместимый lifecycle receipt. `upload` меняет удалённое состояние, но отдельный agent-safe transfer receipt пока не реализован. Не имитируй его произвольным JSON-форматом.

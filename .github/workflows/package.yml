@@ -1,0 +1,79 @@
+name: Package install
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  linux-package:
+    name: Linux packaged CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@v4
+
+      - name: Настроить Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Создать чистый runtime и установить package
+        run: |
+          python -m venv .package-venv
+          .package-venv/bin/python -m pip install --disable-pip-version-check .
+
+      - name: Проверить установленную команду и runtime
+        run: |
+          .package-venv/bin/ssh_relay --version
+          .package-venv/bin/ssh_relay doctor
+          .package-venv/bin/ssh_relay --help | grep -q "job"
+          .package-venv/bin/python - <<'PY'
+          from pathlib import Path
+          import ssh_relay
+          path = Path(ssh_relay.__file__).resolve()
+          runtime = Path('.package-venv').resolve()
+          if runtime not in path.parents:
+              raise SystemExit(f"ssh_relay imported outside packaged runtime: {path}")
+          print(path)
+          PY
+
+      - name: Проверить unit contract нового entrypoint
+        run: .package-venv/bin/python -m unittest tests.test_packaged_entrypoint -v
+
+  windows-package:
+    name: Windows packaged CLI
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Получить исходники
+        uses: actions/checkout@v4
+
+      - name: Настроить Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Создать чистый runtime и установить package
+        shell: pwsh
+        run: |
+          python -m venv .package-venv
+          .\.package-venv\Scripts\python.exe -m pip install --disable-pip-version-check .
+
+      - name: Проверить установленную команду и runtime
+        shell: pwsh
+        run: |
+          .\.package-venv\Scripts\ssh_relay.exe --version
+          .\.package-venv\Scripts\ssh_relay.exe doctor
+          $help = .\.package-venv\Scripts\ssh_relay.exe --help
+          if ($LASTEXITCODE -ne 0 -or $help -notmatch 'job') { throw 'Packaged ssh_relay help contract failed' }
+          .\.package-venv\Scripts\python.exe -c "from pathlib import Path; import ssh_relay; p=Path(ssh_relay.__file__).resolve(); r=Path('.package-venv').resolve(); assert r in p.parents, f'ssh_relay imported outside packaged runtime: {p}'; print(p)"
+
+      - name: Проверить unit contract нового entrypoint
+        shell: pwsh
+        run: .\.package-venv\Scripts\python.exe -m unittest tests.test_packaged_entrypoint -v

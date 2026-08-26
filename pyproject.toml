@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssh-relay"
+version = "0.9.0"
+description = "Cross-platform local SSH relay for controlled non-interactive remote operations"
+requires-python = ">=3.10"
+readme = "README.md"
+dependencies = [
+  "paramiko",
+]
+
+[project.scripts]
+ssh_relay = "ssh_relay_entrypoint:main"
+
+[tool.setuptools]
+py-modules = [
+  "ssh_relay",
+  "ssh_relay_entrypoint",
+  "ssh_relay_core",
+  "ssh_relay_jobs",
+  "ssh_relay_outcomes",
+  "ssh_relay_p0_contract",
+  "ssh_relay_receipts",
+  "ssh_relay_session",
+  "ssh_relay_transfers",
+]
