@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 
 def _configure_stdio() -> None:
@@ -40,9 +41,17 @@ def main() -> int:
     if sys.argv[1:] == ["doctor"]:
         return doctor()
 
-    from ssh_relay import main as relay_main
+    import ssh_relay
 
-    return int(relay_main())
+    if sys.argv[1:2] == ["daemon"]:
+        from ssh_relay_logging import install_daemon_timestamp_streams
+
+        install_daemon_timestamp_streams()
+        # Старый --detach повторно запускает путь из ssh_relay.__file__.
+        # Направляем его на launcher, который также включает timestamp-потоки.
+        ssh_relay.__file__ = str(Path(__file__).with_name("ssh_relay_daemon_launcher.py"))
+
+    return int(ssh_relay.main())
 
 
 if __name__ == "__main__":
