@@ -19,6 +19,8 @@ ssh_relay = "ssh_relay_entrypoint:main"
 py-modules = [
   "ssh_relay",
   "ssh_relay_entrypoint",
+  "ssh_relay_daemon_launcher",
+  "ssh_relay_logging",
   "ssh_relay_core",
   "ssh_relay_jobs",
   "ssh_relay_outcomes",
