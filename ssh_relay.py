@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 import argparse
 import base64
@@ -126,6 +126,8 @@ def _service_error(result: dict[str, Any]) -> str | None:
         "identity_mismatch": "Сохранённая идентичность процесса не подтверждена; остановка запрещена.",
         "still_running": "После SIGTERM задача продолжает работать; при необходимости повторите с --force.",
         "start_locked": "Одновременный запуск job с таким именем уже обрабатывается.",
+        "log_unreadable": "Журнал job существует, но недоступен для чтения.",
+        "log_read_failed": "Не удалось прочитать журнал job.",
     }
     if reason:
         return messages.get(reason, f"Служебная job-команда завершилась с ошибкой: {reason}.")
@@ -148,7 +150,11 @@ def print_job_status(result: dict[str, Any]) -> None:
     print(f"PID: {result.get('pid') if result.get('pid') is not None else '-'}")
     print(f"Время работы: {int(result.get('elapsed', 0) or 0)} с")
     print(f"Код завершения: {result.get('exit_code') if result.get('exit_code') is not None else '-'}")
-    print(f"Размер журнала: {format_bytes(int(result.get('log_size', 0) or 0))}")  # noqa: F405
+    log_size = result.get("log_size")
+    if isinstance(log_size, int) and log_size >= 0:
+        print(f"Размер журнала: {format_bytes(log_size)}")  # noqa: F405
+    else:
+        print("Размер журнала: неизвестен")
     log_age = int(result.get("log_age", -1) if result.get("log_age") is not None else -1)
     print(f"Возраст журнала: {log_age} с" if log_age >= 0 else "Возраст журнала: -")
 
