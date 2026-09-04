@@ -7,6 +7,8 @@ import os
 import sys
 from pathlib import Path
 
+from ssh_relay_build import canonical_identity, record_invocation_identity, source_sha
+
 
 def _configure_stdio() -> None:
     """Keep the installed CLI UTF-8 safe when Windows output is redirected/captured."""
@@ -19,17 +21,17 @@ def _configure_stdio() -> None:
 
 
 def doctor() -> int:
-    """Validate the local packaged runtime without opening an SSH connection."""
+    """Проверяет локальный packaged runtime без открытия SSH-соединения."""
+    identity = canonical_identity()
     try:
         import paramiko
     except ImportError as exc:
-        print(f"ssh_relay runtime error: paramiko import failed: {exc}", file=sys.stderr)
+        print(f"{identity}: ошибка runtime: не удалось импортировать paramiko: {exc}", file=sys.stderr)
         return 1
 
-    from ssh_relay import __version__
-
     paramiko_version = getattr(paramiko, "__version__", "unknown")
-    print(f"ssh_relay {__version__}")
+    print(identity)
+    print(f"Source SHA: {source_sha() or 'unknown'}")
     print(f"Python: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
     print(f"paramiko: {paramiko_version}")
     print("Runtime: ok")
@@ -38,8 +40,16 @@ def doctor() -> int:
 
 def main() -> int:
     _configure_stdio()
-    if sys.argv[1:] == ["doctor"]:
+    arguments = sys.argv[1:]
+    if arguments in (["--version"], ["-v"]):
+        print(canonical_identity())
+        return 0
+    if arguments == ["doctor"]:
         return doctor()
+
+    # Диагностика идёт в отдельный локальный журнал и не меняет stdout/stderr
+    # команды, включая text-mode remote output и machine JSON.
+    record_invocation_identity()
 
     import ssh_relay
 

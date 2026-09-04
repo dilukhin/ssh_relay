@@ -4,11 +4,12 @@
 
 Пользователь вручную запускает `daemon` и проходит SSH-аутентификацию. После этого CLI-агент, в частности OpenCode, работает только через локальный relay: `exec`/`sudo-exec` для коротких команд, `job` для длительных удалённых процессов и `upload`/`download` для SFTP-передач. Прямой `ssh` агенту не нужен.
 
-Текущая версия: `0.9.0`.
+Текущая версия: `0.9.1`.
 
 Внутренняя структура:
 
-* `ssh_relay.py` — основной CLI и фактическая версия;
+* `ssh_relay.py` — основной CLI и фактическая semantic version;
+* `ssh_relay_build.py` — build metadata, exact source SHA и canonical diagnostic identity установленного runtime;
 * `ssh_relay_core.py` — daemon, reconnect, SFTP и базовый протокол коротких команд;
 * `ssh_relay_session.py` — защита локальной регистрации живого daemon, безопасный retry `status`, подключение machine/receipt-слоёв и редукция известных relay-секретов в диагностике зависимостей;
 * `ssh_relay_outcomes.py` — структурированные границы `not_started`/`unknown` и базовый JSON-контракт коротких команд;
@@ -18,6 +19,27 @@
 * `ssh_relay_transfers.py` — прогресс, чанки, таймауты и безопасные частичные файлы для длительных передач.
 
 Каноническая спецификация машинного интерфейса находится в `MACHINE_CONTRACT.md`.
+
+## Version и diagnostic identity
+
+Для установленного runtime, собранного из Git commit, `ssh_relay --version` возвращает каноническую identity:
+
+```text
+ssh_relay MAJOR.MINOR.PATCH.<8hex>
+```
+
+Восемь hex-символов — только компактное представление. Полный 40-hex exact source SHA внедряется при сборке и остаётся authoritative provenance установленной копии; runtime не читает `.git` developer checkout при запуске. `ssh_relay doctor` печатает ту же identity и полный `Source SHA`.
+
+Сборка из Git checkout использует exact `HEAD` и отклоняется при незакоммиченных изменениях tracked-файлов. Для сборки исходного архива без `.git` полный SHA нужно явно передать через `SSH_RELAY_SOURCE_SHA`; если provenance определить нельзя, production package не создаётся.
+
+Обычный вызов установленной команды записывает identity один раз в отдельный локальный диагностический журнал, не добавляя banner в stdout/stderr команды и не нарушая machine JSON:
+
+* Windows: `%LOCALAPPDATA%\ssh_relay\diagnostics.log`;
+* Linux: `${XDG_STATE_HOME:-~/.local/state}/ssh_relay/diagnostics.log`.
+
+Запись содержит время UTC, canonical identity, полный source SHA и PID. В неё не включаются argv, удалённая команда, stdout/stderr, session token и другие секреты. Ошибка записи диагностического журнала не меняет результат рабочей операции.
+
+`py .\ssh_relay.py` остаётся source-entrypoint для разработки и проверок. Canonical build identity установленной Git-sourced копии проверяется через штатную команду `ssh_relay`.
 
 ## Возможности
 
@@ -94,6 +116,8 @@ Fingerprint, полученный через сеть, нужно сверить
 ## Команды
 
 ```text
+ssh_relay --version
+ssh_relay doctor
 py .\ssh_relay.py daemon [--name NAME] --host HOST --user USER [--port PORT] [-i PATH] [--ask-key-passphrase] [--known-hosts PATH] [--command-timeout SECONDS] [--download-timeout SECONDS] [--download-max-size SIZE] [--upload-timeout SECONDS] [--upload-max-size SIZE] [--enable-sudo] [--detach] [--detach-log PATH]
 py .\ssh_relay.py exec [--name NAME] [--json] [--risky] [--receipt-path REMOTE_JSONL] [--transaction-id ID] [--change-target TEXT] [--change-description TEXT] "COMMAND"
 py .\ssh_relay.py sudo-exec [--name NAME] [--json] [--risky] [--receipt-path REMOTE_JSONL] [--transaction-id ID] [--change-target TEXT] [--change-description TEXT] "COMMAND"
@@ -134,7 +158,7 @@ py .\ssh_relay.py daemon --name prod --host 198.51.100.42 --user donpedro -i "%U
 
 `--detach` доступен только с `--identity-file` без интерактивного passphrase и без `--enable-sudo`.
 
-После обновления daemon старую активную сессию нужно остановить и запустить заново. Клиент `0.9.0` откажется запускать протокол длительных `upload`/`download` через daemon старее `0.8.0`, чтобы старый daemon не интерпретировал служебные чанки как обычную передачу. Перед risky-командой клиент также требует capability safe receipt v1; старый daemon без capability получает только read-only `status`, а пользовательская risky-команда не отправляется.
+После обновления daemon старую активную сессию нужно остановить и запустить заново. Клиент `0.9.1` откажется запускать протокол длительных `upload`/`download` через daemon старее `0.8.0`, чтобы старый daemon не интерпретировал служебные чанки как обычную передачу. Перед risky-командой клиент также требует capability safe receipt v1; старый daemon без capability получает только read-only `status`, а пользовательская risky-команда не отправляется.
 
 ## Автоматический reconnect
 
@@ -385,10 +409,12 @@ Session-файлы:
 Без SSH-сервера:
 
 ```powershell
-py -m py_compile .\ssh_relay.py .\ssh_relay_core.py .\ssh_relay_session.py .\ssh_relay_outcomes.py .\ssh_relay_receipts.py .\ssh_relay_p0_contract.py .\ssh_relay_jobs.py .\ssh_relay_transfers.py
+py -m py_compile .\ssh_relay.py .\ssh_relay_build.py .\ssh_relay_entrypoint.py .\ssh_relay_core.py .\ssh_relay_session.py .\ssh_relay_outcomes.py .\ssh_relay_receipts.py .\ssh_relay_p0_contract.py .\ssh_relay_jobs.py .\ssh_relay_transfers.py
 py -m unittest discover -s .\tests -v
 py .\ssh_relay.py --version
 py .\ssh_relay.py --help
+ssh_relay --version
+ssh_relay doctor
 py .\ssh_relay.py exec --help
 py .\ssh_relay.py sudo-exec --help
 py .\ssh_relay.py download --help

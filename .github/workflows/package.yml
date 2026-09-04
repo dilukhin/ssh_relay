@@ -28,25 +28,40 @@ jobs:
           python -m venv .package-venv
           .package-venv/bin/python -m pip install --disable-pip-version-check .
 
-      - name: Проверить установленную команду и runtime вне source checkout
+      - name: Проверить установленную команду и exact source SHA вне source checkout
         run: |
           VENV="$(pwd)/.package-venv"
+          export SSH_RELAY_EXPECTED_SHA="$(git rev-parse HEAD)"
           "$VENV/bin/ssh_relay" --version
           "$VENV/bin/ssh_relay" doctor
           "$VENV/bin/ssh_relay" --help | grep -q "job"
           cd "$RUNNER_TEMP"
           "$VENV/bin/python" - <<'PY'
+          import os
           from pathlib import Path
+          import sys
           import ssh_relay
+          from ssh_relay_build import canonical_identity, source_sha
+
           path = Path(ssh_relay.__file__).resolve()
-          runtime = Path(__import__('sys').prefix).resolve()
+          runtime = Path(sys.prefix).resolve()
           if runtime not in path.parents:
               raise SystemExit(f"ssh_relay imported outside packaged runtime: {path}")
+          expected = os.environ["SSH_RELAY_EXPECTED_SHA"].strip().lower()
+          if source_sha() != expected:
+              raise SystemExit(f"packaged source SHA mismatch: {source_sha()} != {expected}")
+          expected_identity = f"ssh_relay 0.9.1.{expected[:8]}"
+          if canonical_identity() != expected_identity:
+              raise SystemExit(f"packaged identity mismatch: {canonical_identity()} != {expected_identity}")
           print(path)
+          print(canonical_identity())
+          print(source_sha())
           PY
 
-      - name: Проверить unit contract нового entrypoint
-        run: .package-venv/bin/python -m unittest discover -s tests -p "test_packaged_entrypoint.py" -v
+      - name: Проверить unit contract build identity и entrypoint
+        run: |
+          .package-venv/bin/python -m unittest discover -s tests -p "test_build_identity.py" -v
+          .package-venv/bin/python -m unittest discover -s tests -p "test_packaged_entrypoint.py" -v
 
   windows-package:
     name: Windows packaged CLI
@@ -67,10 +82,11 @@ jobs:
           python -m venv .package-venv
           .\.package-venv\Scripts\python.exe -m pip install --disable-pip-version-check .
 
-      - name: Проверить установленную команду и runtime вне source checkout
+      - name: Проверить установленную команду и exact source SHA вне source checkout
         shell: pwsh
         run: |
           $venv = (Resolve-Path .\.package-venv).Path
+          $env:SSH_RELAY_EXPECTED_SHA = (git rev-parse HEAD).Trim().ToLowerInvariant()
           & "$venv\Scripts\ssh_relay.exe" --version
           if ($LASTEXITCODE -ne 0) { throw 'Packaged ssh_relay --version failed' }
           & "$venv\Scripts\ssh_relay.exe" doctor
@@ -79,12 +95,14 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or (($help -join "`n") -notmatch 'job')) { throw 'Packaged ssh_relay help contract failed' }
           Push-Location $env:RUNNER_TEMP
           try {
-            & "$venv\Scripts\python.exe" -c "from pathlib import Path; import sys, ssh_relay; p=Path(ssh_relay.__file__).resolve(); r=Path(sys.prefix).resolve(); assert r in p.parents, f'ssh_relay imported outside packaged runtime: {p}'; print(p)"
-            if ($LASTEXITCODE -ne 0) { throw 'Packaged ssh_relay origin check failed' }
+            & "$venv\Scripts\python.exe" -c "from pathlib import Path; import os, sys, ssh_relay; from ssh_relay_build import canonical_identity, source_sha; p=Path(ssh_relay.__file__).resolve(); r=Path(sys.prefix).resolve(); expected=os.environ['SSH_RELAY_EXPECTED_SHA'].strip().lower(); assert r in p.parents, f'ssh_relay imported outside packaged runtime: {p}'; assert source_sha() == expected, f'packaged source SHA mismatch: {source_sha()} != {expected}'; wanted=f'ssh_relay 0.9.1.{expected[:8]}'; assert canonical_identity() == wanted, f'packaged identity mismatch: {canonical_identity()} != {wanted}'; print(p); print(canonical_identity()); print(source_sha())"
+            if ($LASTEXITCODE -ne 0) { throw 'Packaged ssh_relay provenance check failed' }
           } finally {
             Pop-Location
           }
 
-      - name: Проверить unit contract нового entrypoint
+      - name: Проверить unit contract build identity и entrypoint
         shell: pwsh
-        run: .\.package-venv\Scripts\python.exe -m unittest discover -s tests -p "test_packaged_entrypoint.py" -v
+        run: |
+          .\.package-venv\Scripts\python.exe -m unittest discover -s tests -p "test_build_identity.py" -v
+          .\.package-venv\Scripts\python.exe -m unittest discover -s tests -p "test_packaged_entrypoint.py" -v
