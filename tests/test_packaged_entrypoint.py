@@ -17,7 +17,7 @@ class PackagedEntrypointTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         output = stdout.getvalue()
-        self.assertIn("ssh_relay 0.9.0", output)
+        self.assertIn("ssh_relay 0.9.1", output)
         self.assertIn("paramiko:", output)
         self.assertIn("Runtime: ok", output)
 

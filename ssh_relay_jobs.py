@@ -24,6 +24,7 @@ DEFAULT_STOP_GRACE = 5.0
 
 _START_ACTIVE = 17
 _START_UNKNOWN = 18
+_TAIL_READ_ERROR = 22
 _NOT_FOUND = 44
 
 
@@ -83,6 +84,7 @@ def _state_prelude(job: str) -> str:
         ]
     )
 
+
 def _status_values_shell() -> str:
     return r'''
 now=$(date +%s)
@@ -92,7 +94,7 @@ started_epoch=""
 exit_code=""
 state="unknown"
 elapsed="0"
-log_size="0"
+log_size=""
 log_age="-1"
 if [ -r "$jobdir/pid" ]; then pid=$(cat "$jobdir/pid" 2>/dev/null || true); fi
 if [ -r "$jobdir/start_ticks" ]; then start_ticks=$(cat "$jobdir/start_ticks" 2>/dev/null || true); fi
@@ -114,7 +116,14 @@ case "$started_epoch" in
   *) if [ "$now" -ge "$started_epoch" ]; then elapsed=$((now-started_epoch)); fi ;;
 esac
 if [ -f "$jobdir/log" ]; then
-  log_size=$(wc -c < "$jobdir/log" 2>/dev/null | tr -d ' ' || printf '0')
+  measured_log_size=""
+  if measured_log_size=$(wc -c 2>/dev/null < "$jobdir/log"); then
+    measured_log_size=$(printf '%s' "$measured_log_size" | tr -d '[:space:]')
+    case "$measured_log_size" in
+      ''|*[!0-9]*) log_size="" ;;
+      *) log_size=$measured_log_size ;;
+    esac
+  fi
   log_mtime=$(stat -c %Y "$jobdir/log" 2>/dev/null || printf '')
   case "$log_mtime" in ''|*[!0-9]*) log_age=-1 ;; *) log_age=$((now-log_mtime)) ;; esac
 fi
@@ -129,6 +138,7 @@ def _emit_status_shell() -> str:
   "$job" "$state" "$pid" "$elapsed" "$exit_code" "$log_size" "$log_age"''',
         ]
     )
+
 
 def build_job_status_command(job: str) -> str:
     return "\n".join(
@@ -251,7 +261,16 @@ def build_job_tail_command(job: str, *, lines: int = DEFAULT_TAIL_LINES, max_byt
             _state_prelude(job),
             'if [ ! -d "$jobdir" ]; then exit 44; fi',
             'if [ ! -f "$jobdir/log" ]; then exit 0; fi',
-            f'tail -c {max_bytes} -- "$jobdir/log" 2>/dev/null | tail -n {lines}',
+            'if [ ! -r "$jobdir/log" ]; then printf "tail_error=log_unreadable\\n"; exit 22; fi',
+            'tail_status="$jobdir/.tail-status.$$"',
+            'rm -f "$tail_status"',
+            f'{{ tail -c {max_bytes} -- "$jobdir/log" 2>/dev/null; printf "%s\\n" "$?" > "$tail_status"; }} | tail -n {lines}',
+            'pipe_rc=$?',
+            'tail_rc=$(cat "$tail_status" 2>/dev/null || printf "1")',
+            'rm -f "$tail_status"',
+            'case "$tail_rc" in ""|*[!0-9]*) tail_rc=1 ;; esac',
+            'if [ "$tail_rc" -ne 0 ]; then printf "tail_error=log_read_failed\\n"; exit 22; fi',
+            'if [ "$pipe_rc" -ne 0 ]; then printf "tail_error=log_read_failed\\n"; exit 22; fi',
         ]
     )
 
@@ -308,13 +327,26 @@ def build_job_list_command() -> str:
 
 
 def parse_job_status(text: str) -> dict[str, Any]:
-    """Разбирает ограниченный key=value-ответ status/start/stop."""
+    """Разбирает ограниченный key=value-ответ status/start/stop/tail."""
     raw: dict[str, str] = {}
+    allowed_keys = {
+        "job",
+        "state",
+        "pid",
+        "elapsed",
+        "exit_code",
+        "log_size",
+        "log_age",
+        "not_found",
+        "start_error",
+        "stop_error",
+        "tail_error",
+    }
     for line in text.splitlines():
         if "=" not in line:
             continue
         key, value = line.split("=", 1)
-        if key in {"job", "state", "pid", "elapsed", "exit_code", "log_size", "log_age", "not_found", "start_error", "stop_error"}:
+        if key in allowed_keys:
             raw[key] = value
     result: dict[str, Any] = {
         "job": raw.get("job", ""),
@@ -322,7 +354,7 @@ def parse_job_status(text: str) -> dict[str, Any]:
         "pid": None,
         "elapsed": 0,
         "exit_code": None,
-        "log_size": 0,
+        "log_size": None,
         "log_age": -1,
     }
     for key in ("pid", "elapsed", "exit_code", "log_size", "log_age"):
@@ -335,6 +367,8 @@ def parse_job_status(text: str) -> dict[str, Any]:
         result["start_error"] = raw["start_error"]
     if "stop_error" in raw:
         result["stop_error"] = raw["stop_error"]
+    if "tail_error" in raw:
+        result["tail_error"] = raw["tail_error"]
     return result
 
 
@@ -380,15 +414,22 @@ def wait_for_terminal_status(
             return last_status, True
         sleep(min(poll_interval, remaining))
 
+
 def classify_job_command_failure(exit_code: int, stdout: str) -> str | None:
     """Возвращает понятную причину служебного отказа job-команды."""
+    if exit_code == 0:
+        return None
     parsed = parse_job_status(stdout)
-    if exit_code == _NOT_FOUND or parsed.get("not_found"):
+    if exit_code == _NOT_FOUND:
         return "job_not_found"
-    if exit_code == _START_ACTIVE or parsed.get("start_error") in {"active_exists", "start_locked"}:
+    if exit_code == _TAIL_READ_ERROR:
+        return str(parsed["tail_error"]) if parsed.get("tail_error") else None
+    if exit_code == _START_ACTIVE:
         return "job_active_exists"
-    if exit_code == _START_UNKNOWN or parsed.get("start_error") == "unknown_existing":
+    if exit_code == _START_UNKNOWN:
         return "job_unknown_existing"
+    if parsed.get("not_found"):
+        return "job_not_found"
     if parsed.get("start_error"):
         return str(parsed["start_error"])
     if parsed.get("stop_error"):
