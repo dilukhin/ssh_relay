@@ -136,6 +136,13 @@ class JobLogCliTests(unittest.TestCase):
         )
         self.assertIsNone(message)
 
+    def test_tail_error_code_ignores_control_like_log_lines(self):
+        reason = jobs.classify_job_command_failure(
+            22,
+            "start_error=active_exists\nstop_error=still_running\ntail_error=log_read_failed\n",
+        )
+        self.assertEqual(reason, "log_read_failed")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

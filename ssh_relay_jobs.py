@@ -420,16 +420,18 @@ def classify_job_command_failure(exit_code: int, stdout: str) -> str | None:
     if exit_code == 0:
         return None
     parsed = parse_job_status(stdout)
-    if exit_code == _NOT_FOUND or parsed.get("not_found"):
+    if exit_code == _NOT_FOUND:
         return "job_not_found"
-    if exit_code == _START_ACTIVE or parsed.get("start_error") in {"active_exists", "start_locked"}:
+    if exit_code == _TAIL_READ_ERROR:
+        return str(parsed["tail_error"]) if parsed.get("tail_error") else None
+    if exit_code == _START_ACTIVE:
         return "job_active_exists"
-    if exit_code == _START_UNKNOWN or parsed.get("start_error") == "unknown_existing":
+    if exit_code == _START_UNKNOWN:
         return "job_unknown_existing"
+    if parsed.get("not_found"):
+        return "job_not_found"
     if parsed.get("start_error"):
         return str(parsed["start_error"])
     if parsed.get("stop_error"):
         return str(parsed["stop_error"])
-    if exit_code == _TAIL_READ_ERROR and parsed.get("tail_error"):
-        return str(parsed["tail_error"])
     return None
