@@ -66,7 +66,8 @@ class JobLogShellTests(unittest.TestCase):
         status = self.wait_state("unreadable-log", "succeeded")
         self.assertEqual(status["log_size"], 11)
 
-        log_path = self.state / "ssh_relay" / "jobs" / "unreadable-log" / "log"
+        jobdir = self.state / "ssh_relay" / "jobs" / "unreadable-log"
+        log_path = jobdir / "log"
         self.assertEqual(log_path.read_bytes(), b"known-data\n")
         log_path.chmod(0)
         try:
@@ -81,12 +82,14 @@ class JobLogShellTests(unittest.TestCase):
             self.assertEqual(tail.returncode, 22, tail.stderr + tail.stdout)
             self.assertEqual(tail.stdout, "tail_error=log_unreadable\n")
             self.assertEqual(jobs.classify_job_command_failure(tail.returncode, tail.stdout), "log_unreadable")
+            self.assertEqual(list(jobdir.glob(".tail-status.*")), [])
         finally:
             log_path.chmod(0o600)
 
         restored = self.run_shell(jobs.build_job_tail_command("unreadable-log"))
         self.assertEqual(restored.returncode, 0, restored.stderr + restored.stdout)
         self.assertEqual(restored.stdout, "known-data\n")
+        self.assertEqual(list(jobdir.glob(".tail-status.*")), [])
 
 
 class JobLogCliTests(unittest.TestCase):
@@ -121,6 +124,17 @@ class JobLogCliTests(unittest.TestCase):
             }
         )
         self.assertEqual(message, "Журнал job существует, но недоступен для чтения.")
+
+    def test_successful_tail_payload_is_not_control_error(self):
+        message = self.relay._service_error(
+            {
+                "ok": True,
+                "stdout": "start_error=active_exists\ntail_error=log_unreadable\n",
+                "stderr": "",
+                "exit_code": 0,
+            }
+        )
+        self.assertIsNone(message)
 
 
 if __name__ == "__main__":

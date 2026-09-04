@@ -117,7 +117,7 @@ case "$started_epoch" in
 esac
 if [ -f "$jobdir/log" ]; then
   measured_log_size=""
-  if measured_log_size=$(wc -c < "$jobdir/log" 2>/dev/null); then
+  if measured_log_size=$(wc -c 2>/dev/null < "$jobdir/log"); then
     measured_log_size=$(printf '%s' "$measured_log_size" | tr -d '[:space:]')
     case "$measured_log_size" in
       ''|*[!0-9]*) log_size="" ;;
@@ -262,11 +262,15 @@ def build_job_tail_command(job: str, *, lines: int = DEFAULT_TAIL_LINES, max_byt
             'if [ ! -d "$jobdir" ]; then exit 44; fi',
             'if [ ! -f "$jobdir/log" ]; then exit 0; fi',
             'if [ ! -r "$jobdir/log" ]; then printf "tail_error=log_unreadable\\n"; exit 22; fi',
-            'tail_tmp="$jobdir/.tail.$$"',
-            f'if ! tail -c {max_bytes} -- "$jobdir/log" > "$tail_tmp" 2>/dev/null; then rm -f "$tail_tmp"; printf "tail_error=log_read_failed\\n"; exit 22; fi',
-            f'tail -n {lines} -- "$tail_tmp"',
-            'tail_rc=$?; rm -f "$tail_tmp"',
+            'tail_status="$jobdir/.tail-status.$$"',
+            'rm -f "$tail_status"',
+            f'{{ tail -c {max_bytes} -- "$jobdir/log" 2>/dev/null; printf "%s\\n" "$?" > "$tail_status"; }} | tail -n {lines}',
+            'pipe_rc=$?',
+            'tail_rc=$(cat "$tail_status" 2>/dev/null || printf "1")',
+            'rm -f "$tail_status"',
+            'case "$tail_rc" in ""|*[!0-9]*) tail_rc=1 ;; esac',
             'if [ "$tail_rc" -ne 0 ]; then printf "tail_error=log_read_failed\\n"; exit 22; fi',
+            'if [ "$pipe_rc" -ne 0 ]; then printf "tail_error=log_read_failed\\n"; exit 22; fi',
         ]
     )
 
@@ -413,6 +417,8 @@ def wait_for_terminal_status(
 
 def classify_job_command_failure(exit_code: int, stdout: str) -> str | None:
     """Возвращает понятную причину служебного отказа job-команды."""
+    if exit_code == 0:
+        return None
     parsed = parse_job_status(stdout)
     if exit_code == _NOT_FOUND or parsed.get("not_found"):
         return "job_not_found"
@@ -425,7 +431,5 @@ def classify_job_command_failure(exit_code: int, stdout: str) -> str | None:
     if parsed.get("stop_error"):
         return str(parsed["stop_error"])
     if exit_code == _TAIL_READ_ERROR and parsed.get("tail_error"):
-        return str(parsed["tail_error"])
-    if parsed.get("tail_error"):
         return str(parsed["tail_error"])
     return None
