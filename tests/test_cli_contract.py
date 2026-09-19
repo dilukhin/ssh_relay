@@ -41,7 +41,7 @@ class CliContractTests(unittest.TestCase):
     def test_top_level_and_job_commands_are_stable(self) -> None:
         top = self.subparsers(self.parser)
         self.assertEqual(
-            {"daemon", "exec", "sudo-exec", "download", "upload", "status", "stop", "list", "job"},
+            {"daemon", "exec", "sudo-exec", "download", "upload", "status", "stop", "list", "job", "replay"},
             set(top.choices),
         )
         job = self.subparsers(top.choices["job"])
@@ -180,3 +180,4 @@ class CliContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

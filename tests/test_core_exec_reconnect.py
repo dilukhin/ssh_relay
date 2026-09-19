@@ -151,6 +151,53 @@ class CoreExecReconnectIntegrationTests(unittest.TestCase):
             return 0
         return len(path.read_text(encoding="utf-8").splitlines())
 
+    def test_replay_cli_raw_roundtrip_and_disabled(self):
+        import uuid
+        rid = str(uuid.uuid4())
+        command = [sys.executable, str(ROOT / "ssh_relay.py")]
+        executed = subprocess.run(command + ["exec", "--name", "ci-core", "--request-id", rid, "--json", "test:raw"],
+                                  capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(executed.returncode, 0, executed.stderr)
+        result = json.loads(executed.stdout)
+        self.assertEqual(result["request_id"], rid)
+        self.assertEqual(result["replay_status"], "available")
+        core.request_daemon(self.session, "stop")
+        self.process.communicate(timeout=5)
+        restored = subprocess.run(command + ["replay", "--name", "ci-core", "--request-id", rid, "--encoding", "cp866", "--json"],
+                                  capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(restored.returncode, 0, restored.stderr + restored.stdout)
+        self.assertEqual(json.loads(restored.stdout)["stdout"], "Привет")
+        self.assertEqual(self.command_lines().count("test:raw"), 1)
+
+    def test_replay_unknown_keeps_partial_raw_without_retry(self):
+        import uuid
+        rid = str(uuid.uuid4())
+        result = core.request_daemon(self.session, "exec", command="test:partial-raw", risky=False,
+                                     machine=True, request_id=rid, response_timeout=5)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["replay_status"], "partial")
+        from ssh_relay_replay import Store
+        restored = Store(core.state_directory()).replay(rid=rid, session="ci-core", encoding="cp866", owners=[])
+        self.assertEqual(restored["stdout"], "Привет")
+        self.assertFalse(restored["replay_complete"])
+        self.assertEqual(self.command_lines().count("test:partial-raw"), 1)
+
+    def test_replay_no_replay_legacy_and_invalid_id(self):
+        import uuid
+        root = core.state_directory() / "replay" / "v1" / "requests"
+        rid = str(uuid.uuid4())
+        result = core.request_daemon(self.session, "exec", command="test:success", risky=False,
+                                     request_id=rid, no_replay=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["replay_status"], "disabled")
+        self.assertFalse((root / rid).exists())
+        self.request_exec("test:mixed")
+        self.assertFalse(root.exists())
+        result = core.request_daemon(self.session, "exec", command="must-not-run", request_id="../bad")
+        self.assertFalse(result["ok"])
+        self.assertNotIn("must-not-run", self.command_lines())
+        self.assertEqual(self.status()["replay_schema_version"], 1)
+
     def test_exec_preserves_stdout_stderr_empty_output_and_exit_code(self) -> None:
         mixed = self.request_exec("test:mixed")
         self.assertTrue(mixed.get("ok"))
@@ -305,3 +352,4 @@ class CoreExecReconnectIntegrationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
