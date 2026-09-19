@@ -30,7 +30,7 @@ class PackagedEntrypointTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         output = stdout.getvalue()
-        self.assertIn("ssh_relay 0.9.1.01234567", output)
+        self.assertIn("ssh_relay 0.10.1.01234567", output)
         self.assertIn(f"Source SHA: {SOURCE_SHA}", output)
         self.assertIn("paramiko:", output)
         self.assertIn("Runtime: ok", output)
@@ -46,7 +46,7 @@ class PackagedEntrypointTests(unittest.TestCase):
             result = ssh_relay_entrypoint.main()
 
         self.assertEqual(0, result)
-        self.assertEqual("ssh_relay 0.9.1.01234567\n", stdout.getvalue())
+        self.assertEqual("ssh_relay 0.10.1.01234567\n", stdout.getvalue())
         self.assertEqual("", stderr.getvalue())
 
     def test_doctor_dependency_error_contains_identity(self) -> None:
@@ -68,7 +68,7 @@ class PackagedEntrypointTests(unittest.TestCase):
 
         self.assertEqual(1, result)
         self.assertEqual("", stdout.getvalue())
-        self.assertIn("ssh_relay 0.9.1.01234567", stderr.getvalue())
+        self.assertIn("ssh_relay 0.10.1.01234567", stderr.getvalue())
         self.assertIn("test missing dependency", stderr.getvalue())
 
     def test_regular_cli_preserves_stdio_and_records_identity_separately(self) -> None:
@@ -103,7 +103,7 @@ class PackagedEntrypointTests(unittest.TestCase):
         self.assertEqual("remote-err\n", stderr.getvalue())
         fake_module.main.assert_called_once_with()
         self.assertEqual(1, len(lines))
-        self.assertIn("ssh_relay 0.9.1.01234567", lines[0])
+        self.assertIn("ssh_relay 0.10.1.01234567", lines[0])
         self.assertIn(f"source_sha={SOURCE_SHA}", lines[0])
         self.assertNotIn("printf test", lines[0])
 
@@ -140,3 +140,4 @@ class PackagedEntrypointTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

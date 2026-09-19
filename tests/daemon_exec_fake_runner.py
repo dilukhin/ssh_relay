@@ -56,6 +56,12 @@ class FakeChannel:
     def exec_command(self, command: str) -> None:
         append_line(COMMAND_LOG, command)
 
+        if command in {"test:raw", "test:partial-raw"}:
+            self.stdout.extend("Привет".encode("cp866"))
+            self.stderr.extend(b"raw-error")
+            self.finished = command == "test:raw"
+            self.drop_after_read = command == "test:partial-raw"
+            return
         if command == "test:success":
             self.stdout.extend(b"stdout-ok\n")
             self.finished = True
@@ -120,6 +126,9 @@ class FakeChannel:
         pass
 
     def recv_ready(self) -> bool:
+        if not self.stdout and not self.stderr and getattr(self, "drop_after_read", False):
+            self.transport.active = False
+            raise OSError("обрыв после частичного вывода")
         return bool(self.stdout)
 
     def recv(self, size: int) -> bytes:
@@ -225,3 +234,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

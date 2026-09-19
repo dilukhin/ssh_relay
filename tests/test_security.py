@@ -239,6 +239,25 @@ class SecurityIntegrationTests(unittest.TestCase):
         self.assertNotIn(auth_token, stdout)
         self.assertNotIn(auth_token, stderr)
 
+    def test_sudo_replay_excludes_passwords_and_receipt_output(self):
+        import uuid
+        from ssh_relay_replay import Store
+        self.start_daemon("sudo")
+        rid = str(uuid.uuid4())
+        result = self.request("sudo_exec", command="test:sudo-success", risky=True,
+                              receipt_path="~/changes.jsonl", request_id=rid)
+        restored = Store(core.state_directory()).replay(rid=rid, session="ci-security", encoding="utf-8", owners=[])
+        self.assertEqual(restored["stdout"], "sudo-ok\n")
+        self.assertEqual(restored["stderr"], "")
+        self.assertEqual(restored["source_command_exit_code"], 0)
+        directory = core.state_directory() / "replay" / "v1" / "requests" / rid
+        for path in directory.iterdir():
+            text = path.read_bytes().decode("utf-8")
+            self.assert_no_secrets(text)
+            self.assertNotIn(self.session["auth_token"], text)
+            self.assertNotIn("test:sudo-success", text)
+        self.assertIn(result["replay_status"], {"available", "partial"})
+
     def test_sudo_disabled_is_rejected(self) -> None:
         self.start_daemon("normal")
         result = self.sudo_exec("test:sudo-success")

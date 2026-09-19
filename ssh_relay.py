@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.9.1"
+__version__ = "0.10.1"
 
 import argparse
 import base64
@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import ssh_relay_replay_cli as relay_replay_cli
 import ssh_relay_core as _core
 import ssh_relay_jobs as relay_jobs
 import ssh_relay_session as relay_session
@@ -22,6 +23,7 @@ from ssh_relay_core import *  # noqa: F403 — сохраняем публичн
 _core.__version__ = __version__
 relay_session.install(_core)
 relay_transfers.install(_core)
+relay_replay_cli.install(_core)
 request_daemon = _core.request_daemon
 remove_session_file = _core.remove_session_file
 write_session = _core.write_session
@@ -69,6 +71,11 @@ def parse_tail_bytes(value: str) -> int:
 
 def daemon(args: argparse.Namespace) -> int:
     """Запускает прежний daemon, сохраняя путь внешнего CLI для ``--detach``."""
+    from ssh_relay_logging import install_daemon_timestamp_streams
+
+    # Справка и ошибки argparse уже выведены до входа в обработчик.
+    # Метки относятся только к диагностике запущенного daemon.
+    install_daemon_timestamp_streams()
     original_file = _core.__file__
     _core.__file__ = __file__
     try:
@@ -729,6 +736,7 @@ def _top_level_subparsers(parser: argparse.ArgumentParser) -> argparse._SubParse
 def build_parser() -> argparse.ArgumentParser:
     parser = _core.build_parser()
     subparsers = _top_level_subparsers(parser)
+    relay_replay_cli.extend_parser(_core, subparsers)
 
     # При --detach прежняя реализация повторно запускает внешний ssh_relay.py.
     subparsers.choices["daemon"].set_defaults(handler=daemon)
@@ -849,3 +857,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
