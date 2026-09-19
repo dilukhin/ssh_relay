@@ -218,3 +218,24 @@ Read-only `status` может повторяться безопасно. `exec`,
 - не считать `stderr` признаком failure без remote exit code;
 - использовать `transaction_id` и `receipt_id` для корреляции и последующей диагностики;
 - не передавать секреты в `change_target` и `change_description`.
+
+## Дополнение 0.10.0: локальный replay
+
+Для публичных `exec --json` и `sudo-exec --json` добавлены поля:
+
+- `request_id`: UUIDv4, созданный клиентом до отправки запроса;
+- `replay_status`: `available`, `partial`, `disabled` или `unavailable`;
+- `replay_truncated`: признак отброшенного префикса raw-вывода.
+
+`schema_version=1`, прежние поля, статусы и коды завершения не меняются.
+`request_id` не заменяет `transaction_id`/`receipt_id` и не обеспечивает идемпотентность.
+При потере ответа клиент сохраняет свой `request_id`, но не утверждает доступность
+replay до локального чтения. Старый daemon означает `unavailable`.
+Read-only `status` нового daemon возвращает `replay_schema_version=1`.
+
+`replay --json` возвращает один JSON-объект с `action=replay`, `schema_version=1`,
+`request_id`, `session`, `source_action`, `source_operation_status`,
+`source_command_status`, `source_command_exit_code`, `encoding`, `stdout`, `stderr`,
+`stdout_truncated`, `stderr_truncated`, `replay_complete`, `error_code`, `error_message`.
+Коды локальной операции: `0` — полный результат, `2` — неполный, `1` — ошибка.
+Поля `source_*` относятся к прежнему выполнению; нового удалённого выполнения нет.

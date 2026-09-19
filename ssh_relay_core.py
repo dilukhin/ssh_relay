@@ -15,6 +15,7 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
 __version__ = "0.6.0"
 
 import argparse
+import ssh_relay_replay_cli as replay_cli
 import atexit
 import base64
 import getpass
@@ -367,13 +368,15 @@ def execute_remote_command(
     try:
         while True:
             read_any = False
-            while channel.recv_ready():
+            while channel.recv_ready() and total_size <= MAX_OUTPUT_SIZE:
                 chunk = channel.recv(BUFFER_SIZE)
+                replay_cli.capture_chunk("stdout", chunk)
                 output.append(chunk)
                 total_size += len(chunk)
                 read_any = True
-            while channel.recv_stderr_ready():
+            while channel.recv_stderr_ready() and total_size <= MAX_OUTPUT_SIZE:
                 chunk = channel.recv_stderr(BUFFER_SIZE)
+                replay_cli.capture_chunk("stderr", chunk)
                 errors.append(chunk)
                 total_size += len(chunk)
                 read_any = True
@@ -1204,9 +1207,16 @@ def daemon(args: argparse.Namespace) -> int:
                 flush=True,
             )
 
+    replay_store = replay_cli.Store(state_directory())
+    replay_store.gc()
+
     def connection_monitor() -> None:
         """Контролирует состояние транспорта между локальными запросами."""
+        next_gc = time.monotonic() + 60
         while not stop_event.wait(SSH_MONITOR_INTERVAL):
+            if time.monotonic() >= next_gc:
+                replay_store.gc()
+                next_gc = time.monotonic() + 60
             candidate = current_client()
             if not client_is_active(candidate):
                 mark_connection_lost()
@@ -1238,7 +1248,10 @@ def daemon(args: argparse.Namespace) -> int:
         with conn:
             conn.settimeout(5)
 
+            replay_reply: dict[str, Any] = {}
+
             def reply(message: dict[str, Any]) -> None:
+                message = {**replay_reply, **message}
                 try:
                     send_message(conn, message)
                 except OSError:
@@ -1261,6 +1274,7 @@ def daemon(args: argparse.Namespace) -> int:
                         "last_error": snapshot["last_error"],
                         "reconnect_attempt": snapshot["reconnect_attempt"],
                         "version": __version__,
+                        "replay_schema_version": 1,
                         "sudo_enabled": bool(args.enable_sudo),
                         "name": session_name,
                     })
@@ -1364,19 +1378,20 @@ def daemon(args: argparse.Namespace) -> int:
                     }
                 else:
                     def execute_with_optional_receipt(active_client: Any) -> dict[str, Any]:
-                        if action == "sudo_exec":
-                            command_result = execute_sudo_command(
-                                active_client,
-                                command,
-                                args.command_timeout,
-                                sudo_password,
-                            )
-                        else:
-                            command_result = execute_remote_command(
-                                active_client,
-                                command,
-                                args.command_timeout,
-                            )
+                        with replay_cli.capturing(replay_writer):
+                            if action == "sudo_exec":
+                                command_result = execute_sudo_command(
+                                    active_client,
+                                    command,
+                                    args.command_timeout,
+                                    sudo_password,
+                                )
+                            else:
+                                command_result = execute_remote_command(
+                                    active_client,
+                                    command,
+                                    args.command_timeout,
+                                )
                         if command_result.get("ok") and command_result.get("exit_code") == 0 and risky:
                             receipt = execute_risky_receipt(
                                 active_client,
@@ -1401,10 +1416,23 @@ def daemon(args: argparse.Namespace) -> int:
                                 }
                         return command_result
 
-                    result = run_remote_operation(
-                        "выполнения sudo-команды" if action == "sudo_exec" else "выполнения команды",
-                        execute_with_optional_receipt,
-                    )
+                    try:
+                        replay_cli.validate_request(request)
+                    except replay_cli.ReplayError as exc:
+                        raise RelayError(str(exc)) from None
+                    replay_reply.update(replay_cli.finish(None, request, {}))
+                    replay_writer = replay_cli.begin(sys.modules[__name__], request, session)
+                    try:
+                        result = run_remote_operation(
+                            "выполнения sudo-команды" if action == "sudo_exec" else "выполнения команды",
+                            execute_with_optional_receipt,
+                        )
+                    except Exception as exc:
+                        replay_reply.update(replay_cli.finish(replay_writer, request, {
+                            "command_started": getattr(exc, "command_started", None),
+                        }))
+                        raise
+                    result = replay_cli.finish(replay_writer, request, result)
                 reply(result)
             except (socket.timeout, TimeoutError):
                 reply({"ok": False, "protocol_error": "Истекло время ожидания локального запроса."})
@@ -1907,3 +1935,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
