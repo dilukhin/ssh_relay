@@ -60,11 +60,11 @@ jobs:
       - name: Проверить session control-plane
         run: python -m coverage run -m unittest discover -s tests -p "test_*session*.py" -v
 
-      - name: Проверить exec и reconnect
-        run: python -m coverage run -m unittest discover -s tests -p "test_core*.py" -v
-
       - name: Проверить двоичный replay и приватное хранилище
         run: python -m coverage run -m unittest discover -s tests -p "test_replay*.py" -v
+
+      - name: Проверить exec и reconnect
+        run: python -m coverage run -m unittest discover -s tests -p "test_core*.py" -v
 
       - name: Проверить security-контракт
         run: python -m coverage run -m unittest discover -s tests -p "test_security*.py" -v

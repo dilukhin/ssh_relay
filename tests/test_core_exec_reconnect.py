@@ -154,7 +154,7 @@ class CoreExecReconnectIntegrationTests(unittest.TestCase):
     def test_replay_cli_raw_roundtrip_and_disabled(self):
         import uuid
         rid = str(uuid.uuid4())
-        command = [sys.executable, str(ROOT / "ssh_relay.py")]
+        command = [sys.executable, str(ROOT / "ssh_relay_entrypoint.py")]
         executed = subprocess.run(command + ["exec", "--name", "ci-core", "--request-id", rid, "--json", "test:raw"],
                                   capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(executed.returncode, 0, executed.stderr)
