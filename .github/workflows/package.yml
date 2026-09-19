@@ -50,7 +50,7 @@ jobs:
           expected = os.environ["SSH_RELAY_EXPECTED_SHA"].strip().lower()
           if source_sha() != expected:
               raise SystemExit(f"packaged source SHA mismatch: {source_sha()} != {expected}")
-          expected_identity = f"ssh_relay 0.10.0.{expected[:8]}"
+          expected_identity = f"ssh_relay 0.10.1.{expected[:8]}"
           if canonical_identity() != expected_identity:
               raise SystemExit(f"packaged identity mismatch: {canonical_identity()} != {expected_identity}")
           print(path)
@@ -95,7 +95,7 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or (($help -join "`n") -notmatch 'job')) { throw 'Packaged ssh_relay help contract failed' }
           Push-Location $env:RUNNER_TEMP
           try {
-            & "$venv\Scripts\python.exe" -c "from pathlib import Path; import os, sys, ssh_relay; from ssh_relay_build import canonical_identity, source_sha; p=Path(ssh_relay.__file__).resolve(); r=Path(sys.prefix).resolve(); expected=os.environ['SSH_RELAY_EXPECTED_SHA'].strip().lower(); assert r in p.parents, f'ssh_relay imported outside packaged runtime: {p}'; assert source_sha() == expected, f'packaged source SHA mismatch: {source_sha()} != {expected}'; wanted=f'ssh_relay 0.10.0.{expected[:8]}'; assert canonical_identity() == wanted, f'packaged identity mismatch: {canonical_identity()} != {wanted}'; print(p); print(canonical_identity()); print(source_sha())"
+            & "$venv\Scripts\python.exe" -c "from pathlib import Path; import os, sys, ssh_relay; from ssh_relay_build import canonical_identity, source_sha; p=Path(ssh_relay.__file__).resolve(); r=Path(sys.prefix).resolve(); expected=os.environ['SSH_RELAY_EXPECTED_SHA'].strip().lower(); assert r in p.parents, f'ssh_relay imported outside packaged runtime: {p}'; assert source_sha() == expected, f'packaged source SHA mismatch: {source_sha()} != {expected}'; wanted=f'ssh_relay 0.10.1.{expected[:8]}'; assert canonical_identity() == wanted, f'packaged identity mismatch: {canonical_identity()} != {wanted}'; print(p); print(canonical_identity()); print(source_sha())"
             if ($LASTEXITCODE -ne 0) { throw 'Packaged ssh_relay provenance check failed' }
           } finally {
             Pop-Location
