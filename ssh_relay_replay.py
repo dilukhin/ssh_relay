@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ssh_relay_replay_platform import (
-    ReplayError, alive, check_path, owner_chain, private_directory, process_identity, sanitize_chain,
+    ReplayError, alive, check_path, lock_guard, owner_chain, private_directory, process_identity, sanitize_chain,
 )
 
 STREAM_LIMIT = 4 * 1024 * 1024
@@ -139,6 +139,21 @@ class Store:
 
     @contextmanager
     def locked(self):
+        # Один постоянный inode/файл для всех участников. Его нельзя удалять
+        # даже при освобождении: иначе две группы fd смогут владеть lock.
+        guard = self.root / "gc.guard"
+        try:
+            stream = open_file(guard, create=True, write=True)
+        except FileExistsError:
+            stream = open_file(guard, write=True)
+        with stream:
+            lock_guard(stream.fileno())
+            with self._owner_lock():
+                yield
+
+    @contextmanager
+    def _owner_lock(self):
+        # Все переходы gc.lock, включая stale unlink и finally, под OS guard.
         path = self.root / "gc.lock"
         identity = process_identity(os.getpid())
         data = json.dumps({"owner": identity, "created": utc(time.time())}).encode()
@@ -202,31 +217,33 @@ class Store:
         except (KeyError, ValueError, TypeError, OverflowError):
             raise ReplayError("Метаданные replay повреждены.") from None
 
+    def record(self, rid: str) -> tuple[Path, dict | None, int]:
+        directory = self.requests / request_id(rid)
+        check_path(directory, directory=True)
+        names = set()
+        with os.scandir(directory) as children:
+            for child in children:
+                names.add(child.name)
+                if child.name not in FIXED_FILES:
+                    raise ReplayError("Неизвестный объект в каталоге replay.")
+                check_path(directory / child.name, directory=False)
+        size = sum((directory / f"{s}.bin").stat().st_size for s in STREAMS if f"{s}.bin" in names)
+        try:
+            metadata = self.metadata(directory)
+        except (ReplayError, OSError):
+            metadata = None
+        if metadata and metadata["state"] == "active" and alive(metadata.get("writer_identity", {})) is False:
+            metadata.update(state="abandoned", retention_class="suspect", finished_at_utc=utc(time.time()))
+            write_json(directory, metadata)
+        return directory, metadata, size
+
     def records(self) -> list[tuple[Path, dict | None, int]]:
         records = []
         with os.scandir(self.requests) as entries:
             for index, entry in enumerate(entries):
                 if index >= SCAN_LIMIT:
                     raise ReplayError("Превышен предел безопасного сканирования replay.")
-                request_id(entry.name)
-                directory = self.requests / entry.name
-                check_path(directory, directory=True)
-                names = set()
-                with os.scandir(directory) as children:
-                    for child in children:
-                        names.add(child.name)
-                        if child.name not in FIXED_FILES:
-                            raise ReplayError("Неизвестный объект в каталоге replay.")
-                        check_path(directory / child.name, directory=False)
-                size = sum((directory / f"{s}.bin").stat().st_size for s in STREAMS if f"{s}.bin" in names)
-                try:
-                    metadata = self.metadata(directory)
-                except (ReplayError, OSError):
-                    metadata = None
-                if metadata and metadata["state"] == "active" and alive(metadata.get("writer_identity", {})) is False:
-                    metadata.update(state="abandoned", retention_class="suspect", finished_at_utc=utc(time.time()))
-                    write_json(directory, metadata)
-                records.append((directory, metadata, size))
+                records.append(self.record(entry.name))
         return records
 
     def remove(self, directory: Path) -> bool:
@@ -237,7 +254,8 @@ class Store:
                 return False
             for path in names:
                 check_path(path, directory=False)
-            for path in names:
+            # Не теряем TTL при частичном удалении raw (например sharing violation).
+            for path in sorted(names, key=lambda p: p.name == "metadata.json"):
                 path.unlink()
             directory.rmdir()
             return True
@@ -337,9 +355,11 @@ class Store:
             raise ReplayError("Неизвестная текстовая кодировка replay.") from None
         self.prepare(create=False)
         with self.locked():
-            records = self.collect(self.records())
             if rid is None:
-                candidates = [r for r in records if r[1] and r[1]["session"] == session and r[1]["state"] != "active"]
+                records = self.collect(self.records())
+                now = time.time()
+                candidates = [r for r in records if r[1] and r[1]["session"] == session
+                              and r[1]["state"] != "active" and not self.expired(r[1], now)]
                 current = {(i["pid"], i["platform"], i["start"]) for i in sanitize_chain(owners) if i["start"]}
                 related = [r for r in candidates if current.intersection(
                     (i["pid"], i["platform"], i["start"]) for i in sanitize_chain(r[1].get("owner_chain")) if i["start"])]
@@ -348,11 +368,14 @@ class Store:
                     raise ReplayError("ambiguous_last: требуется явный --request-id." if candidates else "Replay не найден.")
                 selected = candidates[0]
             else:
-                rid = request_id(rid)
-                selected = next((r for r in records if r[0].name == rid), None)
-                if selected is None:
-                    raise ReplayError("Replay не найден или срок хранения истёк.")
+                try:
+                    selected = self.record(rid)
+                except FileNotFoundError:
+                    raise ReplayError("Replay не найден или срок хранения истёк.") from None
             directory, data, _ = selected
+            if data and self.expired(data, time.time()):
+                self.remove(directory)
+                raise ReplayError("Срок хранения replay истёк.")
             if data and (data["state"] == "active" or data["session"] != session):
                 raise ReplayError("Replay ещё активен или принадлежит другой сессии.")
             complete = bool(data and data["state"] == "completed")

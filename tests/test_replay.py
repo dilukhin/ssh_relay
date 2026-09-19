@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -20,6 +21,36 @@ import ssh_relay_core as core
 import ssh_relay_replay as replay
 import ssh_relay_replay_cli as cli
 import ssh_relay_replay_platform as platform
+
+
+def lock_contender(state, connection, before_unlink=None, resume=None):
+    """Spawn-safe worker: pause after stale identity checks, immediately before unlink."""
+    store = replay.Store(Path(state))
+    unlink = Path.unlink
+    paused = False
+
+    def controlled_unlink(path, *args, **kwargs):
+        nonlocal paused
+        if before_unlink is not None and path == store.root / 'gc.lock' and not paused:
+            paused = True
+            before_unlink.set()
+            if not resume.wait(20):
+                raise RuntimeError('resume timeout')
+        return unlink(path, *args, **kwargs)
+
+    try:
+        with patch.object(Path, 'unlink', controlled_unlink), store.locked():
+            connection.send('acquired')
+            if not connection.poll(20):
+                raise RuntimeError('release timeout')
+            connection.recv()
+    except replay.ReplayError:
+        connection.send('busy')
+    except BaseException as exc:
+        connection.send(type(exc).__name__ + ': ' + str(exc))
+        raise
+    finally:
+        connection.close()
 
 
 class ReplayTests(unittest.TestCase):
@@ -93,6 +124,64 @@ class ReplayTests(unittest.TestCase):
         self.finish(writer)
         with patch.object(replay.time, 'time', return_value=replay.timestamp(writer.data['finished_at_utc']) + 301):
             self.store.gc()
+        self.assertFalse(writer.directory.exists())
+
+    def test_expired_unremovable_is_unreadable_and_still_charged(self):
+        writer = self.writer()
+        writer.capture('stdout', b'expired')
+        self.finish(writer)
+        writer.data['finished_at_utc'] = replay.utc(time.time() - replay.CLEAN_TTL - 10)
+        replay.write_json(writer.directory, writer.data)
+        with patch.object(self.store, 'remove', return_value=False) as remove:
+            for rid in (writer.data['request_id'], None):
+                with self.subTest(rid=rid), self.assertRaises(replay.ReplayError):
+                    self.store.replay(rid=rid, session='test', encoding='utf-8', owners=[])
+            records = self.store.collect(self.store.records())
+            self.assertEqual([(p, size) for p, _, size in records], [(writer.directory, 7)])
+            with patch.object(replay, 'SESSION_LIMIT', replay.REQUEST_LIMIT):
+                with self.assertRaisesRegex(replay.ReplayError, 'бюджета'):
+                    self.writer()
+            self.assertTrue(remove.called)
+        self.assertEqual((writer.directory / 'stdout.bin').read_bytes(), b'expired')
+        self.store.gc()
+        self.assertFalse(writer.directory.exists())
+
+    def test_last_ignores_expired_unremovable_candidate(self):
+        old = self.writer()
+        self.finish(old)
+        live = self.writer()
+        live.capture('stdout', b'live')
+        self.finish(live)
+        old.data['finished_at_utc'] = replay.utc(time.time() - replay.CLEAN_TTL - 10)
+        replay.write_json(old.directory, old.data)
+        with patch.object(self.store, 'remove', return_value=False):
+            result = self.store.replay(rid=None, session='test', encoding='utf-8', owners=[])
+        self.assertEqual(result['request_id'], live.directory.name)
+        self.assertEqual(result['stdout'], 'live')
+
+    def test_partial_cleanup_keeps_expiry_metadata(self):
+        writer = self.writer()
+        writer.capture('stderr', b'expired')
+        self.finish(writer)
+        writer.data['finished_at_utc'] = replay.utc(time.time() - replay.CLEAN_TTL - 10)
+        replay.write_json(writer.directory, writer.data)
+        unlink, iterdir = Path.unlink, Path.iterdir
+
+        def refuse_raw(path, *args, **kwargs):
+            if path == writer.directory / 'stderr.bin':
+                raise PermissionError('sharing violation')
+            return unlink(path, *args, **kwargs)
+
+        def metadata_first(path):
+            return iter(sorted(iterdir(path), key=lambda p: p.name != 'metadata.json'))
+
+        with patch.object(Path, 'unlink', refuse_raw), patch.object(Path, 'iterdir', metadata_first):
+            for _ in range(2):
+                with self.assertRaisesRegex(replay.ReplayError, 'истёк'):
+                    self.read(writer)
+                self.assertTrue((writer.directory / 'metadata.json').is_file())
+                self.assertEqual(self.store.records()[0][2], 7)
+        self.store.gc()
         self.assertFalse(writer.directory.exists())
 
     def test_unknown_and_abandoned_remain_partial(self):
@@ -184,6 +273,24 @@ class ReplayTests(unittest.TestCase):
         with self.assertRaises(replay.ReplayError):
             self.writer()
 
+    def test_explicit_read_isolated_from_other_problem_directory(self):
+        good = self.writer()
+        good.capture('stdout', b'good')
+        self.finish(good)
+        bad = self.writer()
+        self.finish(bad)
+        (bad.directory / 'unknown').write_bytes(b'leave alone')
+        before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in bad.directory.iterdir()}
+        self.assertEqual(self.read(good)['stdout'], 'good')
+        with self.assertRaises(replay.ReplayError):
+            self.read(bad)
+        with self.assertRaises(replay.ReplayError):
+            self.store.replay(rid=None, session='test', encoding='utf-8', owners=[])
+        with self.assertRaises(replay.ReplayError):
+            self.writer()
+        self.store.gc()
+        self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in bad.directory.iterdir()})
+
     @unittest.skipIf(os.name == 'nt', 'POSIX modes и symlink')
     def test_private_modes_symlink_and_hardlink(self):
         writer = self.writer()
@@ -244,6 +351,99 @@ class ReplayTests(unittest.TestCase):
             result = subprocess.run([sys.executable, '-c', script, str(self.state)], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('acquired', result.stdout)
+
+    def start_lock_contender(self, context, *pause):
+        receiver, sender = context.Pipe()
+        worker = context.Process(target=lock_contender, args=(str(self.state), sender, *pause))
+        worker.start()
+        sender.close()
+
+        def cleanup():
+            if not worker._closed:
+                try:
+                    receiver.send('release')
+                except (BrokenPipeError, OSError):
+                    pass
+                worker.join(5)
+                if worker.is_alive():
+                    worker.terminate()
+                    worker.join(5)
+                worker.close()
+            receiver.close()
+        self.addCleanup(cleanup)
+        return worker, receiver
+
+    def lock_result(self, receiver):
+        self.assertTrue(receiver.poll(20), 'lock contender did not report')
+        return receiver.recv()
+
+    def test_stale_lock_recovery_serializes_processes_before_unlink(self):
+        self.store.prepare()
+        # A real exited process supplies a strong identity for the stale lock.
+        script = 'import os,json; from ssh_relay_replay_platform import process_identity; print(json.dumps(process_identity(os.getpid())))'
+        dead = json.loads(subprocess.check_output([sys.executable, '-c', script], text=True))
+        self.assertIs(platform.alive(dead), False)
+        with replay.open_file(self.store.root / 'gc.lock', create=True, write=True) as stream:
+            replay.write_all(stream, json.dumps({'owner': dead}).encode())
+        context = multiprocessing.get_context('spawn')
+        paused, resume = context.Event(), context.Event()
+        b, b_result = self.start_lock_contender(context, paused, resume)
+        self.addCleanup(resume.set)
+        self.assertTrue(paused.wait(20), 'B did not reach stale unlink')
+        a, a_result = self.start_lock_contender(context)
+        a_status = self.lock_result(a_result)
+        resume.set()
+        b_status = self.lock_result(b_result)
+        self.assertEqual((a_status, b_status), ('busy', 'acquired'),
+                         'stale recovery allowed simultaneous lock owners')
+        b_result.send('release')
+        for worker in (a, b):
+            worker.join(20)
+            self.assertEqual(worker.exitcode, 0)
+        with self.store.locked():
+            pass
+
+    def test_kernel_guard_released_after_process_death(self):
+        self.store.prepare()
+        context = multiprocessing.get_context('spawn')
+        worker, result = self.start_lock_contender(context)
+        self.assertEqual(self.lock_result(result), 'acquired')
+        worker.terminate()
+        worker.join(20)
+        self.assertFalse(worker.is_alive())
+        worker.close()  # Release the Windows process handle before testing strong death.
+        with self.store.locked():
+            pass
+
+    def test_guard_is_persistent_and_rejects_same_process_reentry(self):
+        self.store.prepare()
+        guard = self.store.root / 'gc.guard'
+        with self.store.locked():
+            first = guard.stat()
+            with self.assertRaises(replay.ReplayError):
+                with self.store.locked():
+                    self.fail('second descriptor acquired guard')
+            # Closing the rejected descriptor must not release the first lock.
+            context = multiprocessing.get_context('spawn')
+            worker, result = self.start_lock_contender(context)
+            self.assertEqual(self.lock_result(result), 'busy')
+            worker.join(20)
+            self.assertEqual(worker.exitcode, 0)
+        with self.store.locked():
+            second = guard.stat()
+            self.assertEqual((first.st_dev, first.st_ino), (second.st_dev, second.st_ino))
+        self.assertTrue(guard.is_file())
+
+    def test_unsafe_guard_fails_closed(self):
+        self.store.prepare()
+        guard = self.store.root / 'gc.guard'
+        with replay.open_file(guard, create=True, write=True):
+            pass
+        os.link(guard, self.store.root / 'guard-alias')
+        with self.assertRaises(replay.ReplayError):
+            with self.store.locked():
+                self.fail('hardlinked guard was accepted')
+        self.assertFalse((self.store.root / 'gc.lock').exists())
 
     def test_pid_reuse_and_weak_identity(self):
         identity = {'pid': 1234, 'platform': 'linux', 'start': 'abc:1'}

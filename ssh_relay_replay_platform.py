@@ -12,6 +12,24 @@ class ReplayError(Exception):
     """Безопасная диагностическая ошибка без содержимого команды и вывода."""
 
 
+def lock_guard(fd: int) -> None:
+    """Неблокирующий OS lock; вызывающий держит fd открытым до конца участка.
+
+    Файл никогда не удаляется/заменяется. Закрытие fd (в том числе смерть
+    процесса) освобождает lock. Windows допускает диапазон за концом файла.
+    """
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, ImportError):
+        raise ReplayError("Хранилище replay занято или OS lock недоступен.") from None
+
+
 def _windows():
     from ctypes import wintypes as w
     k = ctypes.WinDLL("kernel32", use_last_error=True)
