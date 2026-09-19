@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ssh_relay_replay_cli as replay_cli
 import json
 import sys
 import threading
@@ -142,6 +143,7 @@ def _apply_session_identity(result: dict[str, Any], session: dict[str, Any]) -> 
 
 
 def _print_machine_result(result: dict[str, Any], exit_code: int) -> int:
+    result.update(replay_cli.client_fields())
     result["finished_at_utc"] = _utc_now()
     sys.stdout.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n")
     return exit_code
@@ -494,3 +496,4 @@ def install(core: Any) -> None:
     core.request_daemon = request_daemon
     core.execute_remote_command = execute_remote_command
     core._machine_outcomes_installed = True
+

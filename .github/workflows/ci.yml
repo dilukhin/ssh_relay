@@ -24,7 +24,7 @@ jobs:
           python-version: "3.12"
 
       - name: Установить Paramiko
-        run: python -m pip install --disable-pip-version-check paramiko
+        run: python -m pip install --disable-pip-version-check paramiko coverage==7.15.4
 
       - name: Проверить синтаксис
         run: >-
@@ -58,31 +58,41 @@ jobs:
           tests/test_transfers.py
 
       - name: Проверить session control-plane
-        run: python -m unittest discover -s tests -p "test_*session*.py" -v
+        run: python -m coverage run -m unittest discover -s tests -p "test_*session*.py" -v
+
+      - name: Проверить двоичный replay и приватное хранилище
+        run: python -m coverage run -m unittest discover -s tests -p "test_replay*.py" -v
 
       - name: Проверить exec и reconnect
-        run: python -m unittest discover -s tests -p "test_core*.py" -v
+        run: python -m coverage run -m unittest discover -s tests -p "test_core*.py" -v
 
       - name: Проверить security-контракт
-        run: python -m unittest discover -s tests -p "test_security*.py" -v
+        run: python -m coverage run -m unittest discover -s tests -p "test_security*.py" -v
 
       - name: Проверить настоящий loopback SSH
-        run: python -m unittest discover -s tests -p "test_real_ssh_integration.py" -v
+        run: python -m coverage run -m unittest discover -s tests -p "test_real_ssh_integration.py" -v
 
       - name: Проверить настоящий loopback SFTP
-        run: python -m unittest discover -s tests -p "test_real_sftp_integration.py" -v
+        run: python -m coverage run -m unittest discover -s tests -p "test_real_sftp_integration.py" -v
 
       - name: Проверить публичный CLI-контракт
-        run: python -m unittest discover -s tests -p "test_cli*.py" -v
+        run: python -m coverage run -m unittest discover -s tests -p "test_cli*.py" -v
 
       - name: Проверить hardening локального протокола
-        run: python -m unittest discover -s tests -p "test_protocol_hardening.py" -v
+        run: python -m coverage run -m unittest discover -s tests -p "test_protocol_hardening.py" -v
 
       - name: Проверить stop/status при занятом daemon
-        run: python -m unittest discover -s tests -p "test_daemon_busy_shutdown.py" -v
+        run: python -m coverage run -m unittest discover -s tests -p "test_daemon_busy_shutdown.py" -v
 
       - name: Проверить transfer client logic
-        run: python -m unittest discover -s tests -p "test_transfers.py" -v
+        run: python -m coverage run -m unittest discover -s tests -p "test_transfers.py" -v
+
+      - name: Сохранить Windows coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-windows
+          path: .coverage.*
+          include-hidden-files: true
 
   ubuntu-tests:
     name: Ubuntu full tests
@@ -138,5 +148,38 @@ jobs:
       - name: Объединить coverage дочерних Python-процессов
         run: python -m coverage combine
 
-      - name: Проверить subprocess-aware coverage production-модулей
-        run: python -m coverage report
+      - name: Показать покрытие Ubuntu (общий порог проверяется после объединения ОС)
+        run: python -m coverage report --fail-under=0
+
+      - name: Сохранить Ubuntu coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-ubuntu
+          path: .coverage
+          include-hidden-files: true
+
+  cross-platform-coverage:
+    name: Combined Windows and Ubuntu coverage
+    needs: [windows-control-plane, ubuntu-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check coverage==7.15.4
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-windows
+          path: coverage-windows
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage-ubuntu
+          path: coverage-ubuntu
+      - name: Подготовить coverage Ubuntu для объединения
+        run: mv coverage-ubuntu/.coverage coverage-ubuntu/.coverage.ubuntu
+      - name: Проверить общий branch coverage без снижения порога
+        run: |
+          python -m coverage combine coverage-windows coverage-ubuntu
+          python -m coverage report
+
