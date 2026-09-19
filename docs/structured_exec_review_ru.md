@@ -2,13 +2,13 @@
 
 Дата: 2026-09-19. Задача: [#47](https://github.com/dilukhin/ssh_relay/issues/47).
 
-Статус: **проектное предложение для согласования; новый интерфейс исполнения не реализован**.
+Статус: **техническая сверка с конкретным локальным потребителем выполнена; предложения к фиксации границы передачи разрешения ниже; новый интерфейс исполнения не реализован**.
 
 ## 1. Решение
 
-На текущем этапе сохранить строковый API ssh_relay. **Отложить удалённый помощник и RemoteProcessSpec**, пока agent-safe#25 не задаст конкретный структурированный вход и корпус сценариев, которым недостаточно существующих средств. Отдельные exec-script/sudo-exec-script не возвращать.
+На текущем этапе сохранить строковый API ssh_relay. **Отложить удалённый помощник и RemoteProcessSpec** до отдельного удалённого потребителя и корпуса сценариев, которым недостаточно существующих средств. Конкретный локальный ProcessSpec уже появился в agent-safe#28/#31; он не требует SSH и достаточен для начала локального сопоставления с разрешениями. Отдельные exec-script/sudo-exec-script не возвращать.
 
-Первый следующий шаг — локальный ProcessSpec в agent-safe, прежде всего для verify/rollback/receipt, и совместная проверка его полей с opencode_permissions#34. Это устраняет доказанный строковый разбор у потребителя без обязательного изменения relay. Удалённую часть можно отложить независимо от локальной.
+Первый следующий шаг — связать внутренние локальные recover и их verify из agent-safe#31 с opencode_permissions#34; публичные verify/receipt/main-spec остаются отдельной частью agent-safe#25A. Публичные структурированные входы затем устранят доказанный строковый разбор у потребителя без обязательного изменения relay. Удалённую часть можно отложить независимо от локальной.
 
 Для существующих коротких shell-команд использовать нынешний exec. Передавать готовую строку одним аргументом локальному процессу, без лишней оболочки. При необходимости точного многострочного файла рассматривать имеющийся upload + явный exec как отдельную процедуру с собственной проверкой и очисткой. Это не универсальное решение для секретов или risky-квитанций.
 
@@ -18,15 +18,15 @@
 
 | Источник | Проверенная версия | Факт |
 | --- | --- | --- |
-| ssh_relay main | [84f69d6](https://github.com/dilukhin/ssh_relay/commit/84f69d6d679dae843bd31542c2593cf68f91c068) | Строковый exec/sudo-exec и machine/receipt v1 |
-| [ssh_relay_core.py](https://github.com/dilukhin/ssh_relay/blob/84f69d6d679dae843bd31542c2593cf68f91c068/ssh_relay_core.py) | Тот же SHA | request_daemon передаёт command в JSON; execute_remote_command вызывает channel.exec_command(command); stdin_data — внутренний параметр |
-| [ssh_relay_p0_contract.py](https://github.com/dilukhin/ssh_relay/blob/84f69d6d679dae843bd31542c2593cf68f91c068/ssh_relay_p0_contract.py) | Тот же SHA | Capability receipts проверяется до risky-команды; после возможной доставки неопределённость сохраняется |
-| [MACHINE_CONTRACT.md](https://github.com/dilukhin/ssh_relay/blob/84f69d6d679dae843bd31542c2593cf68f91c068/MACHINE_CONTRACT.md) | Тот же SHA | command_hash — SHA-256 точных UTF-8 байтов command string; коды 0/10/11/12/13 |
+| ssh_relay main | [9797551](https://github.com/dilukhin/ssh_relay/commit/9797551bd27889fbdf5567cb1fbbfa2a229dde75) | Строковый exec/sudo-exec и machine/receipt v1 |
+| [ssh_relay_core.py](https://github.com/dilukhin/ssh_relay/blob/9797551bd27889fbdf5567cb1fbbfa2a229dde75/ssh_relay_core.py) | Тот же SHA | request_daemon передаёт command в JSON; execute_remote_command вызывает channel.exec_command(command); stdin_data — внутренний параметр |
+| [ssh_relay_p0_contract.py](https://github.com/dilukhin/ssh_relay/blob/9797551bd27889fbdf5567cb1fbbfa2a229dde75/ssh_relay_p0_contract.py) | Тот же SHA | Capability receipts проверяется до risky-команды; после возможной доставки неопределённость сохраняется |
+| [MACHINE_CONTRACT.md](https://github.com/dilukhin/ssh_relay/blob/9797551bd27889fbdf5567cb1fbbfa2a229dde75/MACHINE_CONTRACT.md) | Тот же SHA | command_hash — SHA-256 точных UTF-8 байтов command string; коды 0/10/11/12/13 |
 | [agent-safe SSH adapter](https://github.com/dilukhin/agent-safe/blob/9f92c3953d061882aba5c5545465c5490bfbb110/src/agent_safe/adapters/ssh_relay.py) | master@9f92c3953d061882aba5c5545465c5490bfbb110 | build_relay_command возвращает list[str], remote_command — один элемент; _run_machine вызывает subprocess.run без shell=True |
 | [agent-safe exec adapter](https://github.com/dilukhin/agent-safe/blob/9f92c3953d061882aba5c5545465c5490bfbb110/src/agent_safe/adapters/exec_adapter.py) | Тот же SHA | Основная команда уже list[str]; verify/receipt проходят _split_shell_command, rollback хранится строкой для ручного восстановления |
-| [opencode_permissions, предварительное сопоставление](https://github.com/dilukhin/opencode_permissions/blob/6594a93f8768a4500a7a3e001bee3af571070695/docs/structured_invocation_mapping_ru.md) | PR #36, HEAD 6594a93f8768a4500a7a3e001bee3af571070695 | ProcessSpec не равен доверенным facts; существующая проекция не связывает произвольные env/stdin/helper автоматически |
+| [opencode_permissions, предварительное сопоставление](https://github.com/dilukhin/opencode_permissions/blob/4b123fb8cd067ca9cf43c726747e8c1edbb628f3/docs/structured_invocation_mapping_ru.md) | PR #36, HEAD 4b123fb8cd067ca9cf43c726747e8c1edbb628f3 | ProcessSpec не равен доверенным facts; существующая проекция не связывает произвольные env/stdin/helper автоматически |
 
-PR #46 (replay) при проверке открыт, HEAD fd94134919bc69d86de8881abe56bc1601ec19ff; PR #48 исправляет argparse отдельно. Этот документ не является ревью всей их реализации. Replay повторно декодирует сохранённый вывод, не исправляет входные аргументы и не повторяет команду.
+PR #46 (replay) и PR #48 (argparse) слиты; текущий main@9797551bd27889fbdf5567cb1fbbfa2a229dde75 содержит версию 0.10.1. Совмещённый HEAD #48 — 0c04a7b84adeb5b259aa96e828262715fc97b8dd; 240 локальных тестов (2 платформенных пропуска) и все 5 заданий CI успешны. #44 и #45 закрыты. Этот документ не является ревью всей их реализации. Replay повторно декодирует сохранённый вывод, не исправляет входные аргументы и не повторяет команду.
 
 ## 3. Где возникают ошибки
 
@@ -74,7 +74,7 @@ PR #46 (replay) при проверке открыт, HEAD fd94134919bc69d86de88
 
 | Данные | Владелец/граница | Требование к будущему remote-профилю |
 | --- | --- | --- |
-| program, argv, cwd | agent-safe producer + доверенный исполнитель | Уточнить argv[0]; сохранить порядок, пустые элементы, точное значение и выбранный executable/cwd |
+| program, argv, cwd | agent-safe producer + доверенный исполнитель | Локальный argv не содержит program; после раскрытия ссылок на артефакты проекция использует [program, *resolved_argv] ровно один раз. Удалённая схема отдельно не утверждена |
 | env | Producer объявляет зависимости; opencode_permissions связывает значимые факты | Не пересылать полное окружение; неизвестные значимые поля не игнорировать |
 | stdin / script | Producer и исполнитель | Ограниченные точные bytes; отсутствие stdin и пустой stdin различать, если это влияет на результат |
 | Session, endpoint, host key, SSH user | relay/SSH transport | Имя сессии и host-label не являются доказанной идентичностью узла; нужен факт от аутентифицированного транспорта и согласованное связывание с авторизацией |
@@ -84,7 +84,34 @@ PR #46 (replay) при проверке открыт, HEAD fd94134919bc69d86de88
 | transaction_id/receipt_id/request_id | Существующие владельцы correlation | Разные назначения; ни один ID не разрешает повтор действия |
 | Проверка результата/recovery | agent-safe | Relay сообщает исход, не выбирает rollback и не повторяет risky-команду |
 
-Предварительное сопоставление opencode_permissions PR #36 совместимо с этим выбором **на уровне границ**: remote slice отложен, новая схема не зафиксирована. Это не финальное межпроектное согласование. _process_operation не переносит произвольные stdin/env/helper в identity; такой вход нельзя объявить parsed-simple/v1 с parser.status=exact. Неизвестные существенные поля требуют отказа/не-ALLOW по действующим правилам.
+Обновлённое сопоставление opencode_permissions PR #36 и принятый локальный вариант agent-safe#28 совместимы с этим выбором: удалённый этап отложен, локальное согласование не ждёт relay. Это подтверждённая совместимость архитектурных границ; готовность адаптера разрешений и совместные проверки исполнения пока не подтверждены. _process_operation не переносит произвольные stdin/env/helper в identity; такой вход нельзя объявить parsed-simple/v1 с parser.status=exact. Неизвестные существенные поля требуют отказа/не-ALLOW по действующим правилам.
+
+### 6.1. Сверка конкретного локального потребителя
+
+| Источник | Проверенный SHA | Подтверждённое состояние |
+| --- | --- | --- |
+| [agent-safe#28, принятое решение](https://github.com/dilukhin/agent-safe/blob/4c6d28a6c06e53c6b178dcad55c39ae59b0c7d37/docs/PROCESS_RECOVERY_DESIGN.md) | `4c6d28a6c06e53c6b178dcad55c39ae59b0c7d37` | Локальный вариант принят пользователем; SSH отложен; PR не слит на момент сверки |
+| [ProcessSpec](https://github.com/dilukhin/agent-safe/blob/40a1fdf3d9f25f84608a3c9c9b0c1f5d8f6086f9/src/agent_safe/core/process_spec.py) и [раскрытие артефактов](https://github.com/dilukhin/agent-safe/blob/40a1fdf3d9f25f84608a3c9c9b0c1f5d8f6086f9/src/agent_safe/core/rollback.py) | `40a1fdf3d9f25f84608a3c9c9b0c1f5d8f6086f9` | Строгая v1; argv без program, ссылки целиком заменяются путями копий; непустые env_dependencies отклоняются |
+| [recover и verify](https://github.com/dilukhin/agent-safe/blob/40a1fdf3d9f25f84608a3c9c9b0c1f5d8f6086f9/src/agent_safe/adapters/recover.py) и [исполнитель](https://github.com/dilukhin/agent-safe/blob/40a1fdf3d9f25f84608a3c9c9b0c1f5d8f6086f9/src/agent_safe/adapters/exec_adapter.py) | Тот же SHA, PR #31 открыт | Два отдельных запуска с повторной проверкой комплекта. Вызова opencode_permissions нет; локальный --approved не является разрешением управляемой интеграции |
+| [mapping #34](https://github.com/dilukhin/opencode_permissions/blob/4b123fb8cd067ca9cf43c726747e8c1edbb628f3/docs/structured_invocation_mapping_ru.md) | `4b123fb8cd067ca9cf43c726747e8c1edbb628f3` | Локальный потребитель сопоставлен; остаются точная граница передачи решения, представления зависимостей и совместные проверки |
+| [identity core](https://github.com/dilukhin/opencode_permissions/blob/7922d612f244882aae3d843a64393b1363b593d9/tools/normalized_operation_identity.py) | `7922d612f244882aae3d843a64393b1363b593d9` | op-jcs-v1 ограничивает целые числа диапазоном I-JSON; новый канонизатор не требуется |
+
+Сверка статическая, по содержимому документов и исходников. Ни один соседний PR не считается слитым по наличию кода в его ветке. Новые Windows/SSH/stdin-проверки этим согласованием не заявляются.
+
+### 6.2. Предлагаемые решения для следующего локального этапа
+
+Эти пункты конкретизируют предложение для владельцев agent-safe#25A и opencode_permissions#34; реализация адаптера и окончательная схема ими ещё не заменяются.
+
+| Вопрос | Предлагаемое решение | Владелец и критерий приёмки |
+| --- | --- | --- |
+| Что именно разрешается | После load_bundle и resolved_spec подготовить неизменяемые факты конкретной роли. Привязать решение к одному вызову; непосредственно перед каждым spawn повторно проверить факты. Recover и verify имеют отдельные привязки; разрешение исходной mutation не наследуется | agent-safe предоставляет факты и проверяет исполнение; opencode_permissions владеет решением и связью с вызовом. Подмена spec/артефакта/роли и повтор чужого разрешения должны остановиться до spawn |
+| Идентичность файлов | Использовать профиль с явной версией и именованными stat-компонентами; большие целые передавать точными десятичными строками. Точную кодировку строки object_identity зафиксировать в адаптере; не менять op-jcs-v1 и не округлять наносекунды | opencode_permissions#34 совместно с resolver agent-safe: одинаковые факты дают одинаковую identity; изменение любого значимого компонента даёт другую. Не использовать Python repr или идентичность, заявленную вызывающим |
+| stdin и переводы строк | Для structured-пути выбрать точные UTF-8 bytes без платформенного изменения LF/CRLF. Отсутствие stdin = DEVNULL; присутствующая пустая строка = пустой PIPE. Связывать именно фактически передаваемые bytes и mode | agent-safe: побайтовые Windows/Linux-проверки LF, CRLF, Unicode, пустого ввода и DEVNULL. Сейчас _run использует text=True: гарантия точных bytes не подтверждена, требует проверки/поправки до binding |
+| Артефакты, timeout, env | После раскрытия ссылок связывать сохранённый путь, ID, размер и digest каждого значимого артефакта, mode/content stdin и целый timeout. Неподдерживаемые env/секретные/удалённые поля отклонять явно | opencode_permissions#34 определяет строгий профиль, agent-safe повторно проверяет использованные копии. Декларация non_secret:true, shell=false, Python -I и пустой env_dependencies не доказывают безопасность скрипта |
+
+Digest идентифицирует данные, но не выдаёт разрешение и не разрешает повтор. Неизвестные эффекты остаются non-ALLOW; native DENY/ASK и действующий P0 не расширяются. Выбор точных UTF-8 bytes относится к новому structured-пути и не меняет прежний строковый CLI.
+
+**Результат для ssh_relay:** текущему локальному потребителю не нужны новые команды или capability. Блокирующей зависимости локального этапа от #47 нет. Удалённый ProcessSpec нельзя выдавать за реализованный или передавать через тихую сборку shell string.
 
 ## 7. Если помощник всё-таки потребуется
 
@@ -113,14 +140,14 @@ PR #46 (replay) при проверке открыт, HEAD fd94134919bc69d86de88
 
 ## 8. Минимальный план и критерии возврата
 
-1. Завершить #44/PR #46 и #45/PR #48 в принятом порядке; этот документ не блокирует их и не расширяет их объём.
-2. Получить конкретный draft agent-safe#25: структура входа, способ запуска CLI/API, verify/rollback/receipt, ответственность за повторную проверку перед выполнением.
-3. До окончательной схемы сверить draft с opencode_permissions#34/PR #36. На текущем этапе выбрать локальный путь; не добавлять remote env/stdin/helper только ради полноты схемы.
+1. #44/PR #46 и #45/PR #48 завершены. Этот документ не расширяет их объём.
+2. Зафиксировать в agent-safe#25A и opencode_permissions#34 решения §6.2 на базе уже имеющегося локального потребителя #31. Публичные main/verify/receipt входы не являются условием начала этой узкой интеграции.
+3. Следующий implementation PR принадлежит локальным владельцам: подготовка доверенных фактов → решение/привязка → проверка перед каждым запуском. Проверить дрейф argv/cwd/артефактов/stdin/timeout, точные bytes и неизменность DENY/ASK; удалённый транспорт остаётся отложенным.
 4. Если есть реальные ошибки удалённого вызова, воспроизвести их на Windows-клиенте через установленный CLI и точный SHA: отдельно cmd.exe, PowerShell и программный argv. Сначала короткие безопасные команды и искусственные данные; production-команду ради проверки не повторять.
 5. Если сбой только на локальной границе command string — узкий design --command-file, без нового daemon endpoint. Если требуются именно remote argv/stdin и существующий shell workload неприемлем — вернуться к помощнику по §7.
 6. При выборе реализации: отдельный PR после согласования; проверить пробелы/кавычки/Unicode/пустой argv/JSON/newline stdin/non-zero exit, missing helper/version mismatch, разрыв до/после возможного запуска, risky receipt и unknown без retry. Старые text/JSON/replay contracts должны сохраниться.
 
-Итог этой итерации: **defer remote structured implementation; сохранить существующий API; сначала конкретизировать локального потребителя**. #47 не закрывается автоматически этим предложением: остаются согласование выбора и конкретного следующего этапа с draft agent-safe#25. Закрытие #27/#28 не объявляется реализацией их первоначальных идей.
+Итог этой итерации: **удалённую structured-реализацию отложить; существующий API сохранить; локальный потребитель достаточно конкретен для согласования границы разрешения**. #47 остаётся открытой до принятия результата исследования; PR #49 сохраняется как проверяемое предложение. Следующий локальный этап и его владельцы определены в §6.2 и не ждут нового relay API. Закрытие #27/#28 не объявляется реализацией их первоначальных идей.
 
 ## 9. Воспроизведение локального опыта
 
