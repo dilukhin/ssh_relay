@@ -370,6 +370,35 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(platform.sanitize_chain([dict(pid=2, platform='linux', start='bad value')]), [])
         self.assertIsNone(platform.alive(None))
 
+    def test_short_writes_are_completed_or_rejected(self):
+        class ShortWriter:
+            def __init__(self):
+                self.data = bytearray()
+            def write(self, data):
+                self.data.extend(data[:2])
+                return min(2, len(data))
+        stream = ShortWriter()
+        replay.write_all(stream, b'abcdef')
+        self.assertEqual(stream.data, b'abcdef')
+        with patch.object(stream, 'write', return_value=0):
+            with self.assertRaises(OSError):
+                replay.write_all(stream, b'x')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows ACL')
+    def test_windows_public_acl_is_refused_without_repair(self):
+        writer = self.writer()
+        result = subprocess.run(['icacls', str(writer.directory), '/grant', '*S-1-1-0:(OI)(CI)R'], capture_output=True)
+        self.assertEqual(result.returncode, 0)
+        with self.assertRaises(replay.ReplayError):
+            platform.windows_private(writer.directory)
+
+    def test_sharing_violation_leaves_record_for_later_gc(self):
+        writer = self.writer()
+        self.finish(writer)
+        with patch.object(Path, 'unlink', side_effect=PermissionError('sharing violation')):
+            self.assertFalse(self.store.remove(writer.directory))
+        self.assertTrue(writer.directory.exists())
+
     def test_disabled_and_unavailable_do_not_capture(self):
         request = {'request_id': str(uuid.uuid4()), 'no_replay': True}
         self.assertIsNone(cli.begin(core, request, {}))

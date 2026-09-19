@@ -28,7 +28,11 @@ def _windows():
         (a, "ConvertSidToStringSidW", [ctypes.c_void_p, ctypes.POINTER(w.LPWSTR)], w.BOOL),
         (a, "ConvertStringSecurityDescriptorToSecurityDescriptorW", [w.LPCWSTR, w.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p], w.BOOL),
         (a, "GetFileSecurityW", [w.LPCWSTR, w.DWORD, ctypes.c_void_p, w.DWORD, ctypes.POINTER(w.DWORD)], w.BOOL),
-        (a, "ConvertSecurityDescriptorToStringSecurityDescriptorW", [ctypes.c_void_p, w.DWORD, w.DWORD, ctypes.POINTER(w.LPWSTR), ctypes.c_void_p], w.BOOL),
+        (a, "ConvertStringSidToSidW", [w.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)], w.BOOL),
+        (a, "GetSecurityDescriptorOwner", [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(w.BOOL)], w.BOOL),
+        (a, "GetSecurityDescriptorDacl", [ctypes.c_void_p, ctypes.POINTER(w.BOOL), ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(w.BOOL)], w.BOOL),
+        (a, "GetAce", [ctypes.c_void_p, w.DWORD, ctypes.POINTER(ctypes.c_void_p)], w.BOOL),
+        (a, "EqualSid", [ctypes.c_void_p, ctypes.c_void_p], w.BOOL),
     ]
     for lib, name, args, result in declarations:
         fn = getattr(lib, name)
@@ -81,28 +85,44 @@ def windows_private(path: Path, *, create: bool = False) -> None:
     buf = ctypes.create_string_buffer(length.value)
     if not a.GetFileSecurityW(str(path), 5, buf, len(buf), ctypes.byref(length)):
         raise ReplayError("Не удалось проверить ACL replay.")
-    value = w.LPWSTR()
-    if not a.ConvertSecurityDescriptorToStringSecurityDescriptorW(buf, 1, 5, ctypes.byref(value), None):
-        raise ReplayError("Не удалось проверить ACL replay.")
+    # Сравниваем бинарные SID: SDDL может сокращать SID владельца до LA и других псевдонимов.
+    trusted = []
     try:
-        sddl = value.value
+        for name in (sid, "S-1-5-18", "S-1-5-32-544"):
+            pointer = ctypes.c_void_p()
+            if not a.ConvertStringSidToSidW(name, ctypes.byref(pointer)):
+                raise ReplayError("Не удалось проверить SID replay.")
+            trusted.append(pointer)
+        owner, acl = ctypes.c_void_p(), ctypes.c_void_p()
+        defaulted, present = w.BOOL(), w.BOOL()
+        if not a.GetSecurityDescriptorOwner(buf, ctypes.byref(owner), ctypes.byref(defaulted)):
+            raise ReplayError("Не удалось проверить владельца replay.")
+        if not owner or not any(a.EqualSid(owner, value) for value in trusted):
+            raise ReplayError("Не подтверждён владелец каталога replay.")
+        if not a.GetSecurityDescriptorDacl(buf, ctypes.byref(present), ctypes.byref(acl), ctypes.byref(defaulted)):
+            raise ReplayError("Не удалось проверить DACL replay.")
+        if not present.value or not acl.value:
+            raise ReplayError("Replay требует приватную DACL.")
+        count = ctypes.c_ushort.from_address(acl.value + 4).value
+        owner_access = False
+        for index in range(count):
+            ace = ctypes.c_void_p()
+            if not a.GetAce(acl, index, ctypes.byref(ace)):
+                raise ReplayError("Не удалось прочитать ACE replay.")
+            header = ctypes.string_at(ace, 4)
+            if header[0] != 0 or int.from_bytes(header[2:4], "little") < 16:
+                raise ReplayError("Неподдерживаемая запись ACL replay.")
+            trustee = ctypes.c_void_p(ace.value + 8)
+            if not any(a.EqualSid(trustee, value) for value in trusted):
+                raise ReplayError("Replay доступен посторонним пользователям.")
+            mask = ctypes.c_uint32.from_address(ace.value + 4).value
+            if a.EqualSid(trustee, trusted[0]) and not header[1] & 8:
+                owner_access |= mask & 0x1f01ff == 0x1f01ff or bool(mask & 0x10000000)
+        if not owner_access:
+            raise ReplayError("Не подтверждены права владельца replay.")
     finally:
-        k.LocalFree(value)
-    owner = re.match(r"O:(.*?)D:", sddl)
-    if not owner or owner.group(1) not in {sid, "SY", "BA"}:
-        raise ReplayError("Не подтверждён владелец каталога replay.")
-    entries = re.findall(r"\(([^()]*)\)", sddl)
-    # Принимается только понятная allow-only ACL для владельца и системных администраторов.
-    if not entries or "NO_ACCESS_CONTROL" in sddl:
-        raise ReplayError("Replay требует приватную ACL.")
-    owner_access = False
-    for entry in entries:
-        fields = entry.split(";")
-        if len(fields) != 6 or fields[0] != "A" or fields[5] not in {sid, "SY", "BA"}:
-            raise ReplayError("Replay доступен посторонним пользователям или ACL не поддерживается.")
-        owner_access |= fields[5] == sid and fields[2] == "FA" and "IO" not in fields[1]
-    if not owner_access:
-        raise ReplayError("Не подтверждены права владельца replay.")
+        for pointer in trusted:
+            k.LocalFree(pointer)
 
 
 def check_path(path: Path, *, directory: bool, private: bool = True) -> os.stat_result:

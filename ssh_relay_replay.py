@@ -73,6 +73,16 @@ def open_file(path: Path, *, create: bool = False, write: bool = False):
         raise
 
 
+def write_all(stream, data: bytes) -> None:
+    """FileIO может подтвердить только часть записи; нельзя считать её целой."""
+    pending = memoryview(data)
+    while pending:
+        written = stream.write(pending)
+        if not written:
+            raise OSError("Неполная запись replay.")
+        pending = pending[written:]
+
+
 def read_json(path: Path) -> dict:
     with open_file(path) as stream:
         data = stream.read(METADATA_LIMIT + 1)
@@ -97,7 +107,7 @@ def write_json(directory: Path, data: dict) -> None:
         check_path(temporary, directory=False)
         temporary.unlink()
     with open_file(temporary, create=True, write=True) as output:
-        output.write(encoded)
+        write_all(output, encoded)
         os.fsync(output.fileno())
     target = directory / "metadata.json"
     if target.exists():
@@ -147,7 +157,7 @@ class Store:
                 path.unlink()
         inode = os.fstat(stream.fileno())
         try:
-            stream.write(data)
+            write_all(stream, data)
             os.fsync(stream.fileno())
             inode = os.fstat(stream.fileno())
             yield
@@ -393,7 +403,7 @@ class Writer:
                 size = output.seek(0, 2)
                 if len(chunk) >= STREAM_LIMIT:
                     output.seek(0)
-                    output.write(chunk[-STREAM_LIMIT:])
+                    write_all(output, chunk[-STREAM_LIMIT:])
                     output.truncate(STREAM_LIMIT)
                 else:
                     drop = max(0, size + len(chunk) - STREAM_LIMIT)
@@ -403,10 +413,10 @@ class Writer:
                             output.seek(offset)
                             block = output.read(min(65536, size - offset))
                             output.seek(offset - drop)
-                            output.write(block)
+                            write_all(output, block)
                             offset += len(block)
                     output.seek(size - drop)
-                    output.write(chunk)
+                    write_all(output, chunk)
                     output.truncate()
         except (OSError, ReplayError):
             self.failed = True
