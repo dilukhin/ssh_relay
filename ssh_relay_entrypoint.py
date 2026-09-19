@@ -54,11 +54,8 @@ def main() -> int:
     import ssh_relay
 
     if sys.argv[1:2] == ["daemon"]:
-        from ssh_relay_logging import install_daemon_timestamp_streams
-
-        install_daemon_timestamp_streams()
         # Старый --detach повторно запускает путь из ssh_relay.__file__.
-        # Направляем его на launcher, который также включает timestamp-потоки.
+        # Launcher настраивает кодировку; метки включает обработчик daemon.
         ssh_relay.__file__ = str(Path(__file__).with_name("ssh_relay_daemon_launcher.py"))
 
     return int(ssh_relay.main())

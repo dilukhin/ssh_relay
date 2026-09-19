@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 import argparse
 import base64
@@ -69,6 +69,11 @@ def parse_tail_bytes(value: str) -> int:
 
 def daemon(args: argparse.Namespace) -> int:
     """Запускает прежний daemon, сохраняя путь внешнего CLI для ``--detach``."""
+    from ssh_relay_logging import install_daemon_timestamp_streams
+
+    # Справка и ошибки argparse уже выведены до входа в обработчик.
+    # Метки относятся только к диагностике запущенного daemon.
+    install_daemon_timestamp_streams()
     original_file = _core.__file__
     _core.__file__ = __file__
     try:

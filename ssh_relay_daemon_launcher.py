@@ -4,12 +4,10 @@
 from __future__ import annotations
 
 from ssh_relay_entrypoint import _configure_stdio
-from ssh_relay_logging import install_daemon_timestamp_streams
 
 
 def main() -> int:
     _configure_stdio()
-    install_daemon_timestamp_streams()
 
     import ssh_relay
 

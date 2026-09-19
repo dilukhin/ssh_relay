@@ -23,7 +23,7 @@ class BuildIdentityTests(unittest.TestCase):
         pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
         match = re.search(r'^version = "([0-9]+\.[0-9]+\.[0-9]+)"$', pyproject, re.MULTILINE)
         self.assertIsNotNone(match)
-        self.assertEqual("0.9.1", build.SEMANTIC_VERSION)
+        self.assertEqual("0.9.2", build.SEMANTIC_VERSION)
         self.assertEqual(build.SEMANTIC_VERSION, ssh_relay.__version__)
         self.assertEqual(build.SEMANTIC_VERSION, match.group(1))
 
@@ -32,14 +32,14 @@ class BuildIdentityTests(unittest.TestCase):
             os.environ, {"SSH_RELAY_SOURCE_SHA": SOURCE_SHA}, clear=False
         ):
             self.assertEqual(SOURCE_SHA, build.source_sha())
-            self.assertEqual("ssh_relay 0.9.1.01234567", build.canonical_identity())
+            self.assertEqual("ssh_relay 0.9.2.01234567", build.canonical_identity())
 
     def test_embedded_sha_cannot_be_overridden_by_runtime_environment(self) -> None:
         with mock.patch.object(build, "_SOURCE_SHA", OTHER_SHA), mock.patch.dict(
             os.environ, {"SSH_RELAY_SOURCE_SHA": SOURCE_SHA}, clear=False
         ):
             self.assertEqual(OTHER_SHA, build.source_sha())
-            self.assertEqual("ssh_relay 0.9.1.fedcba98", build.canonical_identity())
+            self.assertEqual("ssh_relay 0.9.2.fedcba98", build.canonical_identity())
 
     def test_invocation_identity_is_written_once_without_argv(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -56,7 +56,7 @@ class BuildIdentityTests(unittest.TestCase):
                 self.assertFalse(build.record_invocation_identity())
             lines = path.read_text(encoding="utf-8").splitlines()
             self.assertEqual(1, len(lines))
-            self.assertIn("ssh_relay 0.9.1.01234567", lines[0])
+            self.assertIn("ssh_relay 0.9.2.01234567", lines[0])
             self.assertIn(f"source_sha={SOURCE_SHA}", lines[0])
             self.assertNotIn("remote_command", lines[0])
 
