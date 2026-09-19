@@ -408,10 +408,12 @@ class ReplayTests(unittest.TestCase):
         context = multiprocessing.get_context('spawn')
         worker, result = self.start_lock_contender(context)
         self.assertEqual(self.lock_result(result), 'acquired')
+        identity = replay.read_json(self.store.root / 'gc.lock')['owner']
         worker.terminate()
         worker.join(20)
         self.assertFalse(worker.is_alive())
-        worker.close()  # Release the Windows process handle before testing strong death.
+        # Keep the Windows process handle open: PID/start still exist after exit.
+        self.assertIs(platform.alive(identity), False)
         with self.store.locked():
             pass
 

@@ -39,6 +39,7 @@ def _windows():
         (k, "CloseHandle", [w.HANDLE], w.BOOL),
         (k, "LocalFree", [ctypes.c_void_p], ctypes.c_void_p),
         (k, "OpenProcess", [w.DWORD, w.BOOL, w.DWORD], w.HANDLE),
+        (k, "WaitForSingleObject", [w.HANDLE, w.DWORD], w.DWORD),
         (k, "GetProcessTimes", [w.HANDLE] + [ctypes.POINTER(w.FILETIME)] * 4, w.BOOL),
         (k, "CreateDirectoryW", [w.LPCWSTR, ctypes.c_void_p], w.BOOL),
         (a, "OpenProcessToken", [w.HANDLE, w.DWORD, ctypes.POINTER(w.HANDLE)], w.BOOL),
@@ -238,13 +239,25 @@ def alive(identity: dict) -> bool | None:
         return None
     current = process_identity(pid)
     if current["platform"] == identity["platform"] and current["start"]:
-        return current["start"] == identity["start"]
+        if current["start"] != identity["start"]:
+            return False
+        if os.name != "nt":
+            return True
     if os.name == "nt":
         k, _, _ = _windows()
-        handle = k.OpenProcess(0x1000, False, pid)
+        # Завершённый process object сохраняет PID/start, пока открыт чужой
+        # handle. Только fingerprint не доказывает, что процесс ещё работает.
+        handle = k.OpenProcess(0x100000, False, pid)  # SYNCHRONIZE
         if handle:
-            k.CloseHandle(handle)
-            return None
+            try:
+                state = k.WaitForSingleObject(handle, 0)
+                if state == 0:  # WAIT_OBJECT_0: процесс завершён, даже с exit 259.
+                    return False
+                if state == 258 and current["platform"] == identity["platform"] and current["start"] == identity["start"]:
+                    return True
+                return None  # WAIT_FAILED / неизвестная identity: fail closed.
+            finally:
+                k.CloseHandle(handle)
         return False if ctypes.get_last_error() == 87 else None
     try:
         os.kill(pid, 0)
