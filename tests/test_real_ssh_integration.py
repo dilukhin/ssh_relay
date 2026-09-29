@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import json
+import base64
+import hashlib
+import io
 import os
 import subprocess
 import sys
@@ -11,6 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import paramiko
@@ -187,6 +191,28 @@ class RealSSHIntegrationTests(unittest.TestCase):
             ["test:real-success", "test:real-exit7", "test:real-empty"],
             self.server.commands,
         )
+
+    def test_machine_risky_reports_key_from_active_verified_connection(self) -> None:
+        self.start_daemon()
+        expected = "SHA256:" + base64.b64encode(
+            hashlib.sha256(self.host_key.asbytes()).digest()
+        ).decode("ascii").rstrip("=")
+        args = ssh_relay.build_parser().parse_args([
+            "exec", "--name", "ci-real-ssh", "--json", "--risky",
+            "--transaction-id", "test-verified-key", "test:real-success",
+        ])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = args.handler(args)
+        result = json.loads(output.getvalue())
+        # Испытательный сервер подтверждает завершение writer, но не хранит журнал.
+        self.assertEqual(0, code, result)
+        self.assertEqual(expected, result["remote_host_key_sha256"])
+        self.assertEqual("test-verified-key", result["transaction_id"])
+        self.assertEqual("succeeded", result["receipt_status"])
+        self.assertEqual("127.0.0.1", result["remote_host"])
+        self.assertEqual(self.server.port, result["remote_port"])
+        self.assertEqual("donpedro", result["remote_user"])
 
     def test_real_host_key_mismatch_prevents_session_creation(self) -> None:
         self.server.write_known_hosts(self.known_hosts, key=self.wrong_host_key)

@@ -15,6 +15,8 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
 __version__ = "0.6.0"
 
 import argparse
+import base64 as _identity_base64
+import hashlib
 import ssh_relay_replay_cli as replay_cli
 import atexit
 import base64
@@ -346,6 +348,18 @@ def load_paramiko():
     except ImportError as exc:
         raise RelayError("Не установлена зависимость paramiko. Выполните: py -m pip install paramiko") from exc
     return paramiko
+
+
+def verified_host_key_fingerprint(client: Any) -> str:
+    """Отпечаток ключа текущего проверенного и аутентифицированного SSH-транспорта."""
+    transport = client.get_transport()
+    if transport is None or not transport.is_active() or not transport.is_authenticated():
+        raise RelayError("Нет активного аутентифицированного SSH-соединения для risky-команды.")
+    key = transport.get_remote_server_key()
+    if key is None or not key.asbytes():
+        raise RelayError("Невозможно подтвердить ключ текущего SSH-соединения.")
+    digest = hashlib.sha256(key.asbytes()).digest()
+    return "SHA256:" + _identity_base64.b64encode(digest).decode("ascii").rstrip("=")
 
 
 def execute_remote_command(
@@ -1274,6 +1288,9 @@ def daemon(args: argparse.Namespace) -> int:
                         "last_error": snapshot["last_error"],
                         "reconnect_attempt": snapshot["reconnect_attempt"],
                         "version": __version__,
+                        **({"risky_identity_schema_version": 1}
+                           if globals().get("_p0_contract_installed") and globals().get("_safe_receipts_installed")
+                           else {}),
                         "replay_schema_version": 1,
                         "sudo_enabled": bool(args.enable_sudo),
                         "name": session_name,
@@ -1378,6 +1395,9 @@ def daemon(args: argparse.Namespace) -> int:
                     }
                 else:
                     def execute_with_optional_receipt(active_client: Any) -> dict[str, Any]:
+                        verified_fingerprint = None
+                        if risky and request.get("machine") is True:
+                            verified_fingerprint = verified_host_key_fingerprint(active_client)
                         with replay_cli.capturing(replay_writer):
                             if action == "sudo_exec":
                                 command_result = execute_sudo_command(
@@ -1392,10 +1412,20 @@ def daemon(args: argparse.Namespace) -> int:
                                     command,
                                     args.command_timeout,
                                 )
+                        if verified_fingerprint is not None:
+                            command_result.update(
+                                remote_host=session["host"],
+                                remote_port=session["port"],
+                                remote_user=session["user"],
+                                remote_host_key_sha256=verified_fingerprint,
+                            )
                         if command_result.get("ok") and command_result.get("exit_code") == 0 and risky:
                             receipt = execute_risky_receipt(
                                 active_client,
-                                session=session,
+                                session=(
+                                    {**session, "remote_host_key_sha256": verified_fingerprint}
+                                    if verified_fingerprint is not None else session
+                                ),
                                 action=action,
                                 command=command,
                                 sudo=(action == "sudo_exec"),
@@ -1935,4 +1965,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.10.1"
+__version__ = "0.11.0"
 
 import argparse
 import base64
@@ -857,4 +857,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

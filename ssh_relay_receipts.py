@@ -127,6 +127,8 @@ def build_receipt_payload(
         "command_exit_code": 0,
         "command_hash": hashlib.sha256(command.encode("utf-8")).hexdigest(),
     }
+    if session.get("remote_host_key_sha256"):
+        payload["remote_host_key_sha256"] = str(session["remote_host_key_sha256"])
     payload["receipt_hash"] = hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
     return payload
 
@@ -173,6 +175,7 @@ def _summary(
         "transaction_id": payload.get("transaction_id") if payload else None,
         "receipt_id": payload.get("receipt_id") if payload else None,
         "receipt_hash": payload.get("receipt_hash") if payload else None,
+        "remote_host_key_sha256": payload.get("remote_host_key_sha256") if payload else None,
         "exit_code": int(exit_code),
         "error_code": error_code,
         "error_message": error_message,
@@ -235,6 +238,7 @@ def _receipt_public_summary(result: dict[str, Any]) -> dict[str, Any]:
         "transaction_id": result.get("transaction_id"),
         "receipt_id": result.get("receipt_id"),
         "receipt_hash": result.get("receipt_hash"),
+        "remote_host_key_sha256": result.get("remote_host_key_sha256"),
         "exit_code": result.get("exit_code"),
         "error_code": result.get("error_code"),
         "error_message": result.get("error_message"),
@@ -470,9 +474,11 @@ def install(core: Any) -> None:
         except core.RelayError as exc:
             print(str(exc), file=sys.stderr)
             return 1
-        if not status.get("ok") or status.get("receipt_schema_version") != RECEIPT_SCHEMA_VERSION:
+        if (not status.get("ok") or status.get("receipt_schema_version") != RECEIPT_SCHEMA_VERSION
+                or status.get("version") != core.__version__):
             print(
-                "Активный daemon не подтвердил safe receipt v1. Остановите его и запустите заново текущим relay; "
+                "Активный daemon не подтвердил текущую версию и safe receipt v1. "
+                "Остановите его и запустите заново текущим relay; "
                 "risky-команда не отправлена.",
                 file=sys.stderr,
             )

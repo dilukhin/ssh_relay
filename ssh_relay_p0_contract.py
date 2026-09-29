@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import uuid
 from typing import Any
@@ -49,6 +50,20 @@ def _apply_receipt_summary(
     return summary
 
 
+def _confirmed_identity(core: Any, session: dict[str, Any], command: dict[str, Any]) -> str | None:
+    """Проверяет идентичность именно соединения, на котором исполнена команда."""
+    fingerprint = command.get("remote_host_key_sha256")
+    if not isinstance(fingerprint, str) or re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", fingerprint) is None:
+        return None
+    if (
+        command.get("remote_host") != session.get("host")
+        or command.get("remote_port") != session.get("port")
+        or command.get("remote_user") != session.get("user")
+    ):
+        return None
+    return fingerprint
+
+
 def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> int:
     started_at = outcomes._utc_now()
     result = outcomes._machine_result_base(core, args, action=action, started_at=started_at)
@@ -57,6 +72,7 @@ def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> i
             "transaction_id": None,
             "receipt_id": None,
             "receipt_hash": None,
+            "remote_host_key_sha256": None,
             "receipt_path": getattr(args, "receipt_path", None),
             "change_target": getattr(args, "change_target", None),
             "change_description": getattr(args, "change_description", None),
@@ -124,6 +140,11 @@ def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> i
             "Активный daemon не подтвердил safe receipt v1. Остановите его и запустите заново текущим relay."
         )
         return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_NOT_STARTED)
+    if status.get("version") != core.__version__ or status.get("risky_identity_schema_version") != 1:
+        result["error_code"] = "risky_daemon_incompatible"
+        result["error_stage"] = "capability"
+        result["error_message"] = "Версия или контракт идентичности daemon не совпадает; перезапустите daemon текущим relay."
+        return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_NOT_STARTED)
 
     response_timeout = (
         int(session.get("command_timeout", core.DEFAULT_COMMAND_TIMEOUT))
@@ -178,6 +199,28 @@ def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> i
         return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_UNKNOWN)
     finally:
         receipts._client_context.metadata = None
+
+    command = daemon_result if daemon_result.get("ok") else daemon_result.get("command_result")
+    if isinstance(command, dict) and command.get("ok"):
+        fingerprint = _confirmed_identity(core, session, command)
+        receipt = command.get("risky_receipt") if daemon_result.get("ok") else daemon_result.get("receipt_result")
+        receipt_matches = True
+        if int(command.get("exit_code", 1)) == 0:
+            receipt_matches = (
+                isinstance(receipt, dict)
+                and receipt.get("transaction_id") == transaction_id
+                and receipt.get("receipt_id") == receipt_id
+                and receipt.get("remote_host_key_sha256") == fingerprint
+            )
+        if fingerprint is None or not receipt_matches:
+            result["operation_status"] = "unknown"
+            result["command_status"] = "unknown"
+            result["receipt_status"] = "unknown"
+            result["error_code"] = "risky_identity_unconfirmed"
+            result["error_stage"] = "identity"
+            result["error_message"] = "Цель или связь команды с квитанцией не подтверждена; повтор запрещён."
+            return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_UNKNOWN)
+        result["remote_host_key_sha256"] = fingerprint
 
     if daemon_result.get("ok"):
         result["stdout"] = str(daemon_result.get("stdout", ""))
