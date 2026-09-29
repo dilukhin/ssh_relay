@@ -50,7 +50,7 @@ def _apply_receipt_summary(
     return summary
 
 
-def _confirmed_identity(core: Any, session: dict[str, Any], command: dict[str, Any]) -> str | None:
+def _confirmed_identity(session: dict[str, Any], command: dict[str, Any]) -> str | None:
     """Проверяет идентичность именно соединения, на котором исполнена команда."""
     fingerprint = command.get("remote_host_key_sha256")
     if not isinstance(fingerprint, str) or re.fullmatch(r"SHA256:[A-Za-z0-9+/]{43}", fingerprint) is None:
@@ -202,7 +202,7 @@ def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> i
 
     command = daemon_result if daemon_result.get("ok") else daemon_result.get("command_result")
     if isinstance(command, dict) and command.get("ok"):
-        fingerprint = _confirmed_identity(core, session, command)
+        fingerprint = _confirmed_identity(session, command)
         receipt = command.get("risky_receipt") if daemon_result.get("ok") else daemon_result.get("receipt_result")
         receipt_matches = True
         if int(command.get("exit_code", 1)) == 0:

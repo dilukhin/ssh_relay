@@ -15,7 +15,6 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
 __version__ = "0.6.0"
 
 import argparse
-import base64 as _identity_base64
 import hashlib
 import ssh_relay_replay_cli as replay_cli
 import atexit
@@ -359,7 +358,7 @@ def verified_host_key_fingerprint(client: Any) -> str:
     if key is None or not key.asbytes():
         raise RelayError("Невозможно подтвердить ключ текущего SSH-соединения.")
     digest = hashlib.sha256(key.asbytes()).digest()
-    return "SHA256:" + _identity_base64.b64encode(digest).decode("ascii").rstrip("=")
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
 
 
 def execute_remote_command(
