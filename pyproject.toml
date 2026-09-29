@@ -27,6 +27,7 @@ py-modules = [
   "ssh_relay_replay_cli",
   "ssh_relay_replay_platform",
   "ssh_relay_jobs",
+  "ssh_relay_verified_identity",
   "ssh_relay_outcomes",
   "ssh_relay_p0_contract",
   "ssh_relay_receipts",

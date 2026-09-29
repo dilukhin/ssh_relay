@@ -247,3 +247,52 @@ Read-only `status` нового daemon возвращает `replay_schema_versi
 Daemon извлекает `remote_host_key_sha256` из активного аутентифицированного SSH-транспорта, открытого со строгой проверкой `known_hosts`, перед выполнением команды. Формат — `SHA256:` и 43 символа Base64 без заполнения. Ответ связывает этот отпечаток с `remote_host`, `remote_port`, `remote_user`, `transaction_id` и `receipt_id` квитанции. Квитанция хранит тот же отпечаток. Значения из локального файла сессии сами по себе не подтверждают ключ сервера.
 
 При отсутствующем ключе команда не запускается. Если ответ о завершённой команде не подтверждает цель или связь с квитанцией, клиент возвращает `unknown` (код 13); автоматический повтор запрещён. После обновления клиента daemon следует остановить и запустить заново из той же установки.
+
+## Дополнение: явно проверяемая identity для agent-safe (кандидат на review)
+
+Обычный `--json --risky` версии 0.11.0 сохраняет прежнюю совместимость и показывает
+наблюдаемый отпечаток, но **не требует ожидаемого pin**. Такой вызов не даёт
+`agent-safe` права считать цель заранее разрешённой. Новое соглашение opt-in:
+
+1. Read-only `status --name NAME --json` возвращает один объект
+   `action=preflight`, `operation_status=succeeded|not_started`,
+   `verified_identity_schema_version=1` и `verified_identity` только при активном
+   аутентифицированном SSH-транспорте. В identity входят daemon-side
+   `remote_host/port/user`, алгоритм ключа, fingerprint `SHA256:`,
+   `trusted_known_hosts=true`, `daemon_instance_id` (UUID),
+   `connection_generation` (целое от 1), `daemon_source_sha` (полный SHA,
+   внедрённый в установленную сборку). При reconnect generation увеличивается;
+   при disconnected identity не выдаётся. Локальный session-файл и его имя —
+   не свидетельство ключа.
+2. Отдельный `exec|sudo-exec --json --risky --require-verified-identity`
+   требует все поля `--expected-remote-host`, `--expected-remote-port`,
+   `--expected-remote-user`, `--expected-host-key-algorithm`,
+   `--expected-host-key-sha256`, `--expected-daemon-instance-id`,
+   `--expected-connection-generation`, `--expected-daemon-source-sha`.
+   CLI проверяет identity/capability в read-only status; **daemon ещё раз**
+   сравнивает переданную ожидаемую identity с текущим verified transport
+   внутри того же exec/sudo request **до** отправки команды на SSH.
+   Если соединение изменилось после preflight, отказ `not_started`/exit10.
+   `--verified-command-timeout` допускает только целые 1–3600 секунд и
+   передаётся в тот же запрос; истечение после доставки — `unknown`.
+3. Main result и подтверждённый receipt включают наблюдаемую identity,
+   fingerprint, endpoint и существующие `transaction_id`/`receipt_id`/
+   `command_hash`. `identity_observed_before_command` не доказывает, что
+   удалённая команда завершилась после разрыва; при потере ответа доступна
+   лишь `preflight_verified_identity` (прошлое наблюдение), итог — `unknown`.
+   Полученный неэквивалентный ответ никогда не принимается как успех.
+
+Ожидаемое значение fingerprint для опасного действия должно прийти из
+**независимого доверенного источника и отдельного разрешения**, а не из самого
+ответа `ssh_relay` или из session metadata. `status --json` не заменяет
+разрешение человека и не делает локальный token/аргументы CLI защищёнными от
+модельной подстановки. Вызовы без `--require-verified-identity` **не
+соответствуют** этому строгому контракту. Новая реализация — source candidate;
+старый установленный runtime и daemon не обновляются публикацией ветки.
+
+Коррекция диагностики 0.10.1: нижняя строка
+`risky_machine_contract_not_ready` в `ssh_relay_outcomes.py` перехватывается
+более поздней P0-обёрткой. Установленный локальный безопасный probe с
+несуществующей сессией и receipt path `/` вернул `not_started` и
+`invalid_risky_metadata`, а **не** `not_ready`. Это подтверждает только parser
+dispatch, не реальный remote risky E2E.

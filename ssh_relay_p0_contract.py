@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import sys
 import uuid
 from typing import Any
 
+import ssh_relay_verified_identity as verified_identity
+from ssh_relay_build import source_sha
 import ssh_relay_outcomes as outcomes
 import ssh_relay_receipts as receipts
 
@@ -46,6 +49,7 @@ def _apply_receipt_summary(
     result["transaction_id"] = summary.get("transaction_id") or transaction_id
     result["receipt_id"] = summary.get("receipt_id") or receipt_id
     result["receipt_hash"] = summary.get("receipt_hash")
+    result["command_hash"] = summary.get("command_hash")
     result["receipt_path"] = summary.get("receipt_path") or receipt_path
     return summary
 
@@ -108,6 +112,19 @@ def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> i
     result["change_description"] = change_description
 
     try:
+        expected_identity = verified_identity.from_args(args)
+    except ValueError as exc:
+        result["error_code"] = "invalid_verified_identity"
+        result["error_stage"] = "validation"
+        result["error_message"] = str(exc)
+        return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_NOT_STARTED)
+    verified_timeout = getattr(args, "verified_command_timeout", None)
+    if verified_timeout is not None and not 1 <= verified_timeout <= 3600:
+        result["error_code"] = "invalid_verified_timeout"
+        result["error_stage"] = "validation"
+        return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_NOT_STARTED)
+
+    try:
         session_name = core.validate_session_name(args.name)
     except core.RelayError as exc:
         result["error_code"] = "invalid_session"
@@ -145,9 +162,17 @@ def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> i
         result["error_stage"] = "capability"
         result["error_message"] = "Версия или контракт идентичности daemon не совпадает; перезапустите daemon текущим relay."
         return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_NOT_STARTED)
+    if expected_identity is not None:
+        if (source_sha() is None or status.get("verified_identity_schema_version") != verified_identity.SCHEMA_VERSION or
+                not verified_identity.matches(expected_identity, status.get("verified_identity")) or
+                expected_identity["daemon_source_sha"] != source_sha()):
+            result["error_code"] = "verified_identity_preflight_mismatch"
+            result["error_stage"] = "identity"
+            return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_NOT_STARTED)
+        result["preflight_verified_identity"] = status["verified_identity"]
 
     response_timeout = (
-        int(session.get("command_timeout", core.DEFAULT_COMMAND_TIMEOUT))
+        int(verified_timeout or session.get("command_timeout", core.DEFAULT_COMMAND_TIMEOUT))
         + int(session.get("reconnect_wait", core.DEFAULT_RECONNECT_WAIT))
         + 10
     )
@@ -167,6 +192,8 @@ def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> i
             receipt_path=receipt_path,
             receipt_id=receipt_id,
             machine=True,
+            **({"expected_verified_identity": expected_identity} if expected_identity is not None else {}),
+            **({"verified_command_timeout": verified_timeout} if verified_timeout is not None else {}),
             response_timeout=response_timeout,
         )
     except core.DaemonRequestError as exc:
@@ -200,6 +227,25 @@ def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> i
     finally:
         receipts._client_context.metadata = None
 
+    if expected_identity is not None:
+        command_result = daemon_result if daemon_result.get("ok") else daemon_result.get("command_result")
+        if not (verified_identity.matches(expected_identity, daemon_result.get("verified_identity")) and
+                isinstance(command_result, dict) and
+                verified_identity.matches(expected_identity, command_result.get("verified_identity"))):
+            if daemon_result.get("command_started") is False:
+                result["error_code"] = "verified_identity_mismatch"
+                result["error_stage"] = "identity"
+                return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_NOT_STARTED)
+            result["operation_status"] = "unknown"
+            result["command_status"] = "unknown"
+            result["receipt_status"] = "unknown"
+            result["error_code"] = "verified_identity_result_unknown"
+            result["error_stage"] = "identity"
+            return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_UNKNOWN)
+        result["verified_identity"] = expected_identity
+        result["identity_observed_before_command"] = True
+        result["identity_current_after_result"] = daemon_result.get("identity_current_after_result") is True
+
     command = daemon_result if daemon_result.get("ok") else daemon_result.get("command_result")
     if isinstance(command, dict) and command.get("ok"):
         fingerprint = _confirmed_identity(session, command)
@@ -211,6 +257,9 @@ def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> i
                 and receipt.get("transaction_id") == transaction_id
                 and receipt.get("receipt_id") == receipt_id
                 and receipt.get("remote_host_key_sha256") == fingerprint
+                and (expected_identity is None or receipt.get("receipt_status") != "succeeded" or
+                     (verified_identity.matches(expected_identity, receipt.get("verified_identity")) and
+                      receipt.get("command_hash") == hashlib.sha256(args.remote_command.encode("utf-8")).hexdigest()))
             )
         if fingerprint is None or not receipt_matches:
             result["operation_status"] = "unknown"
@@ -460,6 +509,15 @@ def install(core: Any) -> None:
                 continue
             original_handler = command_parser.get_default("handler")
 
+            command_parser.add_argument("--require-verified-identity", action="store_true",
+                                        help="Проверять точный SSH pin в том же daemon-запросе до запуска команды.")
+            for flag, kind in (("--expected-remote-host", str), ("--expected-remote-port", int),
+                               ("--expected-remote-user", str), ("--expected-host-key-algorithm", str),
+                               ("--expected-host-key-sha256", str), ("--expected-daemon-instance-id", str),
+                               ("--expected-connection-generation", int), ("--expected-daemon-source-sha", str),
+                               ("--verified-command-timeout", int)):
+                command_parser.add_argument(flag, type=kind, help="Точное ожидание verified machine-запроса.")
+
             def dispatch(
                 args: argparse.Namespace,
                 *,
@@ -468,6 +526,15 @@ def install(core: Any) -> None:
             ) -> int:
                 if getattr(args, "json", False) and getattr(args, "risky", False):
                     return _machine_risky_cmd(core, args, action=_action)
+                if getattr(args, "require_verified_identity", False) or any(
+                    getattr(args, name, None) is not None for name in (
+                        "expected_remote_host", "expected_remote_port", "expected_remote_user",
+                        "expected_host_key_algorithm", "expected_host_key_sha256",
+                        "expected_daemon_instance_id", "expected_connection_generation",
+                        "expected_daemon_source_sha", "verified_command_timeout")
+                ):
+                    print("Verified identity доступна только с --json --risky.", file=sys.stderr)
+                    return 2
                 return int(_original(args))
 
             command_parser.set_defaults(handler=dispatch)

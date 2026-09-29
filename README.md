@@ -219,6 +219,8 @@ Remote exit code хранится отдельно в `command_exit_code`. По�
 
 Начиная с 0.11.0, машинная risky-команда требует совпадения версии клиента и запущенного daemon и подтверждения контракта идентичности до отправки команды. В результате `remote_host_key_sha256` содержит SHA-256 отпечаток ключа сервера из активного SSH-соединения, проверенного через `known_hosts`; квитанция содержит тот же отпечаток. При отсутствии или расхождении подтверждений результат не считается успешным и команду нельзя автоматически повторять. После обновления установки обязательно остановите прежний daemon и запустите новый.
 
+Для строгой интеграции `agent-safe` кандидат предлагает read-only `status --name prod --json` и отдельный `exec|sudo-exec --json --risky --require-verified-identity` с полным набором `--expected-*` (host/port/user/host key/daemon instance/generation/source SHA). Daemon сравнивает pin **в том же запросе до SSH-команды**. Обычный `--json --risky` остаётся без обязательного заранее известного pin и не является разрешением на развёртывание v5. Формат и ограничения: `MACHINE_CONTRACT.md`. Идентичность установленного клиента и daemon сверяется по полному внедрённому Source SHA; один номер версии `0.11.0` недостаточен. Отдельное доверенное согласие человека остаётся задачей `opencode_permissions`/`agent-safe`.
+
 `operation_status=unknown` и `partial_success` нельзя автоматически retry. Полная схема, failure matrix, `receipt_status` и правила hash описаны в `MACHINE_CONTRACT.md`.
 
 ## job — длительные удалённые процессы
@@ -437,7 +439,7 @@ py .\ssh_relay.py exec --name prod --json --risky --transaction-id relay-test-00
 $LASTEXITCODE
 ```
 
-Для проверки установленного пакета сначала выполните `ssh_relay doctor` и `ssh_relay --version`, затем перезапустите daemon этой же установки. Успешный рискованный пробный вызов должен вернуть `operation_status=succeeded`, `receipt_status=succeeded` и `remote_host_key_sha256=SHA256:…`. Если установленная 0.10.1 возвращает `risky_machine_contract_not_ready`, сверяйте `Source SHA` из `doctor` с опубликованным выпуском: один номер версии сам по себе не подтверждает состав установленных исходников.
+Для проверки установленного пакета сначала выполните `ssh_relay doctor` и `ssh_relay --version`, затем отдельно согласуйте перезапуск daemon этой же установки. Успешный рискованный пробный вызов должен вернуть `operation_status=succeeded`, `receipt_status=succeeded` и `remote_host_key_sha256=SHA256:…`. Безопасный **локальный** probe установленной 0.10.1 с несуществующей сессией и заведомо неправильным receipt path `/` вернул `not_started/invalid_risky_metadata`: P0-dispatch доступен, хотя нижний обработчик ещё содержит строку `risky_machine_contract_not_ready`. Этот probe не проверяет исполнение remote risky и не устраняет потребность в независимом pin и доверенном разрешении.
 
 Минимальный transfer-тест:
 
