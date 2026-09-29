@@ -1129,7 +1129,13 @@ def daemon(args: argparse.Namespace) -> int:
     def run_remote_operation(operation_name: str, operation: Any) -> dict[str, Any]:
         """Запускает операцию только на рабочем SSH и не повторяет её после обрыва."""
         with command_lock:
-            operation_client = wait_for_connection(DEFAULT_RECONNECT_WAIT)
+            try:
+                operation_client = wait_for_connection(DEFAULT_RECONNECT_WAIT)
+            except RelayError as exc:
+                # Операция ещё не вызывалась; replay и machine result должны
+                # сохранить достоверное not_started при отказе host key/reconnect.
+                exc.command_started = False
+                raise
             try:
                 return operation(operation_client)
             except Exception as exc:
