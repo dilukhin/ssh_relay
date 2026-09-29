@@ -56,7 +56,9 @@ class CliContractTests(unittest.TestCase):
         self.assertTrue(callable(top.choices["sudo-exec"].get_default("handler")))
         self.assertIs(ssh_relay.download_cmd, top.choices["download"].get_default("handler"))
         self.assertIs(ssh_relay.upload_cmd, top.choices["upload"].get_default("handler"))
-        self.assertIs(core.status, top.choices["status"].get_default("handler"))
+        # status получает диспетчер только для явного --json; текстовый путь
+        # сохраняет прежний core.status.
+        self.assertTrue(callable(top.choices["status"].get_default("handler")))
         self.assertIs(core.stop, top.choices["stop"].get_default("handler"))
         self.assertIs(core.list_sessions, top.choices["list"].get_default("handler"))
 

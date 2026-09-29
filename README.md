@@ -4,7 +4,7 @@
 
 Пользователь вручную запускает `daemon` и проходит SSH-аутентификацию. После этого CLI-агент, в частности OpenCode, работает только через локальный relay: `exec`/`sudo-exec` для коротких команд, `job` для длительных удалённых процессов и `upload`/`download` для SFTP-передач. Прямой `ssh` агенту не нужен.
 
-Текущая версия: `0.10.1`.
+Текущая версия: `0.11.0`.
 
 Внутренняя структура:
 
@@ -216,6 +216,10 @@ Process exit code машинного режима:
 * `13` — `unknown`: команда могла быть запущена, но достоверный результат потерян.
 
 Remote exit code хранится отдельно в `command_exit_code`. Полный текст команды в JSON не включается. Для risky-команды `transaction_id` и `receipt_id` создаются до изменяющего запроса, поэтому они остаются доступны даже при неизвестном результате.
+
+Начиная с 0.11.0, машинная risky-команда требует совпадения версии клиента и запущенного daemon и подтверждения контракта идентичности до отправки команды. В результате `remote_host_key_sha256` содержит SHA-256 отпечаток ключа сервера из активного SSH-соединения, проверенного через `known_hosts`; квитанция содержит тот же отпечаток. При отсутствии или расхождении подтверждений результат не считается успешным и команду нельзя автоматически повторять. После обновления установки обязательно остановите прежний daemon и запустите новый.
+
+Для строгой интеграции `agent-safe` кандидат предлагает read-only `status --name prod --json` и отдельный `exec|sudo-exec --json --risky --require-verified-identity` с полным набором `--expected-*` (host/port/user/host key/daemon instance/generation/source SHA). Daemon сравнивает pin **в том же запросе до SSH-команды**. Обычный `--json --risky` остаётся без обязательного заранее известного pin и не является разрешением на развёртывание v5. Формат и ограничения: `MACHINE_CONTRACT.md`. Идентичность установленного клиента и daemon сверяется по полному внедрённому Source SHA; один номер версии `0.11.0` недостаточен. Отдельное доверенное согласие человека остаётся задачей `opencode_permissions`/`agent-safe`.
 
 `operation_status=unknown` и `partial_success` нельзя автоматически retry. Полная схема, failure matrix, `receipt_status` и правила hash описаны в `MACHINE_CONTRACT.md`.
 
@@ -434,6 +438,8 @@ py .\ssh_relay.py exec --name prod --json "hostname && whoami && pwd"
 py .\ssh_relay.py exec --name prod --json --risky --transaction-id relay-test-001 --change-description "тестовая безопасная операция" "true"
 $LASTEXITCODE
 ```
+
+Для проверки установленного пакета сначала выполните `ssh_relay doctor` и `ssh_relay --version`, затем отдельно согласуйте перезапуск daemon этой же установки. Успешный рискованный пробный вызов должен вернуть `operation_status=succeeded`, `receipt_status=succeeded` и `remote_host_key_sha256=SHA256:…`. Безопасный **локальный** probe установленной 0.10.1 с несуществующей сессией и заведомо неправильным receipt path `/` вернул `not_started/invalid_risky_metadata`: P0-dispatch доступен, хотя нижний обработчик ещё содержит строку `risky_machine_contract_not_ready`. Этот probe не проверяет исполнение remote risky и не устраняет потребность в независимом pin и доверенном разрешении.
 
 Минимальный transfer-тест:
 

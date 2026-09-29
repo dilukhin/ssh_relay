@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import io
 import json
 import os
 import subprocess
@@ -10,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -65,6 +69,7 @@ class RealSSHIntegrationTests(unittest.TestCase):
         *,
         password: str = PASSWORD,
         expect_session: bool = True,
+        enable_sudo: bool = False,
     ) -> subprocess.Popen[str]:
         child_env = os.environ.copy()
         child_env.update(self.overrides)
@@ -72,6 +77,8 @@ class RealSSHIntegrationTests(unittest.TestCase):
         child_env["SSH_RELAY_REAL_SSH_PORT"] = str(self.server.port)
         child_env["SSH_RELAY_REAL_KNOWN_HOSTS"] = str(self.known_hosts)
         child_env["PYTHONIOENCODING"] = "utf-8"
+        if enable_sudo:
+            child_env["SSH_RELAY_REAL_ENABLE_SUDO"] = "1"
 
         self.process = subprocess.Popen(
             [sys.executable, "-u", str(DAEMON_RUNNER)],
@@ -188,6 +195,121 @@ class RealSSHIntegrationTests(unittest.TestCase):
             self.server.commands,
         )
 
+    def test_machine_risky_reports_key_from_active_verified_connection(self) -> None:
+        self.start_daemon()
+        expected = "SHA256:" + base64.b64encode(
+            hashlib.sha256(self.host_key.asbytes()).digest()
+        ).decode("ascii").rstrip("=")
+        args = ssh_relay.build_parser().parse_args([
+            "exec", "--name", "ci-real-ssh", "--json", "--risky",
+            "--transaction-id", "test-verified-key", "test:real-success",
+        ])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = args.handler(args)
+        result = json.loads(output.getvalue())
+        # Испытательный сервер подтверждает завершение writer, но не хранит журнал.
+        self.assertEqual(0, code, result)
+        self.assertEqual(expected, result["remote_host_key_sha256"])
+        self.assertEqual("test-verified-key", result["transaction_id"])
+        self.assertEqual("succeeded", result["receipt_status"])
+        self.assertEqual("127.0.0.1", result["remote_host"])
+        self.assertEqual(self.server.port, result["remote_port"])
+        self.assertEqual("donpedro", result["remote_user"])
+
+    @staticmethod
+    def verified_flags(identity: dict) -> list[str]:
+        return ["--require-verified-identity",
+                "--expected-remote-host", identity["remote_host"],
+                "--expected-remote-port", str(identity["remote_port"]),
+                "--expected-remote-user", identity["remote_user"],
+                "--expected-host-key-algorithm", identity["host_key_algorithm"],
+                "--expected-host-key-sha256", identity["remote_host_key_sha256"],
+                "--expected-daemon-instance-id", identity["daemon_instance_id"],
+                "--expected-connection-generation", str(identity["connection_generation"]),
+                "--expected-daemon-source-sha", identity["daemon_source_sha"]]
+
+    def verified_preflight(self) -> dict:
+        args = ssh_relay.build_parser().parse_args(["status", "--name", "ci-real-ssh", "--json"])
+        with redirect_stdout(io.StringIO()) as output:
+            code = args.handler(args)
+        result = json.loads(output.getvalue())
+        self.assertEqual(0, code, result)
+        return result["verified_identity"]
+
+    def verified_risky(self, identity: dict, *, mode="exec", command="test:real-success"):
+        args = ssh_relay.build_parser().parse_args([
+            mode, "--name", "ci-real-ssh", "--json", "--risky",
+            *self.verified_flags(identity), "--transaction-id", "test-v5-pin", command,
+        ])
+        with redirect_stdout(io.StringIO()) as output:
+            code = args.handler(args)
+        return code, json.loads(output.getvalue())
+
+    def test_real_verified_exec_and_wrong_pin(self) -> None:
+        with patch.dict(os.environ, {"SSH_RELAY_SOURCE_SHA": "a" * 40}):
+            self.start_daemon()
+            observed = self.verified_preflight()
+            digest = "SHA256:" + base64.b64encode(hashlib.sha256(self.host_key.asbytes()).digest()).decode("ascii").rstrip("=")
+            self.assertEqual(digest, observed["remote_host_key_sha256"])
+            self.assertEqual("a" * 40, observed["daemon_source_sha"])
+            before = self.server.commands.count("test:real-success")
+            bad = {**observed, "remote_host_key_sha256": "SHA256:" + "A" * 43}
+            code, blocked = self.verified_risky(bad)
+            self.assertEqual(10, code, blocked)
+            self.assertEqual(before, self.server.commands.count("test:real-success"))
+            code, result = self.verified_risky(observed)
+            self.assertEqual(0, code, result)
+            self.assertEqual(observed, result["verified_identity"])
+            self.assertEqual(before + 1, self.server.commands.count("test:real-success"))
+
+    def test_real_verified_sudo_and_generation_drift(self) -> None:
+        with patch.dict(os.environ, {"SSH_RELAY_SOURCE_SHA": "a" * 40}):
+            self.start_daemon(enable_sudo=True)
+            observed = self.verified_preflight()
+            code, result = self.verified_risky(observed, mode="sudo-exec")
+            self.assertEqual(0, code, result)
+            self.assertTrue(result["sudo"])
+            before = len(self.server.commands)
+            count = self.server.connection_count
+            self.server.drop_all_transports()
+            self.assertTrue(self.server.wait_for_connections(count + 1, timeout=7))
+            self.wait_connected()
+            current = self.verified_preflight()
+            self.assertGreater(current["connection_generation"], observed["connection_generation"])
+            code, blocked = self.verified_risky(observed)
+            self.assertEqual(10, code, blocked)
+            self.assertEqual(before, len(self.server.commands))
+
+    def test_generation_changes_between_preflight_and_same_exec_request(self) -> None:
+        with patch.dict(os.environ, {"SSH_RELAY_SOURCE_SHA": "a" * 40}):
+            self.start_daemon()
+            old_identity = self.verified_preflight()
+            original_request = core.request_daemon
+            before = len(self.server.commands)
+            count = self.server.connection_count
+
+            def request(session, action, **kwargs):
+                if action != "status":
+                    return original_request(session, action, **kwargs)
+                stale = original_request(session, "status", **kwargs)
+                self.server.drop_all_transports()
+                self.assertTrue(self.server.wait_for_connections(count + 1, timeout=7))
+                deadline = time.monotonic() + 7
+                while time.monotonic() < deadline:
+                    fresh = original_request(session, "status", response_timeout=2)
+                    current = fresh.get("verified_identity")
+                    if current and current["connection_generation"] > old_identity["connection_generation"]:
+                        return stale
+                    time.sleep(0.02)
+                self.fail("Daemon не подтвердил новое поколение до запроса")
+
+            with patch.object(core, "request_daemon", side_effect=request):
+                code, result = self.verified_risky(old_identity)
+            self.assertEqual(10, code, result)
+            self.assertEqual("not_started", result["operation_status"])
+            self.assertEqual(before, len(self.server.commands))
+
     def test_real_host_key_mismatch_prevents_session_creation(self) -> None:
         self.server.write_known_hosts(self.known_hosts, key=self.wrong_host_key)
         process = self.start_daemon(expect_session=False)
@@ -199,6 +321,26 @@ class RealSSHIntegrationTests(unittest.TestCase):
         self.assertNotIn(PASSWORD, stdout)
         self.assertNotIn(PASSWORD, stderr)
         self.assertEqual([], self.server.auth_attempts)
+
+    def test_changed_host_key_on_reconnect_prevents_risky_command(self) -> None:
+        self.start_daemon()
+        count = self.server.connection_count
+        self.server.host_key = self.wrong_host_key
+        self.server.drop_all_transports()
+        self.assertTrue(self.server.wait_for_connections(count + 1, timeout=7))
+
+        args = ssh_relay.build_parser().parse_args([
+            "exec", "--name", "ci-real-ssh", "--json", "--risky",
+            "--transaction-id", "test-reconnect-rejected", "test:real-success",
+        ])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = args.handler(args)
+        result = json.loads(output.getvalue())
+        self.assertEqual(10, code, result)
+        self.assertEqual("not_started", result["operation_status"])
+        self.assertEqual("not_attempted", result["receipt_status"])
+        self.assertNotIn("test:real-success", self.server.commands)
 
     def test_real_wrong_password_prevents_session_creation(self) -> None:
         process = self.start_daemon(password="wrong-test-password", expect_session=False)

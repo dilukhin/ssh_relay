@@ -15,6 +15,8 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
 __version__ = "0.6.0"
 
 import argparse
+import ssh_relay_verified_identity as verified_identity_contract
+import hashlib
 import ssh_relay_replay_cli as replay_cli
 import atexit
 import base64
@@ -31,6 +33,7 @@ import sys
 import threading
 import time
 import uuid
+from ssh_relay_build import source_sha
 from pathlib import Path
 from typing import Any
 
@@ -346,6 +349,18 @@ def load_paramiko():
     except ImportError as exc:
         raise RelayError("Не установлена зависимость paramiko. Выполните: py -m pip install paramiko") from exc
     return paramiko
+
+
+def verified_host_key_fingerprint(client: Any) -> str:
+    """Отпечаток ключа текущего проверенного и аутентифицированного SSH-транспорта."""
+    transport = client.get_transport()
+    if transport is None or not transport.is_active() or not transport.is_authenticated():
+        raise RelayError("Нет активного аутентифицированного SSH-соединения для risky-команды.")
+    key = transport.get_remote_server_key()
+    if key is None or not key.asbytes():
+        raise RelayError("Невозможно подтвердить ключ текущего SSH-соединения.")
+    digest = hashlib.sha256(key.asbytes()).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
 
 
 def execute_remote_command(
@@ -1039,6 +1054,8 @@ def daemon(args: argparse.Namespace) -> int:
     client_lock = threading.Lock()
     connection_condition = threading.Condition()
     connection_state = "connected"
+    daemon_instance_id = str(uuid.uuid4())
+    connection_generation = 1
     connection_error: str | None = None
     reconnect_attempt = 0
     cleanup_done = False
@@ -1053,6 +1070,29 @@ def daemon(args: argparse.Namespace) -> int:
     def current_client() -> Any:
         with client_lock:
             return client
+
+    def observed_identity(candidate: Any) -> dict[str, Any] | None:
+        with client_lock:
+            if candidate is not client:
+                return None
+            generation = connection_generation
+        try:
+            transport = candidate.get_transport()
+            if transport is None or not transport.is_active() or not transport.is_authenticated():
+                return None
+            key = transport.get_remote_server_key()
+            if key is None or not key.get_name():
+                return None
+            fingerprint = verified_host_key_fingerprint(candidate)
+        except (AttributeError, OSError, RelayError):
+            return None
+        return {
+            "schema_version": verified_identity_contract.SCHEMA_VERSION,
+            "remote_host": args.host, "remote_port": args.port, "remote_user": args.user,
+            "host_key_algorithm": key.get_name(), "remote_host_key_sha256": fingerprint,
+            "trusted_known_hosts": True, "daemon_instance_id": daemon_instance_id,
+            "connection_generation": generation, "daemon_source_sha": source_sha(),
+        }
 
     def mark_connection_lost(error: object | None = None) -> None:
         """Переводит SSH в восстановление и будит reconnect-worker."""
@@ -1116,7 +1156,13 @@ def daemon(args: argparse.Namespace) -> int:
     def run_remote_operation(operation_name: str, operation: Any) -> dict[str, Any]:
         """Запускает операцию только на рабочем SSH и не повторяет её после обрыва."""
         with command_lock:
-            operation_client = wait_for_connection(DEFAULT_RECONNECT_WAIT)
+            try:
+                operation_client = wait_for_connection(DEFAULT_RECONNECT_WAIT)
+            except RelayError as exc:
+                # Операция ещё не вызывалась; replay и machine result должны
+                # сохранить достоверное not_started при отказе host key/reconnect.
+                exc.command_started = False
+                raise
             try:
                 return operation(operation_client)
             except Exception as exc:
@@ -1130,7 +1176,7 @@ def daemon(args: argparse.Namespace) -> int:
 
     def reconnect_worker() -> None:
         """Последовательно восстанавливает SSH с ограниченным backoff."""
-        nonlocal client, connection_state, connection_error, reconnect_attempt
+        nonlocal client, connection_state, connection_error, reconnect_attempt, connection_generation
         delay_index = 0
         while not stop_event.is_set():
             reconnect_event.wait(timeout=0.5)
@@ -1188,6 +1234,7 @@ def daemon(args: argparse.Namespace) -> int:
             with client_lock:
                 old_client = client
                 client = new_client
+                connection_generation += 1
             if old_client is not new_client:
                 try:
                     old_client.close()
@@ -1249,9 +1296,14 @@ def daemon(args: argparse.Namespace) -> int:
             conn.settimeout(5)
 
             replay_reply: dict[str, Any] = {}
+            identity_before_command: dict[str, Any] | None = None
 
             def reply(message: dict[str, Any]) -> None:
                 message = {**replay_reply, **message}
+                if identity_before_command is not None and "verified_identity" not in message:
+                    message["verified_identity"] = identity_before_command
+                    message["identity_observed_before_command"] = True
+                    message["identity_current_after_result"] = bool(message.get("ok"))
                 try:
                     send_message(conn, message)
                 except OSError:
@@ -1266,6 +1318,8 @@ def daemon(args: argparse.Namespace) -> int:
                 action = request.get("action")
                 if action == "status":
                     snapshot = connection_snapshot()
+                    observed = (observed_identity(current_client())
+                                if snapshot["ssh_status"] == "connected" else None)
                     reply({
                         "ok": True,
                         "status": "active" if snapshot["ssh_status"] == "connected" else snapshot["ssh_status"],
@@ -1274,9 +1328,14 @@ def daemon(args: argparse.Namespace) -> int:
                         "last_error": snapshot["last_error"],
                         "reconnect_attempt": snapshot["reconnect_attempt"],
                         "version": __version__,
+                        **({"risky_identity_schema_version": 1}
+                           if globals().get("_p0_contract_installed") and globals().get("_safe_receipts_installed")
+                           else {}),
                         "replay_schema_version": 1,
                         "sudo_enabled": bool(args.enable_sudo),
                         "name": session_name,
+                        "verified_identity_schema_version": verified_identity_contract.SCHEMA_VERSION,
+                        "verified_identity": observed,
                     })
                     return
                 if action == "stop":
@@ -1371,6 +1430,22 @@ def daemon(args: argparse.Namespace) -> int:
                     reply({"ok": False, "protocol_error": "Некорректный путь risky receipt."})
                     return
 
+                expected_identity = request.get("expected_verified_identity")
+                if expected_identity is not None and not verified_identity_contract.validate_expected(expected_identity):
+                    reply({"ok": False, "command_started": False,
+                           "error_code": "invalid_expected_identity",
+                           "protocol_error": "Ожидаемая SSH identity некорректна."})
+                    return
+                requested_timeout = request.get("verified_command_timeout")
+                if requested_timeout is not None and (type(requested_timeout) is not int or
+                                                      not 1 <= requested_timeout <= 3600 or
+                                                      request.get("machine") is not True):
+                    reply({"ok": False, "command_started": False,
+                           "error_code": "invalid_verified_timeout",
+                           "protocol_error": "Некорректный конечный тайм-аут машинного запроса."})
+                    return
+                command_timeout = requested_timeout or args.command_timeout
+
                 if action == "sudo_exec" and sudo_password is None:
                     result = {
                         "ok": False,
@@ -1378,29 +1453,53 @@ def daemon(args: argparse.Namespace) -> int:
                     }
                 else:
                     def execute_with_optional_receipt(active_client: Any) -> dict[str, Any]:
+                        nonlocal identity_before_command
+                        verified_fingerprint = None
+                        if expected_identity is not None:
+                            identity_before_command = observed_identity(active_client)
+                            if not verified_identity_contract.matches(expected_identity, identity_before_command):
+                                return {"ok": False, "command_started": False,
+                                        "error_code": "verified_identity_mismatch",
+                                        "protocol_error": "SSH identity изменилась: команда не отправлена."}
+                        if risky and request.get("machine") is True:
+                            verified_fingerprint = verified_host_key_fingerprint(active_client)
                         with replay_cli.capturing(replay_writer):
                             if action == "sudo_exec":
                                 command_result = execute_sudo_command(
                                     active_client,
                                     command,
-                                    args.command_timeout,
+                                    command_timeout,
                                     sudo_password,
                                 )
                             else:
                                 command_result = execute_remote_command(
                                     active_client,
                                     command,
-                                    args.command_timeout,
+                                    command_timeout,
                                 )
+                        if verified_fingerprint is not None:
+                            command_result.update(
+                                remote_host=args.host,
+                                remote_port=args.port,
+                                remote_user=args.user,
+                                remote_host_key_sha256=verified_fingerprint,
+                            )
+                        if identity_before_command is not None:
+                            command_result["verified_identity"] = identity_before_command
                         if command_result.get("ok") and command_result.get("exit_code") == 0 and risky:
                             receipt = execute_risky_receipt(
                                 active_client,
-                                session=session,
+                                session=(
+                                    {**session, "remote_host_key_sha256": verified_fingerprint,
+                                     **({"verified_identity": identity_before_command}
+                                        if identity_before_command is not None else {})}
+                                    if verified_fingerprint is not None else session
+                                ),
                                 action=action,
                                 command=command,
                                 sudo=(action == "sudo_exec"),
                                 receipt_path=receipt_path,
-                                timeout_seconds=args.command_timeout,
+                                timeout_seconds=command_timeout,
                                 sudo_password=sudo_password,
                             )
                             command_result["risky_receipt"] = {
@@ -1935,4 +2034,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
