@@ -8,6 +8,7 @@ import sys
 import uuid
 from typing import Any
 
+import ssh_relay_identity as identity
 import ssh_relay_outcomes as outcomes
 import ssh_relay_receipts as receipts
 
@@ -92,6 +93,19 @@ def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> i
     result["change_description"] = change_description
 
     try:
+        expected_identity = identity.expected_from_args(args)
+    except ValueError as exc:
+        result["error_code"] = "invalid_verified_identity"
+        result["error_stage"] = "validation"
+        result["error_message"] = str(exc)
+        return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_NOT_STARTED)
+    verified_timeout = getattr(args, "verified_command_timeout", None)
+    if verified_timeout is not None and not 1 <= verified_timeout <= 3600:
+        result["error_code"] = "invalid_verified_timeout"
+        result["error_stage"] = "validation"
+        return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_NOT_STARTED)
+
+    try:
         session_name = core.validate_session_name(args.name)
     except core.RelayError as exc:
         result["error_code"] = "invalid_session"
@@ -124,9 +138,16 @@ def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> i
             "Активный daemon не подтвердил safe receipt v1. Остановите его и запустите заново текущим relay."
         )
         return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_NOT_STARTED)
+    if expected_identity is not None:
+        if (status.get("identity_schema_version") != identity.IDENTITY_SCHEMA_VERSION or
+                not identity.trusted_match(expected_identity, status.get("verified_identity"))):
+            result["error_code"] = "verified_identity_preflight_mismatch"
+            result["error_stage"] = "identity"
+            return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_NOT_STARTED)
+        result["preflight_verified_identity"] = status["verified_identity"]
 
     response_timeout = (
-        int(session.get("command_timeout", core.DEFAULT_COMMAND_TIMEOUT))
+        int(verified_timeout or session.get("command_timeout", core.DEFAULT_COMMAND_TIMEOUT))
         + int(session.get("reconnect_wait", core.DEFAULT_RECONNECT_WAIT))
         + 10
     )
@@ -146,6 +167,8 @@ def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> i
             receipt_path=receipt_path,
             receipt_id=receipt_id,
             machine=True,
+            **({"expected_verified_identity": expected_identity} if expected_identity is not None else {}),
+            **({"verified_command_timeout": verified_timeout} if verified_timeout is not None else {}),
             response_timeout=response_timeout,
         )
     except core.DaemonRequestError as exc:
@@ -178,6 +201,22 @@ def _machine_risky_cmd(core: Any, args: argparse.Namespace, *, action: str) -> i
         return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_UNKNOWN)
     finally:
         receipts._client_context.metadata = None
+
+    result["verified_identity"] = daemon_result.get("verified_identity")
+    result["identity_observed_before_command"] = daemon_result.get("identity_observed_before_command") is True
+    result["identity_current_after_result"] = daemon_result.get("identity_current_after_result") is True
+    if expected_identity is not None and not identity.trusted_match(expected_identity, result["verified_identity"]):
+        started = daemon_result.get("command_started")
+        if started is False:
+            result["error_code"] = "verified_identity_mismatch"
+            result["error_stage"] = "identity"
+            return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_NOT_STARTED)
+        result["operation_status"] = "unknown"
+        result["command_status"] = "unknown"
+        result["receipt_status"] = "unknown"
+        result["error_code"] = "verified_identity_result_unknown"
+        result["error_stage"] = "identity"
+        return outcomes._print_machine_result(result, outcomes.MACHINE_EXIT_UNKNOWN)
 
     if daemon_result.get("ok"):
         result["stdout"] = str(daemon_result.get("stdout", ""))
@@ -416,6 +455,13 @@ def install(core: Any) -> None:
             if command_parser is None:
                 continue
             original_handler = command_parser.get_default("handler")
+
+            for flag, field_type in (("--expected-remote-host", str), ("--expected-remote-port", int),
+                                     ("--expected-remote-user", str), ("--expected-host-key-algorithm", str),
+                                     ("--expected-host-key-sha256", str), ("--expected-daemon-instance-id", str),
+                                     ("--expected-connection-generation", int),
+                                     ("--verified-command-timeout", int)):
+                command_parser.add_argument(flag, type=field_type, help="Параметр строгой машинной проверки SSH identity.")
 
             def dispatch(
                 args: argparse.Namespace,

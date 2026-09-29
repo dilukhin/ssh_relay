@@ -7,6 +7,7 @@ __version__ = "0.10.1"
 
 import argparse
 import base64
+import json
 import os
 import sys
 import time
@@ -16,6 +17,7 @@ from typing import Any
 import ssh_relay_replay_cli as relay_replay_cli
 import ssh_relay_core as _core
 import ssh_relay_jobs as relay_jobs
+import ssh_relay_identity as relay_identity
 import ssh_relay_session as relay_session
 import ssh_relay_transfers as relay_transfers
 from ssh_relay_core import *  # noqa: F403 — сохраняем публичный интерфейс прежнего модуля.
@@ -733,10 +735,49 @@ def _top_level_subparsers(parser: argparse.ArgumentParser) -> argparse._SubParse
     raise RuntimeError("В базовом parser не найдены подкоманды.")
 
 
+def verified_status_cmd(args: argparse.Namespace) -> int:
+    """Выводит только daemon-attested identity активного транспорта."""
+    result: dict[str, Any] = {
+        "schema_version": 1, "tool": "ssh_relay", "action": "preflight",
+        "operation_status": "not_started", "identity_schema_version": relay_identity.IDENTITY_SCHEMA_VERSION,
+        "verified_identity": None,
+    }
+    if args.all:
+        result["error_code"] = "single_session_required"
+    else:
+        try:
+            session = _core.read_session(_core.validate_session_name(args.name))
+            response = _core.request_daemon(session, "status", response_timeout=5)
+            confirmed = response.get("verified_identity")
+            if (response.get("ok") and response.get("ssh_status") == "connected" and
+                    response.get("identity_schema_version") == relay_identity.IDENTITY_SCHEMA_VERSION and
+                    relay_identity.valid_expected(confirmed)):
+                result["operation_status"] = "succeeded"
+                result["verified_identity"] = confirmed
+                result["receipt_schema_version"] = response.get("receipt_schema_version")
+            else:
+                result["error_code"] = "verified_transport_unavailable"
+        except _core.RelayError:
+            result["error_code"] = "verified_transport_unavailable"
+    print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+    return 0 if result["operation_status"] == "succeeded" else 10
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _core.build_parser()
     subparsers = _top_level_subparsers(parser)
     relay_replay_cli.extend_parser(_core, subparsers)
+
+    status_parser = subparsers.choices["status"]
+    status_parser.add_argument("--json", action="store_true", help="Проверить identity SSH-транспорта в одном JSON.")
+    original_status_handler = status_parser.get_default("handler")
+
+    def status_dispatch(args: argparse.Namespace) -> int:
+        if args.json:
+            return verified_status_cmd(args)
+        return int(original_status_handler(args))
+
+    status_parser.set_defaults(handler=status_dispatch)
 
     # При --detach прежняя реализация повторно запускает внешний ssh_relay.py.
     subparsers.choices["daemon"].set_defaults(handler=daemon)

@@ -15,6 +15,7 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
 __version__ = "0.6.0"
 
 import argparse
+import ssh_relay_identity as relay_identity
 import ssh_relay_replay_cli as replay_cli
 import atexit
 import base64
@@ -1039,6 +1040,8 @@ def daemon(args: argparse.Namespace) -> int:
     client_lock = threading.Lock()
     connection_condition = threading.Condition()
     connection_state = "connected"
+    daemon_instance_id = str(uuid.uuid4())
+    connection_generation = 1
     connection_error: str | None = None
     reconnect_attempt = 0
     cleanup_done = False
@@ -1053,6 +1056,16 @@ def daemon(args: argparse.Namespace) -> int:
     def current_client() -> Any:
         with client_lock:
             return client
+
+    def verified_identity(candidate: Any) -> dict[str, Any] | None:
+        with client_lock:
+            if candidate is not client:
+                return None
+            generation = connection_generation
+        return relay_identity.observed_identity(
+            candidate, host=args.host, port=args.port, user=args.user,
+            daemon_instance_id=daemon_instance_id, connection_generation=generation,
+        )
 
     def mark_connection_lost(error: object | None = None) -> None:
         """Переводит SSH в восстановление и будит reconnect-worker."""
@@ -1130,7 +1143,7 @@ def daemon(args: argparse.Namespace) -> int:
 
     def reconnect_worker() -> None:
         """Последовательно восстанавливает SSH с ограниченным backoff."""
-        nonlocal client, connection_state, connection_error, reconnect_attempt
+        nonlocal client, connection_state, connection_error, reconnect_attempt, connection_generation
         delay_index = 0
         while not stop_event.is_set():
             reconnect_event.wait(timeout=0.5)
@@ -1188,6 +1201,7 @@ def daemon(args: argparse.Namespace) -> int:
             with client_lock:
                 old_client = client
                 client = new_client
+                connection_generation += 1
             if old_client is not new_client:
                 try:
                     old_client.close()
@@ -1249,9 +1263,14 @@ def daemon(args: argparse.Namespace) -> int:
             conn.settimeout(5)
 
             replay_reply: dict[str, Any] = {}
+            identity_before_command: dict[str, Any] | None = None
 
             def reply(message: dict[str, Any]) -> None:
                 message = {**replay_reply, **message}
+                if identity_before_command is not None and "verified_identity" not in message:
+                    message["verified_identity"] = identity_before_command
+                    message["identity_observed_before_command"] = True
+                    message["identity_current_after_result"] = bool(message.get("ok"))
                 try:
                     send_message(conn, message)
                 except OSError:
@@ -1266,6 +1285,8 @@ def daemon(args: argparse.Namespace) -> int:
                 action = request.get("action")
                 if action == "status":
                     snapshot = connection_snapshot()
+                    confirmed = (verified_identity(current_client())
+                                 if snapshot["ssh_status"] == "connected" else None)
                     reply({
                         "ok": True,
                         "status": "active" if snapshot["ssh_status"] == "connected" else snapshot["ssh_status"],
@@ -1277,6 +1298,8 @@ def daemon(args: argparse.Namespace) -> int:
                         "replay_schema_version": 1,
                         "sudo_enabled": bool(args.enable_sudo),
                         "name": session_name,
+                        "identity_schema_version": relay_identity.IDENTITY_SCHEMA_VERSION,
+                        "verified_identity": confirmed,
                     })
                     return
                 if action == "stop":
@@ -1371,6 +1394,22 @@ def daemon(args: argparse.Namespace) -> int:
                     reply({"ok": False, "protocol_error": "Некорректный путь risky receipt."})
                     return
 
+                expected_identity = request.get("expected_verified_identity")
+                if expected_identity is not None and not relay_identity.valid_expected(expected_identity):
+                    reply({"ok": False, "command_started": False,
+                           "error_code": "invalid_expected_identity",
+                           "protocol_error": "Некорректная ожидаемая SSH identity."})
+                    return
+                requested_timeout = request.get("verified_command_timeout")
+                if requested_timeout is not None and (type(requested_timeout) is not int or
+                                                      not 1 <= requested_timeout <= 3600 or
+                                                      not request.get("machine")):
+                    reply({"ok": False, "command_started": False,
+                           "error_code": "invalid_verified_timeout",
+                           "protocol_error": "Некорректный конечный timeout machine-команды."})
+                    return
+                command_timeout = requested_timeout or args.command_timeout
+
                 if action == "sudo_exec" and sudo_password is None:
                     result = {
                         "ok": False,
@@ -1378,19 +1417,32 @@ def daemon(args: argparse.Namespace) -> int:
                     }
                 else:
                     def execute_with_optional_receipt(active_client: Any) -> dict[str, Any]:
+                        nonlocal identity_before_command
+                        if request.get("machine") or expected_identity is not None:
+                            identity_before_command = verified_identity(active_client)
+                            if expected_identity is not None and identity_before_command is None:
+                                return {"ok": False, "command_started": False,
+                                        "error_code": "verified_transport_unavailable",
+                                        "protocol_error": "Проверенный SSH-транспорт недоступен до отправки команды."}
+                            if expected_identity is not None and not relay_identity.trusted_match(
+                                expected_identity, identity_before_command
+                            ):
+                                return {"ok": False, "command_started": False,
+                                        "error_code": "verified_identity_mismatch",
+                                        "protocol_error": "SSH identity изменилась; команда не отправлена."}
                         with replay_cli.capturing(replay_writer):
                             if action == "sudo_exec":
                                 command_result = execute_sudo_command(
                                     active_client,
                                     command,
-                                    args.command_timeout,
+                                    command_timeout,
                                     sudo_password,
                                 )
                             else:
                                 command_result = execute_remote_command(
                                     active_client,
                                     command,
-                                    args.command_timeout,
+                                    command_timeout,
                                 )
                         if command_result.get("ok") and command_result.get("exit_code") == 0 and risky:
                             receipt = execute_risky_receipt(
@@ -1400,7 +1452,7 @@ def daemon(args: argparse.Namespace) -> int:
                                 command=command,
                                 sudo=(action == "sudo_exec"),
                                 receipt_path=receipt_path,
-                                timeout_seconds=args.command_timeout,
+                                timeout_seconds=command_timeout,
                                 sudo_password=sudo_password,
                             )
                             command_result["risky_receipt"] = {

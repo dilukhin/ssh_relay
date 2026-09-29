@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ssh_relay_identity as identity
 import ssh_relay_replay_cli as replay_cli
 import json
 import sys
@@ -179,8 +180,30 @@ def _machine_exec_cmd(core: Any, args: argparse.Namespace, *, action: str) -> in
         return _print_machine_result(result, MACHINE_EXIT_NOT_STARTED)
 
     _apply_session_identity(result, session)
+    try:
+        expected_identity = identity.expected_from_args(args)
+    except ValueError as exc:
+        result["error_code"] = "invalid_verified_identity"
+        result["error_stage"] = "validation"
+        result["error_message"] = str(exc)
+        return _print_machine_result(result, MACHINE_EXIT_NOT_STARTED)
+    verified_timeout = getattr(args, "verified_command_timeout", None)
+    if verified_timeout is not None and not 1 <= verified_timeout <= 3600:
+        result["error_code"] = "invalid_verified_timeout"
+        return _print_machine_result(result, MACHINE_EXIT_NOT_STARTED)
+    if expected_identity is not None:
+        try:
+            preflight = core.request_daemon(session, "status", response_timeout=5)
+        except core.RelayError:
+            preflight = {}
+        if (preflight.get("identity_schema_version") != identity.IDENTITY_SCHEMA_VERSION or
+                not identity.trusted_match(expected_identity, preflight.get("verified_identity"))):
+            result["error_code"] = "verified_identity_preflight_mismatch"
+            result["error_stage"] = "identity"
+            return _print_machine_result(result, MACHINE_EXIT_NOT_STARTED)
+        result["preflight_verified_identity"] = expected_identity
     response_timeout = (
-        int(session.get("command_timeout", core.DEFAULT_COMMAND_TIMEOUT))
+        int(verified_timeout or session.get("command_timeout", core.DEFAULT_COMMAND_TIMEOUT))
         + int(session.get("reconnect_wait", core.DEFAULT_RECONNECT_WAIT))
         + 10
     )
@@ -193,6 +216,8 @@ def _machine_exec_cmd(core: Any, args: argparse.Namespace, *, action: str) -> in
             risky=False,
             receipt_path=args.receipt_path,
             machine=True,
+            **({"expected_verified_identity": expected_identity} if expected_identity is not None else {}),
+            **({"verified_command_timeout": verified_timeout} if verified_timeout is not None else {}),
             response_timeout=response_timeout,
         )
     except core.DaemonRequestError as exc:
@@ -221,6 +246,19 @@ def _machine_exec_cmd(core: Any, args: argparse.Namespace, *, action: str) -> in
         result["error_message"] = str(exc)
         return _print_machine_result(result, MACHINE_EXIT_UNKNOWN)
 
+    result["verified_identity"] = daemon_result.get("verified_identity")
+    result["identity_observed_before_command"] = daemon_result.get("identity_observed_before_command") is True
+    result["identity_current_after_result"] = daemon_result.get("identity_current_after_result") is True
+    if expected_identity is not None and not identity.trusted_match(expected_identity, result["verified_identity"]):
+        if daemon_result.get("command_started") is False:
+            result["error_code"] = "verified_identity_mismatch"
+            result["error_stage"] = "identity"
+            return _print_machine_result(result, MACHINE_EXIT_NOT_STARTED)
+        result["operation_status"] = "unknown"
+        result["command_status"] = "unknown"
+        result["error_code"] = "verified_identity_result_unknown"
+        result["error_stage"] = "identity"
+        return _print_machine_result(result, MACHINE_EXIT_UNKNOWN)
     result["stdout"] = str(daemon_result.get("stdout", ""))
     result["stderr"] = str(daemon_result.get("stderr", ""))
     if daemon_result.get("ok"):
