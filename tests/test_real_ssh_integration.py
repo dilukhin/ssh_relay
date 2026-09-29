@@ -226,6 +226,26 @@ class RealSSHIntegrationTests(unittest.TestCase):
         self.assertNotIn(PASSWORD, stderr)
         self.assertEqual([], self.server.auth_attempts)
 
+    def test_changed_host_key_on_reconnect_prevents_risky_command(self) -> None:
+        self.start_daemon()
+        count = self.server.connection_count
+        self.server.host_key = self.wrong_host_key
+        self.server.drop_all_transports()
+        self.assertTrue(self.server.wait_for_connections(count + 1, timeout=7))
+
+        args = ssh_relay.build_parser().parse_args([
+            "exec", "--name", "ci-real-ssh", "--json", "--risky",
+            "--transaction-id", "test-reconnect-rejected", "test:real-success",
+        ])
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = args.handler(args)
+        result = json.loads(output.getvalue())
+        self.assertEqual(10, code, result)
+        self.assertEqual("not_started", result["operation_status"])
+        self.assertEqual("not_attempted", result["receipt_status"])
+        self.assertNotIn("test:real-success", self.server.commands)
+
     def test_real_wrong_password_prevents_session_creation(self) -> None:
         process = self.start_daemon(password="wrong-test-password", expect_session=False)
         stdout, stderr = process.communicate(timeout=8)
