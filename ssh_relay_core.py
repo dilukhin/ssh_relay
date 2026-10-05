@@ -16,6 +16,7 @@ __version__ = "0.6.0"
 
 import argparse
 import ssh_relay_verified_identity as verified_identity_contract
+import ssh_relay_sudo_jobs as sudo_jobs_contract
 import hashlib
 import ssh_relay_replay_cli as replay_cli
 import atexit
@@ -902,6 +903,9 @@ def check_existing_session(name: str) -> bool:
 
 
 def daemon(args: argparse.Namespace) -> int:
+    if getattr(args, "enable_sudo_jobs", False) and not args.enable_sudo:
+        print("--enable-sudo-jobs требует --enable-sudo.", file=sys.stderr)
+        return 2
     if getattr(args, "detach", False):
         return start_detached_daemon(args)
 
@@ -1333,6 +1337,8 @@ def daemon(args: argparse.Namespace) -> int:
                            else {}),
                         "replay_schema_version": 1,
                         "sudo_enabled": bool(args.enable_sudo),
+                        "sudo_job_schema_version": sudo_jobs_contract.SCHEMA,
+                        "sudo_jobs_enabled": bool(getattr(args, "enable_sudo_jobs", False) and args.enable_sudo),
                         "name": session_name,
                         "verified_identity_schema_version": verified_identity_contract.SCHEMA_VERSION,
                         "verified_identity": observed,
@@ -1344,6 +1350,27 @@ def daemon(args: argparse.Namespace) -> int:
                     reconnect_event.set()
                     with connection_condition:
                         connection_condition.notify_all()
+                    return
+                if action == "sudo_job":
+                    operation_entered = False
+                    def sudo_job_operation(active_client: Any) -> dict[str, Any]:
+                        nonlocal operation_entered
+                        operation_entered = True
+                        return sudo_jobs_contract.daemon_request(
+                            request, observed_identity(active_client), active_client,
+                            sudo_password, bool(getattr(args, "enable_sudo_jobs", False) and args.enable_sudo),
+                        )
+                    try:
+                        result = run_remote_operation(
+                            "обращения к длительному sudo-заданию",
+                            sudo_job_operation,
+                        )
+                    except Exception:
+                        result = {"ok": True, "schema_version": sudo_jobs_contract.SCHEMA,
+                                  "state": "unknown" if operation_entered else "not_started",
+                                  "request_not_started": not operation_entered,
+                                  "error_code": "sudo_job_connection_unavailable"}
+                    reply(result)
                     return
                 if action not in {"exec", "sudo_exec", "download", "upload"}:
                     reply({"ok": False, "protocol_error": "Неизвестное действие relay."})
@@ -1950,6 +1977,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-sudo",
         action="store_true",
         help="Включить явный режим sudo с ручным вводом sudo-пароля в терминале daemon.",
+    )
+    daemon_parser.add_argument(
+        "--enable-sudo-jobs", action="store_true",
+        help="Дополнительно разрешить длительные sudo-задания systemd; требует --enable-sudo.",
     )
     daemon_parser.add_argument(
         "--detach",

@@ -1,0 +1,44 @@
+name: Длительные sudo-задания на одноразовой Ubuntu
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  sudo-jobs-e2e:
+    name: Sudo jobs ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Установить испытательные зависимости
+        run: |
+          python -m pip install paramiko coverage==7.15.4
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server
+          sudo mkdir -p /run/sshd
+      - name: Подготовить пользователя, которому нужен пароль sudo
+        run: |
+          sudo useradd -m -s /bin/sh relayci
+          printf 'relayci:relay-ci-artificial-password-52\n' | sudo chpasswd
+          printf 'relayci ALL=(root) PASSWD: ALL\nDefaults:relayci timestamp_timeout=0\n' | sudo tee /etc/sudoers.d/relayci >/dev/null
+          sudo chmod 440 /etc/sudoers.d/relayci
+          sudo visudo -cf /etc/sudoers.d/relayci
+      - name: Проверить защищённые файлы, подмены и наблюдатель root
+        run: sudo "$(command -v python)" -m unittest discover -s tests -p test_sudo_jobs.py -v
+      - name: Выполнить настоящую установку пакета через SSH, sudo и systemd
+        env:
+          SSH_RELAY_SUDO_JOB_E2E: '1'
+          SSH_RELAY_SOURCE_SHA: ${{ github.sha }}
+        run: python tests/test_sudo_job_e2e.py
