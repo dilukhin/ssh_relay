@@ -214,6 +214,27 @@ class SudoJobE2E(unittest.TestCase):
         self.assertEqual(result["state"], "not_started", result)
         self.assertEqual(self.status(request)["error_code"], "job_not_found")
 
+    def test_07_real_ssh_disconnect_does_not_stop_root_job(self):
+        request, _ = self.launch("sleep 4; exit 0")
+        old_generation = self.identity["connection_generation"]
+        # Завершаются только процессы искусственного SSH-пользователя на runner.
+        # Служба root находится в отдельной группе systemd и не затрагивается.
+        subprocess.run(["sudo", "-n", "pkill", "-TERM", "-u", "relayci"], check=True)
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            status = ssh_relay._core.request_daemon(self.session, "status", response_timeout=3)
+            current = status.get("verified_identity")
+            if current and current["connection_generation"] > old_generation:
+                type(self).identity = current
+                self.pin.write_text(json.dumps(current))
+                break
+            time.sleep(0.1)
+        else:
+            self.fail("SSH не восстановился с новым поколением")
+        result = self.wait(request)
+        self.assertEqual(result["state"], "succeeded", result)
+        self.assertEqual(result["completion_witness"]["job_id"], request["job_id"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
