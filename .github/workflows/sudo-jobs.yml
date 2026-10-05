@@ -42,3 +42,46 @@ jobs:
           SSH_RELAY_SUDO_JOB_E2E: '1'
           SSH_RELAY_SOURCE_SHA: ${{ github.sha }}
         run: python tests/test_sudo_job_e2e.py
+
+  windows-ubuntu-vm:
+    name: Windows → Ubuntu ${{ matrix.release }} VM
+    runs-on: windows-2022
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        release: [jammy, noble]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Установить испытательные зависимости Windows
+        shell: pwsh
+        run: |
+          python -m pip install paramiko
+          if ($LASTEXITCODE -ne 0) { throw 'Не удалось установить paramiko' }
+          $installer = Join-Path $env:RUNNER_TEMP 'qemu-installer.exe'
+          Invoke-WebRequest 'https://qemu.weilnetz.de/w64/qemu-w64-setup-20260811.exe' -OutFile $installer
+          $expected = '5bcf9eed634e8575a37b74f445af41a2fe4106da512d0c30c368301d4c105037fdfab40a5287367a28a957624cddebbc8c07e16c88ab6634f554cdf3d16bf543'
+          if ((Get-FileHash $installer -Algorithm SHA512).Hash.ToLowerInvariant() -ne $expected) {
+            throw 'Не совпала контрольная сумма установщика QEMU'
+          }
+          $process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Не удалось установить QEMU' }
+          & "$env:ProgramFiles\qemu\qemu-system-x86_64.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw 'QEMU недоступен' }
+      - name: Проверить Windows-клиент, отказы и перезагрузки гостевой Ubuntu
+        env:
+          SSH_RELAY_SUDO_JOB_VM_E2E: '1'
+          SSH_RELAY_VM_RELEASE: ${{ matrix.release }}
+          SSH_RELAY_SOURCE_SHA: ${{ github.sha }}
+          PYTHONIOENCODING: utf-8
+        run: python tests/test_sudo_job_vm_e2e.py
+      - name: Сохранить итог испытаний без сессий, ключей и паролей
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ubuntu-${{ matrix.release }}-report
+          path: ${{ runner.temp }}/relay-vm-report.json
+          if-no-files-found: warn

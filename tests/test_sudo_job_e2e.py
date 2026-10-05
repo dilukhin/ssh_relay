@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import paramiko
 import ssh_relay
 import ssh_relay_sudo_jobs as jobs
+from ci.sudo_job_fault_cases import SudoJobFaultCases
 
 PROJECT = Path(__file__).resolve().parents[1]
 PASSWORD = "relay-ci-artificial-password-52"
@@ -28,7 +29,7 @@ PASSWORD = "relay-ci-artificial-password-52"
 @unittest.skipUnless(os.environ.get("SSH_RELAY_SUDO_JOB_E2E") == "1" and
                      os.environ.get("GITHUB_ACTIONS") == "true" and sys.platform == "linux",
                      "Требуется отдельный одноразовый runner Ubuntu с systemd")
-class SudoJobE2E(unittest.TestCase):
+class SudoJobE2E(SudoJobFaultCases, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix="relay-root-e2e-")
@@ -57,7 +58,7 @@ class SudoJobE2E(unittest.TestCase):
                     break
             except OSError:
                 time.sleep(0.05)
-        cls.env = {**os.environ, "XDG_STATE_HOME": str(cls.state),
+        cls.env = {**os.environ, "XDG_STATE_HOME": str(cls.state), "LOCALAPPDATA": str(cls.state),
                    "SSH_RELAY_SUDO_JOB_TEST_PASSWORD": PASSWORD, "SSH_RELAY_SUDO_JOB_TEST_PORT": str(cls.port),
                    "SSH_RELAY_SUDO_JOB_TEST_KNOWN_HOSTS": str(cls.known), "PYTHONIOENCODING": "utf-8"}
         cls.client = paramiko.SSHClient()
@@ -76,7 +77,7 @@ class SudoJobE2E(unittest.TestCase):
         cls.process = subprocess.Popen([sys.executable, "-u", str(PROJECT / "tests/daemon_sudo_job_runner.py")],
                                        cwd=PROJECT, env=cls.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         path = cls.state / "ssh_relay/sessions/ci-sudo-job.json"
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             if cls.process.poll() is not None:
                 raise AssertionError(cls.process.communicate())
@@ -119,6 +120,19 @@ class SudoJobE2E(unittest.TestCase):
                     raise AssertionError("Пароль sudo попал в вывод daemon")
         finally:
             cls.tmp.cleanup()
+
+    def admin(self, command):
+        result = subprocess.run(["sudo", "-n", "/bin/sh", "-c", command],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr.decode()[:2000])
+        return result.stdout.decode()
+
+    def new_client(self):
+        client = paramiko.SSHClient()
+        client.load_host_keys(str(self.known))
+        client.connect("127.0.0.1", port=self.port, username="relayci", password=PASSWORD,
+                       allow_agent=False, look_for_keys=False)
+        return client
 
     def launch(self, command):
         request = {"schema_version": 1, "operation": "start", "job_id": str(uuid.uuid4()),
@@ -220,7 +234,7 @@ class SudoJobE2E(unittest.TestCase):
         # Завершаются только процессы искусственного SSH-пользователя на runner.
         # Служба root находится в отдельной группе systemd и не затрагивается.
         subprocess.run(["sudo", "-n", "pkill", "-TERM", "-u", "relayci"], check=True)
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             status = ssh_relay._core.request_daemon(self.session, "status", response_timeout=3)
             current = status.get("verified_identity")
