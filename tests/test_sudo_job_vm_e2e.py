@@ -76,7 +76,8 @@ class WindowsUbuntuE2E(base.SudoJobE2E):
         old = self.identity["connection_generation"]
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
-            value = ssh_relay._core.request_daemon(self.session, "status", response_timeout=5).get("verified_identity")
+            status = ssh_relay._core.request_daemon(self.session, "status", response_timeout=5)
+            value = status.get("verified_identity")
             if value and value["connection_generation"] > old:
                 type(self).identity = value
                 self.pin.write_text(json.dumps(value))
@@ -89,7 +90,8 @@ class WindowsUbuntuE2E(base.SudoJobE2E):
                 ssh_relay._core.request_daemon(self.session, "sudo_job", response_timeout=35,
                     sudo_job={**probe_request, "operation": "status"}, expected_verified_identity=value)
             time.sleep(1)
-        self.fail("Daemon не восстановил SSH с новым поколением")
+        details = {key: status.get(key) for key in ("ssh_status", "last_error", "reconnect_attempt", "verified_identity")}
+        self.fail("Daemon не восстановил SSH: " + json.dumps(details, ensure_ascii=False).replace(PASSWORD, "[СКРЫТО]"))
 
     def test_07_real_ssh_disconnect_does_not_stop_root_job(self):
         request, _ = self.launch("sleep 20; exit 0")

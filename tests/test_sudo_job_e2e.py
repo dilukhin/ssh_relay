@@ -74,8 +74,15 @@ class SudoJobE2E(SudoJobFaultCases, unittest.TestCase):
 
     @classmethod
     def start_daemon(cls):
+        # PIPE без постоянного чтения блокирует daemon после серии ошибок
+        # соединения, особенно при малом буфере Windows. Эти журналы остаются
+        # только в одноразовом стенде и проверяются на отсутствие пароля.
+        index = len(cls.transcripts) // 2
+        cls.daemon_log_paths = [cls.root / f"daemon-{index}.{name}.log" for name in ("stdout", "stderr")]
+        cls.daemon_log_streams = [path.open("wb") for path in cls.daemon_log_paths]
         cls.process = subprocess.Popen([sys.executable, "-u", str(PROJECT / "tests/daemon_sudo_job_runner.py")],
-                                       cwd=PROJECT, env=cls.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                       cwd=PROJECT, env=cls.env,
+                                       stdout=cls.daemon_log_streams[0], stderr=cls.daemon_log_streams[1])
         path = cls.state / "ssh_relay/sessions/ci-sudo-job.json"
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
@@ -101,7 +108,10 @@ class SudoJobE2E(SudoJobFaultCases, unittest.TestCase):
             return
         if cls.process.poll() is None:
             ssh_relay._core.request_daemon(cls.session, "stop", response_timeout=3)
-        cls.transcripts.extend(cls.process.communicate(timeout=10))
+        cls.process.communicate(timeout=10)
+        for stream in cls.daemon_log_streams:
+            stream.close()
+        cls.transcripts.extend(path.read_bytes() for path in cls.daemon_log_paths)
         cls.process = None
 
     @classmethod
