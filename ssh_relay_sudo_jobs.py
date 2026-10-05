@@ -36,7 +36,7 @@ def valid_uuid(value: object) -> bool:
 
 
 def validate_payload(value: object) -> bool:
-    if not isinstance(value, dict) or value.get("schema_version") != SCHEMA:
+    if not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] != SCHEMA:
         return False
     if value.get("operation") not in ("start", "status", "tail", "stop"):
         return False
@@ -116,7 +116,7 @@ def exchange(client: Any, password: str, payload: dict[str, Any], *, timeout: fl
                 if code != 0:
                     return {"state": "unknown", "error_code": "helper_exit_without_result"}
                 result = json.loads(bytes(output))
-                if (not isinstance(result, dict) or result.get("schema_version") != SCHEMA or
+                if (not isinstance(result, dict) or type(result.get("schema_version")) is not int or result["schema_version"] != SCHEMA or
                         result.get("state") not in ("not_started", "running", "succeeded", "failed", "unknown")):
                     raise ValueError("invalid_helper_result")
                 return result
@@ -191,7 +191,8 @@ def cli(core: Any, args: argparse.Namespace) -> int:
     payload = {"schema_version": SCHEMA, "operation": "status" if operation == "wait" else operation,
                "job_id": args.job_id, "transaction_id": args.transaction_id,
                "command_sha256": getattr(args, "command_sha256", None)}
-    result = {"schema_version": SCHEMA, "operation": operation, "job_id": args.job_id,
+    result = {"schema_version": SCHEMA, "tool": "ssh_relay", "tool_version": core.__version__,
+              "result_type": "sudo_job", "operation": operation, "job_id": args.job_id,
               "transaction_id": args.transaction_id, "state": "not_started" if operation == "start" else "unknown"}
 
     def emit(value: dict[str, Any]) -> int:
@@ -249,14 +250,32 @@ def cli(core: Any, args: argparse.Namespace) -> int:
         # Допускается отсутствие identity только при отказе ДО отправки запроса.
         if response["state"] != "not_started" and not identity.matches(expected, response.get("verified_identity")):
             return emit({"state": "unknown", "error_code": "response_identity_mismatch"})
+        if response["state"] == "running" and not isinstance(response.get("start_witness"), dict):
+            return emit({"state": "unknown", "error_code": "start_witness_missing"})
+        if response["state"] in ("succeeded", "failed"):
+            code = response.get("exit_code")
+            if (type(code) is not int or not 0 <= code <= 255 or
+                    (response["state"] == "succeeded") != (code == 0) or
+                    not (isinstance(response.get("completion_witness"), dict) or
+                         (code == 0 and response.get("accounting_status") == "failed" and
+                          isinstance(response.get("start_witness"), dict)))):
+                return emit({"state": "unknown", "error_code": "completion_result_invalid"})
         for key in ("start_witness", "completion_witness"):
             proof = response.get(key)
             if proof is not None:
+                if not isinstance(proof, dict):
+                    return emit({"state": "unknown", "error_code": "witness_binding_mismatch"})
                 original = {field: value for field, value in proof.items() if field != "witness_sha256"}
                 canonical = json.dumps(original, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
                 if (proof.get("witness_sha256") != hashlib.sha256(canonical).hexdigest() or
                         any(proof.get(field) != payload[field] for field in ("job_id", "transaction_id", "command_sha256")) or
-                        proof.get("target") != {field: expected[field] for field in TARGET_FIELDS}):
+                        proof.get("target") != {field: expected[field] for field in TARGET_FIELDS} or
+                        proof.get("phase") != ("start" if key == "start_witness" else "completion") or
+                        not valid_uuid(proof.get("boot_id")) or
+                        proof.get("unit") != "ssh-relay-sudo-" + uuid.UUID(payload["job_id"]).hex + ".service" or
+                        not isinstance(proof.get("invocation_id"), str) or
+                        not re.fullmatch("[0-9a-f]{32}", proof["invocation_id"]) or
+                        (key == "completion_witness" and proof.get("exit_code") != response.get("exit_code"))):
                     return emit({"state": "unknown", "error_code": "witness_binding_mismatch"})
         if operation != "wait" or response["state"] != "running":
             return emit(response)

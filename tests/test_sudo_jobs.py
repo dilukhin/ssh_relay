@@ -167,7 +167,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_invalid_payload_bounds_and_hash(self):
         valid = payload()
-        for invalid in ({**valid, "job_id": "../../escape"}, {**valid, "command": "different"},
+        for invalid in ({**valid, "schema_version": True}, {**valid, "job_id": "../../escape"}, {**valid, "command": "different"},
                         payload("x" * (jobs.MAX_COMMAND + 1)), payload("\x00"),
                         {**valid, "operation": "tail", "stream": "stdout", "max_bytes": 65537}):
             self.assertFalse(jobs.validate_payload(invalid))
@@ -183,6 +183,16 @@ class CliTests(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def proof(self, phase='start', code=0):
+        value = {key: self.request[key] for key in ('schema_version', 'job_id', 'transaction_id', 'command_sha256')}
+        value.update(target={key: self.identity[key] for key in jobs.TARGET_FIELDS}, boot_id=str(uuid.uuid4()),
+                     unit='ssh-relay-sudo-' + uuid.UUID(self.request['job_id']).hex + '.service',
+                     phase=phase, invocation_id='a' * 32)
+        if phase == 'completion':
+            value['exit_code'] = code
+        value['witness_sha256'] = hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        return value
 
     def args(self, operation="start", *extra):
         arguments = ["sudo-job", operation, "--job-id", self.request["job_id"],
@@ -209,7 +219,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(call.call_count, 1)
 
     def test_launch_success_only_reports_running(self):
-        code, result, call = self.run_cli(self.args(), {"ok": True, "schema_version": 1, "state": "running", "verified_identity": self.identity})
+        code, result, call = self.run_cli(self.args(), {"ok": True, "schema_version": 1, "state": "running", "verified_identity": self.identity, "start_witness": self.proof()})
         self.assertEqual(code, 0)
         self.assertEqual(result["state"], "running")
         self.assertNotIn("exit_code", result)
@@ -224,22 +234,42 @@ class CliTests(unittest.TestCase):
 
     def test_command_success_accounting_failure_not_disguised_as_not_started(self):
         response = {"ok": True, "schema_version": 1, "state": "succeeded", "exit_code": 0,
-                    "accounting_status": "failed", "error_code": "completion_record_failed", "verified_identity": self.identity}
+                    "accounting_status": "failed", "error_code": "completion_record_failed", "verified_identity": self.identity, "start_witness": self.proof()}
         code, result, _ = self.run_cli(self.args("status"), response)
         self.assertEqual(code, 2)
         self.assertEqual(result["state"], "succeeded")
         self.assertEqual(result["exit_code"], 0)
 
     def test_corrupt_witness_rejected(self):
-        response = {"ok": True, "schema_version": 1, "state": "succeeded", "verified_identity": self.identity,
+        response = {"ok": True, "schema_version": 1, "state": "succeeded", "exit_code": 0, "verified_identity": self.identity,
                     "completion_witness": {"job_id": str(uuid.uuid4()), "witness_sha256": "a" * 64}}
         code, result, _ = self.run_cli(self.args("status"), response)
         self.assertEqual(code, 3)
         self.assertEqual(result["error_code"], "witness_binding_mismatch")
 
+    def test_terminal_success_without_evidence_is_unknown(self):
+        response = {"ok": True, "schema_version": 1, "state": "succeeded", "exit_code": 0,
+                    "verified_identity": self.identity}
+        code, result, _ = self.run_cli(self.args("status"), response)
+        self.assertEqual(code, 3)
+        self.assertEqual(result["state"], "unknown")
+
+    def test_correctly_hashed_wrong_phase_is_not_completion(self):
+        response = {"ok": True, "schema_version": 1, "state": "succeeded", "exit_code": 0,
+                    "verified_identity": self.identity, "completion_witness": self.proof('start')}
+        code, result, _ = self.run_cli(self.args("status"), response)
+        self.assertEqual(code, 3)
+        self.assertEqual(result["error_code"], "witness_binding_mismatch")
+
+    def test_running_without_start_witness_is_unknown(self):
+        response = {"ok": True, "schema_version": 1, "state": "running", "verified_identity": self.identity}
+        code, result, _ = self.run_cli(self.args(), response)
+        self.assertEqual(code, 3)
+        self.assertEqual(result["error_code"], "start_witness_missing")
+
     def test_timeout_never_sends_stop(self):
         args = self.args("wait", "--timeout", "1")
-        response = {"ok": True, "schema_version": 1, "state": "running", "verified_identity": self.identity}
+        response = {"ok": True, "schema_version": 1, "state": "running", "verified_identity": self.identity, "start_witness": self.proof()}
         with mock.patch.object(jobs.time, "monotonic", side_effect=[0, 2]):
             code, result, call = self.run_cli(args, response)
         self.assertEqual(code, 124)

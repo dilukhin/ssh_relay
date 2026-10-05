@@ -1367,7 +1367,7 @@ def daemon(args: argparse.Namespace) -> int:
                         )
                     except Exception:
                         result = {"ok": True, "schema_version": sudo_jobs_contract.SCHEMA,
-                                  "state": "unknown" if operation_entered else "not_started",
+                                  "state": "not_started" if not operation_entered and isinstance(request.get("sudo_job"), dict) and request["sudo_job"].get("operation") == "start" else "unknown",
                                   "request_not_started": not operation_entered,
                                   "error_code": "sudo_job_connection_unavailable"}
                     reply(result)

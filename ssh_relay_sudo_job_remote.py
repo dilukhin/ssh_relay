@@ -62,7 +62,10 @@ def secure_directory(path, create=False):
         except FileNotFoundError:
             if not create or parent != path:
                 raise
-            parent.mkdir(mode=0o700)
+            try:
+                parent.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
             info = parent.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
             raise Refusal("unsafe_directory")
@@ -155,7 +158,7 @@ def preflight():
 
 
 def validate(request):
-    if not isinstance(request, dict) or request.get("schema_version") != SCHEMA:
+    if not isinstance(request, dict) or type(request.get("schema_version")) is not int or request["schema_version"] != SCHEMA:
         raise Refusal("unsupported_schema")
     if request.get("operation") not in ("start", "status", "tail", "stop"):
         raise Refusal("invalid_operation")
@@ -316,7 +319,7 @@ def control(request):
     if request["operation"] == "stop" and result["state"] == "running":
         # Проверка InvocationID выше выполняется в том же root-процессе перед сигналом.
         # Имя unit зарезервировано навсегда; обычный SSH-пользователь не может его заменить.
-        subprocess.run(["/usr/bin/systemctl", "--no-ask-password", "kill", "--kill-whom=all",
+        subprocess.run(["/usr/bin/systemctl", "--no-ask-password", "kill", "--kill-who=all",
                         "--signal=SIGTERM", metadata["unit"]],
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        env=ENV, timeout=5, check=True)
