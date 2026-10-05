@@ -69,6 +69,7 @@ def exchange(client: Any, password: str, payload: dict[str, Any], *, timeout: fl
     любые ошибки означают unknown. Текст stderr никогда не возвращается клиенту.
     """
     channel = None
+    transport = None
     sent_payload = False
     started = time.monotonic()
     try:
@@ -124,6 +125,13 @@ def exchange(client: Any, password: str, payload: dict[str, Any], *, timeout: fl
                 time.sleep(0.01)
         raise TimeoutError
     except Exception:
+        # Зависший канал может оставить is_active=True после сброса узла.
+        # Закрытие будит штатное восстановление daemon; запрос не повторяется.
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                pass
         return {"state": "unknown" if sent_payload else "not_started",
                 "error_code": "ssh_response_unknown" if sent_payload else "sudo_job_transport_unavailable"}
     finally:

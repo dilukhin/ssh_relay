@@ -133,6 +133,20 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(result["state"], "unknown")
         self.assertEqual(len(channel.sent), 2)
         client.get_transport.return_value.open_session.assert_called_once()
+        client.get_transport.return_value.close.assert_called_once()
+
+    def test_failed_channel_invalidates_stale_active_transport_without_retry(self):
+        client = mock.Mock()
+        transport = client.get_transport.return_value
+        active = {"value": True}
+        transport.is_active.side_effect = lambda: active["value"]
+        transport.open_session.side_effect = OSError("зависший транспорт после сброса")
+        transport.close.side_effect = lambda: active.update(value=False)
+        result = jobs.exchange(client, "secret", payload())
+        self.assertEqual(result["state"], "not_started")
+        self.assertFalse(transport.is_active())
+        transport.open_session.assert_called_once()
+        transport.close.assert_called_once()
 
     def test_channel_open_failure_cannot_have_started(self):
         client = mock.Mock()

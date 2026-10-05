@@ -72,7 +72,7 @@ class WindowsUbuntuE2E(base.SudoJobE2E):
     def new_client(self):
         return self.vm.connect("relayci")
 
-    def reconnect(self):
+    def reconnect(self, probe_request=None):
         old = self.identity["connection_generation"]
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
@@ -83,13 +83,18 @@ class WindowsUbuntuE2E(base.SudoJobE2E):
                 self.client.close()
                 type(self).client = self.new_client()
                 return
+            if value and probe_request is not None:
+                # Читается уже известное задание. Чтение выявляет зависший
+                # транспорт после сброса; полезная команда не повторяется.
+                ssh_relay._core.request_daemon(self.session, "sudo_job", response_timeout=35,
+                    sudo_job={**probe_request, "operation": "status"}, expected_verified_identity=value)
             time.sleep(1)
         self.fail("Daemon не восстановил SSH с новым поколением")
 
     def test_07_real_ssh_disconnect_does_not_stop_root_job(self):
         request, _ = self.launch("sleep 20; exit 0")
         self.admin("pkill -TERM -u relayci")
-        self.reconnect()
+        self.reconnect(request)
         result = self.wait(request)
         self.assertEqual(result["state"], "succeeded", result)
         self.assertEqual(result["completion_witness"]["job_id"], request["job_id"])
@@ -110,7 +115,7 @@ class WindowsUbuntuE2E(base.SudoJobE2E):
             self.fail("Полезная команда не начала работу")
         self.admin("sync")
         new_boot = self.vm.reset()
-        self.reconnect()
+        self.reconnect(running)
         self.assertNotEqual(new_boot, proof["boot_id"])
         self.assertEqual(self.status(completed)["completion_witness"], proof)
         unknown = self.status(running)
@@ -124,7 +129,7 @@ class WindowsUbuntuE2E(base.SudoJobE2E):
         request, _ = self.launch("exit 0")
         proof = self.wait(request)["completion_witness"]
         self.vm.reboot()
-        self.reconnect()
+        self.reconnect(request)
         self.assertEqual(self.status(request)["completion_witness"], proof)
 
     def test_13_native_windows_cli_and_wait_timeout(self):
@@ -163,9 +168,18 @@ if __name__ == "__main__":
         raise SystemExit("Этот набор запускается только выделенным заданием Windows CI")
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(WindowsUbuntuE2E)
     started = time.monotonic()
-    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    class EvidenceResult(unittest.TextTestResult):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.passed = []
+
+        def addSuccess(self, case):
+            self.passed.append(case.id())
+            super().addSuccess(case)
+
+    result = unittest.TextTestRunner(verbosity=2, resultclass=EvidenceResult).run(suite)
     report = {"source_sha": os.environ["SSH_RELAY_SOURCE_SHA"], "client_os": platform.platform(),
-              "guest": os.environ["SSH_RELAY_VM_RELEASE"], "tests_run": result.testsRun,
+              "guest": os.environ["SSH_RELAY_VM_RELEASE"], "tests_run": result.testsRun, "passed": result.passed,
               "failures": [case.id() for case, _ in result.failures],
               "errors": [case.id() for case, _ in result.errors],
               "skipped": [case.id() for case, _ in result.skipped],

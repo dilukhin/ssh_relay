@@ -79,8 +79,8 @@ class UbuntuVM:
         threading.Thread(target=self.http.serve_forever, daemon=True).start()
         qemu = shutil.which("qemu-system-x86_64") or str(Path(os.environ["ProgramFiles"]) / "qemu/qemu-system-x86_64.exe")
         qemu_img = str(Path(qemu).with_name("qemu-img.exe" if os.name == "nt" else "qemu-img"))
-        subprocess.run([qemu_img, "resize", str(image), "5G"], check=True)
-        args = [qemu, "-accel", "tcg,thread=multi", "-machine", "q35", "-m", "2048", "-smp", "2",
+        subprocess.run([qemu_img, "resize", str(image), "20G"], check=True)
+        args = [qemu, "-accel", "tcg,thread=multi", "-machine", "q35", "-m", "2048", "-smp", "4",
                 "-display", "none", "-serial", "file:" + str(self.root / "serial.log"),
                 "-monitor", "none", "-qmp", "tcp:127.0.0.1:44452,server=on,wait=off", "-drive", f"file={image},format=qcow2,if=virtio",
                 "-netdev", f"user,id=net0,hostfwd=tcp:127.0.0.1:{self.port}-:22",
@@ -127,7 +127,7 @@ class UbuntuVM:
                 if old_boot is None or boot.strip() != old_boot:
                     self.command("test $(cat /proc/1/comm) = systemd; test -f /sys/fs/cgroup/cgroup.controllers; command -v python3 systemctl systemd-run")
                     return boot.strip()
-            except (OSError, paramiko.SSHException, AssertionError) as exc:
+            except (OSError, EOFError, paramiko.SSHException, AssertionError) as exc:
                 last_error = type(exc).__name__
             time.sleep(2)
         raise RuntimeError(f"Ubuntu не готова за 600 секунд: {last_error}")

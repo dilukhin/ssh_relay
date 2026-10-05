@@ -46,9 +46,13 @@ class SudoJobFaultCases:
         request, _ = self.launch("exit 0")
         original = self.wait(request)
         path = ROOT + "/" + request["job_id"]
-        for command in (f"cat {path}/metadata.json", f"printf hacked >> {path}/command.json"):
-            _stdin, stdout, _stderr = self.client.exec_command(command)
-            self.assertNotEqual(stdout.channel.recv_exit_status(), 0)
+        client = self.new_client()
+        try:
+            for command in (f"cat {path}/metadata.json", f"printf hacked >> {path}/command.json"):
+                _stdin, stdout, _stderr = client.exec_command(command)
+                self.assertNotEqual(stdout.channel.recv_exit_status(), 0)
+        finally:
+            client.close()
         self.admin(f"cp {path}/completion.json {path}/saved.json; printf '{{}}' > {path}/completion.json")
         try:
             self.assertEqual(self.status(request)["state"], "unknown")
