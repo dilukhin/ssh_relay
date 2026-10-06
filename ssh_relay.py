@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 import argparse
 import base64
@@ -18,6 +18,7 @@ import ssh_relay_replay_cli as relay_replay_cli
 import ssh_relay_core as _core
 import ssh_relay_jobs as relay_jobs
 import ssh_relay_verified_identity as verified_identity
+import ssh_relay_sudo_jobs as sudo_jobs
 import ssh_relay_session as relay_session
 import ssh_relay_transfers as relay_transfers
 from ssh_relay_core import *  # noqa: F403 — сохраняем публичный интерфейс прежнего модуля.
@@ -770,6 +771,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _core.build_parser()
     subparsers = _top_level_subparsers(parser)
     relay_replay_cli.extend_parser(_core, subparsers)
+    sudo_jobs.add_parser(_core, subparsers)
 
     status_parser = subparsers.choices["status"]
     status_parser.add_argument("--json", action="store_true", help="Проверить SSH identity daemon в одном JSON.")

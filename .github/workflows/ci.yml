@@ -34,6 +34,8 @@ jobs:
           ssh_relay_session.py
           ssh_relay_outcomes.py
           ssh_relay_verified_identity.py
+          ssh_relay_sudo_jobs.py
+          ssh_relay_sudo_job_remote.py
           ssh_relay_jobs.py
           ssh_relay_transfers.py
           tests/daemon_fake_runner.py
@@ -83,6 +85,9 @@ jobs:
       - name: Проверить точный pin SSH для machine-вызова
         run: python -m coverage run -m unittest discover -s tests -p "test_verified_machine_target.py" -v
 
+      - name: Проверить протокол длительных sudo-заданий
+        run: python -m coverage run -m unittest discover -s tests -p "test_sudo_jobs.py" -v
+
       - name: Проверить hardening локального протокола
         run: python -m coverage run -m unittest discover -s tests -p "test_protocol_hardening.py" -v
 
@@ -123,6 +128,8 @@ jobs:
           ssh_relay_session.py
           ssh_relay_outcomes.py
           ssh_relay_verified_identity.py
+          ssh_relay_sudo_jobs.py
+          ssh_relay_sudo_job_remote.py
           ssh_relay_jobs.py
           ssh_relay_transfers.py
           tests/daemon_fake_runner.py
@@ -151,6 +158,9 @@ jobs:
 
       - name: Выполнить полный набор тестов с branch coverage
         run: python -m coverage run -m unittest discover -s tests -v
+
+      - name: Проверить защищённые файлы и наблюдатель root
+        run: sudo "$(command -v python)" -m coverage run -m unittest discover -s tests -p "test_sudo_jobs.py" -v
 
       - name: Объединить coverage дочерних Python-процессов
         run: python -m coverage combine
