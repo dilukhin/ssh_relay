@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import io
+import base64
+import hashlib
 import json
 import unittest
 import uuid
@@ -27,6 +29,7 @@ SESSION = {
     "command_timeout": 120,
     "reconnect_wait": 30,
 }
+FINGERPRINT = "SHA256:" + "A" * 43
 
 
 class _InboundSocket:
@@ -49,12 +52,23 @@ class UnifiedRiskyMachineTests(unittest.TestCase):
         def request(_session, action, **kwargs):
             calls.append((action, dict(kwargs)))
             if action == "status":
-                return {"ok": True, "status": "active", "ssh_status": "connected", "receipt_schema_version": 1}
+                return {"ok": True, "status": "active", "ssh_status": "connected", "receipt_schema_version": 1,
+                        "version": core.__version__, "risky_identity_schema_version": 1}
             if command_error is not None:
                 raise command_error
-            if callable(command_result):
-                return command_result(kwargs)
-            return command_result
+            response = command_result(kwargs) if callable(command_result) else command_result
+            if not isinstance(response, dict):
+                return response
+            response = dict(response)
+            command = response if response.get("ok") else response.get("command_result")
+            if isinstance(command, dict) and command.get("ok"):
+                for key, value in (("remote_host", _session["host"]), ("remote_port", _session["port"]),
+                                   ("remote_user", _session["user"]), ("remote_host_key_sha256", FINGERPRINT)):
+                    command.setdefault(key, value)
+                receipt = command.get("risky_receipt") if response.get("ok") else response.get("receipt_result")
+                if isinstance(receipt, dict):
+                    receipt.setdefault("remote_host_key_sha256", FINGERPRINT)
+            return response
 
         with patch.object(core, "read_session", return_value=current_session), patch.object(
             core, "request_daemon", side_effect=request
@@ -243,6 +257,42 @@ class UnifiedRiskyMachineTests(unittest.TestCase):
         self.assertEqual("succeeded", payload["receipt_status"])
         self.assertEqual(["status", "sudo_exec"], [action for action, _ in calls])
 
+    def test_wrong_verified_key_or_receipt_identity_never_reports_success(self) -> None:
+        for altered in ("remote_host_key_sha256", "receipt_id", "transaction_id"):
+            with self.subTest(altered=altered):
+                def response(kwargs):
+                    command = {"ok": True, "stdout": "", "stderr": "", "exit_code": 0,
+                               "risky_receipt": {"receipt_status": "succeeded", "transaction_id": "tx-identity",
+                                                 "receipt_id": kwargs["receipt_id"],
+                                                 "remote_host_key_sha256": FINGERPRINT}}
+                    if altered == "remote_host_key_sha256":
+                        command[altered] = "SHA256:" + "B" * 43
+                    else:
+                        command["risky_receipt"][altered] = "wrong"
+                    return command
+                code, payload, _, _ = self.run_machine(
+                    ["exec", "--json", "--risky", "--transaction-id", "tx-identity", "true"],
+                    command_result=response,
+                )
+                self.assertEqual(13, code)
+                self.assertEqual("unknown", payload["operation_status"])
+                self.assertEqual("risky_identity_unconfirmed", payload["error_code"])
+
+    def test_old_daemon_is_rejected_before_command(self) -> None:
+        args = ssh_relay.build_parser().parse_args(["exec", "--json", "--risky", "true"])
+        output = io.StringIO()
+        calls = []
+        def request(_session, action, **_kwargs):
+            calls.append(action)
+            return {"ok": True, "receipt_schema_version": 1, "version": "0.10.1"}
+        with patch.object(core, "read_session", return_value=dict(SESSION)), patch.object(
+            core, "request_daemon", side_effect=request
+        ), redirect_stdout(output):
+            code = args.handler(args)
+        self.assertEqual(10, code)
+        self.assertEqual(["status"], calls)
+        self.assertEqual("risky_daemon_incompatible", json.loads(output.getvalue())["error_code"])
+
     def test_named_sessions_keep_identity_and_transactions_separate(self) -> None:
         def make_result(tx):
             def result(kwargs):
@@ -350,6 +400,25 @@ class ReceiptIdPropagationTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(core.RelayError, "receipt_id"):
             core.read_message(inbound)
+
+
+class VerifiedHostKeyTests(unittest.TestCase):
+    def test_fingerprint_comes_from_active_transport_key(self) -> None:
+        class Transport:
+            def is_active(self): return True
+            def is_authenticated(self): return True
+            def get_remote_server_key(self): return self
+            def asbytes(self): return b"verified-test-host-key"
+        class Client:
+            def get_transport(self): return Transport()
+        expected = "SHA256:" + base64.b64encode(hashlib.sha256(b"verified-test-host-key").digest()).decode("ascii").rstrip("=")
+        self.assertEqual(expected, core.verified_host_key_fingerprint(Client()))
+
+    def test_inactive_transport_cannot_supply_risky_identity(self) -> None:
+        class Client:
+            def get_transport(self): return None
+        with self.assertRaises(core.RelayError):
+            core.verified_host_key_fingerprint(Client())
 
 
 if __name__ == "__main__":

@@ -23,8 +23,7 @@ def main() -> int:
 
     import ssh_relay
 
-    args = ssh_relay.build_parser().parse_args(
-        [
+    arguments = [
             "daemon",
             "--name",
             "ci-real-ssh",
@@ -39,7 +38,9 @@ def main() -> int:
             "--command-timeout",
             "2",
         ]
-    )
+    if os.environ.get("SSH_RELAY_REAL_ENABLE_SUDO") == "1":
+        arguments.append("--enable-sudo")
+    args = ssh_relay.build_parser().parse_args(arguments)
     return int(args.handler(args))
 
 
