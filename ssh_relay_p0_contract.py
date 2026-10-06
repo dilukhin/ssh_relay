@@ -526,6 +526,13 @@ def install(core: Any) -> None:
             ) -> int:
                 if getattr(args, "json", False) and getattr(args, "risky", False):
                     return _machine_risky_cmd(core, args, action=_action)
+                # Точная проверка транспорта нужна и read-only verify. Это
+                # не оценка безопасности команды и не разрешение её исполнения.
+                if _action == "exec" and getattr(args, "json", False):
+                    if getattr(args, "verified_command_timeout", None) is not None:
+                        print("verified-command-timeout доступен только с --risky.", file=sys.stderr)
+                        return 2
+                    return int(_original(args))
                 if getattr(args, "require_verified_identity", False) or any(
                     getattr(args, name, None) is not None for name in (
                         "expected_remote_host", "expected_remote_port", "expected_remote_user",
@@ -533,7 +540,7 @@ def install(core: Any) -> None:
                         "expected_daemon_instance_id", "expected_connection_generation",
                         "expected_daemon_source_sha", "verified_command_timeout")
                 ):
-                    print("Verified identity доступна только с --json --risky.", file=sys.stderr)
+                    print("Verified identity доступна с exec --json или --json --risky.", file=sys.stderr)
                     return 2
                 return int(_original(args))
 

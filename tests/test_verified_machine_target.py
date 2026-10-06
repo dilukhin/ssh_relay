@@ -10,6 +10,7 @@ from unittest.mock import patch
 import ssh_relay
 import ssh_relay_core as core
 import ssh_relay_p0_contract as p0
+import ssh_relay_outcomes as outcomes
 
 
 PIN = {
@@ -55,9 +56,45 @@ class VerifiedMachineTargetTests(unittest.TestCase):
         with (patch.object(core, "read_session", return_value=SESSION),
               patch.object(core, "request_daemon", side_effect=request),
               patch.object(p0, "source_sha", return_value="a" * 40),
+              patch.object(outcomes, "source_sha", return_value="a" * 40),
               redirect_stdout(io.StringIO()) as output):
             code = args.handler(args)
         return code, json.loads(output.getvalue()), calls
+
+    def test_verified_nonrisky_exec_pins_transport_without_receipt(self):
+        def reply(kwargs):
+            self.assertEqual(PIN, kwargs["expected_verified_identity"])
+            self.assertFalse(kwargs["risky"])
+            self.assertNotIn("receipt_id", kwargs)
+            return {"ok": True, "exit_code": 0, "stdout": "ok", "stderr": "", "verified_identity": PIN}
+        code, payload, calls = self.run_case(reply_factory=reply, argv=[
+            "exec", "--name", "synthetic", "--json", *flags(), "true"])
+        self.assertEqual(0, code)
+        self.assertEqual("succeeded", payload["operation_status"])
+        self.assertEqual(PIN, payload["verified_identity"])
+        self.assertEqual("not_requested", payload["receipt_status"])
+        self.assertFalse(payload["risky"])
+        self.assertEqual(["status", "exec"], [action for action, _ in calls])
+
+    def test_nonrisky_pin_drift_or_missing_proof_is_not_success(self):
+        argv = ["exec", "--name", "synthetic", "--json", *flags(), "true"]
+        code, payload, calls = self.run_case(status_identity={**PIN, "connection_generation": 2}, argv=argv)
+        self.assertEqual(10, code)
+        self.assertEqual(["status"], [action for action, _ in calls])
+        for proof in (None, {**PIN, "remote_host_key_sha256": "SHA256:" + "B" * 43}):
+            with self.subTest(proof=proof):
+                code, payload, calls = self.run_case(argv=argv, reply_factory=lambda _kw: {
+                    "ok": True, "exit_code": 0, "verified_identity": proof})
+                self.assertEqual(13, code)
+                self.assertEqual("unknown", payload["operation_status"])
+                self.assertEqual(1, sum(action == "exec" for action, _ in calls))
+
+    def test_nonrisky_partial_pin_is_rejected(self):
+        code, payload, calls = self.run_case(argv=["exec", "--json", "--name", "synthetic",
+                                                  "--expected-remote-host", PIN["remote_host"], "true"])
+        self.assertEqual(10, code)
+        self.assertEqual("invalid_verified_identity", payload["error_code"])
+        self.assertEqual([], calls)
 
     def test_preflight_wrong_key_or_generation_blocks_before_command(self):
         for change in ({"remote_host_key_sha256": "SHA256:" + "B" * 43},
