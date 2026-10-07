@@ -540,7 +540,7 @@ def install(core: Any) -> None:
                         "expected_daemon_instance_id", "expected_connection_generation",
                         "expected_daemon_source_sha", "verified_command_timeout")
                 ):
-                    print("Verified identity доступна с exec --json или --json --risky.", file=sys.stderr)
+                    print("Проверка точной SSH-цели доступна с exec --json или --json --risky.", file=sys.stderr)
                     return 2
                 return int(_original(args))
 
