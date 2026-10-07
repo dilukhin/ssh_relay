@@ -8,7 +8,7 @@ import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
-SEMANTIC_VERSION = "0.12.0"
+SEMANTIC_VERSION = "0.13.0"
 _SOURCE_SHA: str | None = None
 _SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 _invocation_identity_recorded = False
