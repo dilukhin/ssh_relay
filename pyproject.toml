@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ssh-relay"
-version = "0.10.1"
+version = "0.13.0"
 description = "Cross-platform local SSH relay for controlled non-interactive remote operations"
 requires-python = ">=3.10"
 readme = "README.md"
@@ -27,10 +27,12 @@ py-modules = [
   "ssh_relay_replay_cli",
   "ssh_relay_replay_platform",
   "ssh_relay_jobs",
+  "ssh_relay_sudo_jobs",
+  "ssh_relay_sudo_job_remote",
+  "ssh_relay_verified_identity",
   "ssh_relay_outcomes",
   "ssh_relay_p0_contract",
   "ssh_relay_receipts",
   "ssh_relay_session",
   "ssh_relay_transfers",
 ]
-
