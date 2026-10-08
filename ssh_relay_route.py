@@ -84,6 +84,13 @@ class Client:
         return Transport(target, intermediary) if target is not None and intermediary is not None else None
 
     def intermediary_identity(self) -> dict[str, Any] | None:
+        try:
+            return self._intermediary_identity()
+        except Exception:
+            # Обрыв во время чтения ключа не даёт подтверждённой identity.
+            return None
+
+    def _intermediary_identity(self) -> dict[str, Any] | None:
         transport = self.get_transport()
         if transport is None or not transport.is_active() or not transport.is_authenticated():
             return None

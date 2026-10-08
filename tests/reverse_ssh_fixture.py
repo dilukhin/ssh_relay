@@ -15,13 +15,13 @@ def bridge(left, right):
                 if not data:
                     break
                 destination.sendall(data)
-        except (OSError, EOFError):
+        except (OSError, EOFError, paramiko.SSHException):
             pass
         finally:
             for stream in (source, destination):
                 try:
                     stream.close()
-                except OSError:
+                except (OSError, EOFError, paramiko.SSHException):
                     pass
     threading.Thread(target=pump, args=(left, right), daemon=True).start()
     threading.Thread(target=pump, args=(right, left), daemon=True).start()

@@ -214,11 +214,12 @@ if paramiko is not None:
             destination = Path(self.tmp.name) / "download.bin"
             payload = bytes(range(256)) * 1025
             source.write_bytes(payload)
+            child_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
             for arguments in (["upload", "--name", "ci-real-ssh", str(source), "/daemon.bin"],
                               ["download", "--name", "ci-real-ssh", "/daemon.bin", str(destination)]):
                 completed = subprocess.run([sys.executable, str(Path(core.__file__).with_name("ssh_relay.py")),
                     *arguments], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, encoding="utf-8", timeout=15)
+                    text=True, encoding="utf-8", env=child_env, timeout=15)
                 self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
             self.assertEqual(payload, destination.read_bytes())
 
