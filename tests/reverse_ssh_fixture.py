@@ -19,6 +19,13 @@ def bridge(left, right):
             pass
         finally:
             for stream in (source, destination):
+                if isinstance(stream, socket.socket):
+                    # close из другого потока не прерывает recv на Linux.
+                    # shutdown завершает TCP и будит второй поток передачи.
+                    try:
+                        stream.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
                 try:
                     stream.close()
                 except (OSError, EOFError, paramiko.SSHException):
