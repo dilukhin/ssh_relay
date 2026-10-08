@@ -759,6 +759,9 @@ def verified_status_cmd(args: argparse.Namespace) -> int:
                 result["operation_status"] = "succeeded"
                 result["verified_identity"] = observed
                 result["receipt_schema_version"] = status.get("receipt_schema_version")
+                if "ssh_route" in status:
+                    result["ssh_route"] = status["ssh_route"]
+                    result["verified_intermediate_identity"] = status.get("verified_intermediate_identity")
             else:
                 result["error_code"] = "verified_transport_unavailable"
         except _core.RelayError:
