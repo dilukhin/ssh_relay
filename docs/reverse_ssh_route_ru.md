@@ -77,7 +77,11 @@ systemd, sudo-job или квитанций с Windows как удалённой
 SFTP-пути. В автоматическом испытании конечный SSH/SFTP-сервер — изолированный
 Paramiko-сервер; обратный туннель использует настоящие SSH `tcpip-forward` и
 `forwarded-tcpip`, а relay — настоящий `direct-tcpip`. Это не приёмка реального
-DIMA-HP или системного OpenSSH `ssh -R`.
+DIMA-HP. Отдельный Linux-тест запускает системный OpenSSH `ssh -R` и проверяет
+через него exec, SFTP, CLI upload/download и сохранение процесса туннеля после
+stop. Его одноразовый ключ находится только в памяти испытательного ssh-agent.
+Конечный sshd и посредник в этом опыте по-прежнему реализованы Paramiko;
+системный OpenSSH Server Windows и пользовательский ПК требуют отдельной приёмки.
 
 ## Проверки кандидата
 
@@ -87,5 +91,9 @@ DIMA-HP или системного OpenSSH `ssh -R`.
 старого pin и сохранение независимого туннеля после stop. Повторён прежний
 контракт verified exec и sudo на синтетическом сервере; root-команды не
 выполняются. Локально в среде ChatGPT отсутствует Paramiko, поэтому реальные
-SSH-проверки выполняются обязательным CI на Ubuntu и Windows. Слияние, выпуск
+SSH-проверки выполняются обязательным CI на Ubuntu и Windows; системный
+ssh-agent/ssh -R дополнительно проверяется на Linux. Слияние, выпуск
 и приёмка на пользовательском ПК проверяются отдельно.
+
+Справочники: [OpenSSH sshd_config](https://man.openbsd.org/sshd_config),
+[Paramiko Transport](https://docs.paramiko.org/en/stable/api/transport.html).

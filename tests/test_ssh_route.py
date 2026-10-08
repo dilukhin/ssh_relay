@@ -239,6 +239,19 @@ if paramiko is not None:
             self.assertTrue(self.exec("test:real-success")["ok"])
             self.assertEqual(1, self.server.commands.count("test:lost-result"))
 
+        @unittest.skipUnless(os.name == "posix", "Системный ssh-agent для этого опыта проверяется на Linux.")
+        def test_system_openssh_reverse_tunnel_exec_and_sftp(self):
+            self.forward.stop()
+            self.forward = ReverseSSHFixture(self.via_key, self.server.port)
+            self.forward.start(self.via_hosts, native=True)
+            self.overrides.update({"SSH_RELAY_REAL_VIA_PORT": str(self.forward.port),
+                                   "SSH_RELAY_REAL_VIA_FORWARD_PORT": str(self.forward.forward_port)})
+            self.test_sftp_over_reverse_ssh()
+            self.assertTrue(self.exec("test:real-success")["ok"])
+            self.assertIsNone(self.forward.ssh_process.poll())
+            self.stop_daemon()
+            self.assertIsNone(self.forward.ssh_process.poll())
+
 else:
     @unittest.skip("Для реального SSH нужна обязательная зависимость Paramiko; CI устанавливает её.")
     class ReverseSSHIntegrationTests(unittest.TestCase):

@@ -3,6 +3,11 @@ from __future__ import annotations
 
 import socket
 import threading
+import io
+import os
+import subprocess
+import time
+from pathlib import Path
 import paramiko
 
 
@@ -42,7 +47,11 @@ class ForwardServer(paramiko.ServerInterface):
         self.reverse_listener = None
 
     def get_allowed_auths(self, username):
-        return "password"
+        return "password,publickey"
+
+    def check_auth_publickey(self, username, key):
+        return (paramiko.AUTH_SUCCESSFUL if username == "via-user" and key == self.owner.reverse_key
+                else paramiko.AUTH_FAILED)
 
     def check_auth_password(self, username, password):
         return (paramiko.AUTH_SUCCESSFUL if username == "via-user" and password == "via-test-password"
@@ -110,8 +119,11 @@ class ReverseSSHFixture:
         self.listener.listen(8)
         self.listener.settimeout(0.1)
         self.reverse_client = None
+        self.reverse_key = None
+        self.ssh_process = None
+        self.agent_process = None
 
-    def start(self, known_hosts):
+    def start(self, known_hosts, *, native=False):
         def serve(connection):
             transport = paramiko.Transport(connection)
             self.transports.append(transport)
@@ -141,6 +153,9 @@ class ReverseSSHFixture:
         keys = paramiko.HostKeys()
         keys.add(f"[127.0.0.1]:{self.port}", self.key.get_name(), self.key)
         keys.save(str(known_hosts))
+        if native:
+            self.start_native_reverse(known_hosts)
+            return
         self.reverse_client = paramiko.SSHClient()
         self.reverse_client.load_system_host_keys(str(known_hosts))
         self.reverse_client.set_missing_host_key_policy(paramiko.RejectPolicy())
@@ -157,6 +172,39 @@ class ReverseSSHFixture:
             threading.Thread(target=connect, daemon=True).start()
         self.reverse_client.get_transport().request_port_forward("127.0.0.1", 0, handler=forwarded)
 
+    def start_native_reverse(self, known_hosts):
+        """Системный ssh -R; одноразовый приватный ключ передаётся ssh-agent через stdin."""
+        self.reverse_key = paramiko.RSAKey.generate(2048)
+        agent_socket = str(Path(known_hosts).with_name("synthetic-agent.sock"))
+        self.agent_process = subprocess.Popen(["ssh-agent", "-D", "-a", agent_socket],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 5
+        while not Path(agent_socket).exists() and time.monotonic() < deadline:
+            if self.agent_process.poll() is not None:
+                raise RuntimeError("Испытательный ssh-agent завершился.")
+            time.sleep(0.02)
+        key = io.StringIO()
+        self.reverse_key.write_private_key(key)
+        environment = {**os.environ, "SSH_AUTH_SOCK": agent_socket}
+        subprocess.run(["ssh-add", "-"], input=key.getvalue(), text=True, env=environment,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=5)
+        self.ssh_process = subprocess.Popen([
+            "ssh", "-F", "/dev/null", "-N", "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile=" + str(known_hosts),
+            "-o", "GlobalKnownHostsFile=/dev/null", "-o", "IdentityFile=none",
+            "-o", "IdentityAgent=" + agent_socket, "-o", "PasswordAuthentication=no",
+            "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=5",
+            "-R", f"127.0.0.1:0:127.0.0.1:{self.target_port}", "-p", str(self.port),
+            "via-user@127.0.0.1"], env=environment,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 5
+        while self.forward_port == 0 and time.monotonic() < deadline:
+            if self.ssh_process.poll() is not None:
+                raise RuntimeError("Системный ssh не создал испытательный обратный туннель.")
+            time.sleep(0.02)
+        if self.forward_port == 0:
+            raise RuntimeError("Системный ssh не подтвердил обратный порт вовремя.")
+
     def drop_relay_connections(self):
         for transport in list(self.transports):
             if transport is not self.reverse_transport:
@@ -165,6 +213,14 @@ class ReverseSSHFixture:
     def stop_reverse(self):
         if self.reverse_client is not None:
             self.reverse_client.close()
+        for process in (self.ssh_process, self.agent_process):
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
 
     def stop(self):
         self.stopped.set()
