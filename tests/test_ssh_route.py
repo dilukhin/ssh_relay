@@ -65,6 +65,30 @@ class RouteContractTests(unittest.TestCase):
         via.close.assert_called_once()
         self.assertNotIn("passphrase", json.dumps(config.public()))
 
+    def test_port_22022_is_forward_port_not_target_identity_port(self):
+        module, via, target, channel = Mock(), Mock(), Mock(), Mock()
+        module.SSHClient.side_effect = [via, target]
+        via.get_transport.return_value.open_channel.return_value = channel
+        config = route.Route.from_args(SimpleNamespace(
+            via_host="185.79.138.72", via_user="dilukhin", via_target_port=22022))
+        client = route.open_client(
+            module, config, target_host="target-via-vserv", target_port=22,
+            target_user="dilukhin", target_known_hosts="known_hosts",
+            target_identity="target-key", target_password=None,
+            target_passphrase=None, via_identity="via-key",
+            via_password=None, via_passphrase=None, keepalive=30)
+        try:
+            via.connect.assert_called_once()
+            self.assertEqual("185.79.138.72", via.connect.call_args.args[0])
+            via.get_transport.return_value.open_channel.assert_called_once_with(
+                "direct-tcpip", ("127.0.0.1", 22022), ("127.0.0.1", 0), timeout=10)
+            self.assertEqual("target-via-vserv", target.connect.call_args.args[0])
+            self.assertEqual(22, target.connect.call_args.kwargs["port"])
+            self.assertIs(channel, target.connect.call_args.kwargs["sock"])
+            self.assertEqual(22022, config.public()["forward_port"])
+        finally:
+            client.close()
+
     def test_failed_second_handshake_closes_all_owned_resources(self):
         module, via, target, channel = Mock(), Mock(), Mock(), Mock()
         module.SSHClient.side_effect = [via, target]

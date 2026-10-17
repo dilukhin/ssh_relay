@@ -56,6 +56,56 @@ TCP-порт обратного туннеля на VPS. `--via-target-host` п�
 ключа без интерактивных запросов. SSH-agent и автоматический подбор ключей
 не включаются; неизвестный или изменившийся ключ любого узла отклоняется.
 
+
+## Эквивалент `ssh -J` для обратного порта 22022
+
+Если уже работает команда OpenSSH:
+
+```text
+ssh -J dilukhin@185.79.138.72 -p 22022 dilukhin@127.0.0.1
+```
+
+на Windows-машине, где запускается relay, используется тот же маршрут. Пример
+для **cmd.exe** (конечный SSH-порт за пробросом — 22):
+
+```cmd
+ssh_relay daemon --name target-via-vserv ^
+  --host target-via-vserv --port 22 --user dilukhin ^
+  --via-host 185.79.138.72 --via-user dilukhin ^
+  --via-target-host 127.0.0.1 --via-target-port 22022 ^
+  --identity-file "%USERPROFILE%\.ssh\id_ed25519_target" ^
+  --via-identity-file "%USERPROFILE%\.ssh\id_ed25519_vserv" ^
+  --known-hosts "%USERPROFILE%\.ssh\known_hosts" ^
+  --via-known-hosts "%USERPROFILE%\.ssh\known_hosts"
+```
+
+Здесь `--via-target-port 22022` — это порт, открытый **на vserv** обратным
+туннелем; `--port 22` — порт *логической идентичности* конечного SSH-сервера
+для проверки его ключа. В отличие от OpenSSH `ssh -J`, relay не читает
+`ProxyJump` из конфигурации SSH и не выбирает ключи через ssh-agent:
+оба ключа заданы явно. Если используется аутентификация паролем, соответствующие
+`--identity-file` допускается не указывать; пароли вводятся в терминале daemon.
+
+Имя `target-via-vserv` — уникальный псевдоним конечного узла, **не** адрес
+для DNS или сетевого соединения. В `known_hosts` заранее необходимы две
+независимо проверенные записи: одна для `185.79.138.72`, другая для
+`target-via-vserv` (если логический `--port` не равен 22, то для
+`[target-via-vserv]:<порт>`). Не копируйте ключ посредника как ключ
+конечного узла и не принимайте автоматически ключ, присланный по тому же
+непроверенному маршруту.
+
+В другом окне cmd.exe можно проверить:
+
+```cmd
+ssh_relay status --name target-via-vserv --json
+ssh_relay exec --name target-via-vserv "hostname && whoami && pwd"
+ssh_relay stop --name target-via-vserv
+```
+
+`stop` не останавливает независимый обратный SSH-туннель. Переход к прямому
+подключению в случае отсутствия маршрута не выполняется.
+
+
 ## Состояние, обрыв и ограничения
 
 В JSON `verified_identity` продолжает обозначать конечный узел. Схема и проверки
