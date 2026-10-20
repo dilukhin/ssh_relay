@@ -15,6 +15,7 @@ ssh_relay.py — локальный SSH-relay для выполнения неи
 __version__ = "0.6.0"
 
 import argparse
+import ssh_relay_route as relay_route
 import ssh_relay_verified_identity as verified_identity_contract
 import ssh_relay_sudo_jobs as sudo_jobs_contract
 import hashlib
@@ -836,6 +837,11 @@ def start_detached_daemon(args: argparse.Namespace) -> int:
         print("--detach несовместим с --enable-sudo, потому что sudo-пароль вводится интерактивно.", file=sys.stderr)
         return 2
 
+    route = relay_route.Route.from_args(args)
+    if route is not None and (not route.identity_file or route.ask_key_passphrase):
+        print("--detach через посредника требует --via-identity-file без запроса passphrase.", file=sys.stderr)
+        return 2
+
     session_name = validate_session_name(args.name)
     if check_existing_session(session_name):
         return 1
@@ -857,6 +863,12 @@ def start_detached_daemon(args: argparse.Namespace) -> int:
     ]
     if args.known_hosts:
         command.extend(["--known-hosts", args.known_hosts])
+    if route is not None:
+        for name in ("via_host", "via_port", "via_user", "via_target_host", "via_target_port",
+                     "via_identity_file", "via_known_hosts"):
+            value = getattr(args, name, None)
+            if value is not None:
+                command.extend(["--" + name.replace("_", "-"), str(value)])
 
     log_path = Path(args.detach_log).expanduser() if args.detach_log else state_directory() / f"{session_name}.daemon.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -903,6 +915,11 @@ def check_existing_session(name: str) -> bool:
 
 
 def daemon(args: argparse.Namespace) -> int:
+    try:
+        route = relay_route.Route.from_args(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if getattr(args, "enable_sudo_jobs", False) and not args.enable_sudo:
         print("--enable-sudo-jobs требует --enable-sudo.", file=sys.stderr)
         return 2
@@ -926,12 +943,21 @@ def daemon(args: argparse.Namespace) -> int:
     password: str | None = None
     passphrase: str | None = None
     sudo_password: str | None = None
+    via_identity: str | None = None
+    via_password: str | None = None
+    via_passphrase: str | None = None
     if args.identity_file:
         identity_path = Path(args.identity_file).expanduser()
         if not identity_path.is_file():
             print(f"Файл ключа или сертификата не найден: {identity_path}", file=sys.stderr)
             return 1
         identity_file = str(identity_path)
+    if route is not None and route.identity_file:
+        via_path = Path(route.identity_file).expanduser()
+        if not via_path.is_file():
+            print(f"Файл ключа посредника не найден: {via_path}", file=sys.stderr)
+            return 1
+        via_identity = str(via_path)
 
     try:
         paramiko = load_paramiko()
@@ -945,8 +971,23 @@ def daemon(args: argparse.Namespace) -> int:
     else:
         password = getpass.getpass(f"SSH-пароль для {args.user}@{args.host}: ")
 
+    if route is not None:
+        if via_identity:
+            if route.ask_key_passphrase:
+                via_passphrase = getpass.getpass(f"Passphrase SSH-ключа посредника {route.user}@{route.host}: ")
+        else:
+            via_password = getpass.getpass(f"SSH-пароль посредника {route.user}@{route.host}: ")
+
     def open_ssh_client() -> Any:
         """Открывает проверенное SSH-соединение, пригодное для последующего reconnect."""
+        if route is not None:
+            return relay_route.open_client(
+                paramiko, route, target_host=args.host, target_port=args.port,
+                target_user=args.user, target_known_hosts=args.known_hosts,
+                target_identity=identity_file, target_password=password, target_passphrase=passphrase,
+                via_identity=via_identity, via_password=via_password, via_passphrase=via_passphrase,
+                keepalive=SSH_KEEPALIVE_INTERVAL,
+            )
         new_client = paramiko.SSHClient()
         try:
             if args.known_hosts:
@@ -979,6 +1020,8 @@ def daemon(args: argparse.Namespace) -> int:
     except Exception as exc:
         password = None
         passphrase = None
+        via_password = None
+        via_passphrase = None
         print(f"Не удалось установить SSH-соединение: {exc}", file=sys.stderr)
         if identity_file:
             print(
@@ -1001,6 +1044,8 @@ def daemon(args: argparse.Namespace) -> int:
             sudo_password = None
             password = None
             passphrase = None
+            via_password = None
+            via_passphrase = None
             client.close()
             print(str(exc), file=sys.stderr)
             return 1
@@ -1018,6 +1063,8 @@ def daemon(args: argparse.Namespace) -> int:
         password = None
         passphrase = None
         client.close()
+        via_password = None
+        via_passphrase = None
         print(f"Не удалось открыть локальный порт relay: {exc}", file=sys.stderr)
         return 1
 
@@ -1041,6 +1088,8 @@ def daemon(args: argparse.Namespace) -> int:
         "upload_max_size": args.upload_max_size,
         "reconnect_wait": DEFAULT_RECONNECT_WAIT,
     }
+    if route is not None:
+        session["ssh_route"] = route.public()
     try:
         session_path = write_session(session_name, session)
     except OSError as exc:
@@ -1048,6 +1097,8 @@ def daemon(args: argparse.Namespace) -> int:
         sudo_password = None
         password = None
         passphrase = None
+        via_password = None
+        via_passphrase = None
         client.close()
         print(f"Не удалось безопасно записать файл сессии: {exc}", file=sys.stderr)
         return 1
@@ -1273,7 +1324,7 @@ def daemon(args: argparse.Namespace) -> int:
                 mark_connection_lost()
 
     def cleanup() -> None:
-        nonlocal cleanup_done, sudo_password, password, passphrase, connection_state
+        nonlocal cleanup_done, sudo_password, password, passphrase, connection_state, via_password, via_passphrase
         if cleanup_done:
             return
         cleanup_done = True
@@ -1285,6 +1336,8 @@ def daemon(args: argparse.Namespace) -> int:
         sudo_password = None
         password = None
         passphrase = None
+        via_password = None
+        via_passphrase = None
         remove_session_file(session_name, auth_token)
         try:
             current_client().close()
@@ -1322,7 +1375,8 @@ def daemon(args: argparse.Namespace) -> int:
                 action = request.get("action")
                 if action == "status":
                     snapshot = connection_snapshot()
-                    observed = (observed_identity(current_client())
+                    candidate = current_client()
+                    observed = (observed_identity(candidate)
                                 if snapshot["ssh_status"] == "connected" else None)
                     reply({
                         "ok": True,
@@ -1342,6 +1396,9 @@ def daemon(args: argparse.Namespace) -> int:
                         "name": session_name,
                         "verified_identity_schema_version": verified_identity_contract.SCHEMA_VERSION,
                         "verified_identity": observed,
+                        **({"ssh_route": route.public(),
+                            "verified_intermediate_identity": candidate.intermediary_identity() if observed else None}
+                           if route is not None else {}),
                     })
                     return
                 if action == "stop":
@@ -1923,7 +1980,7 @@ def build_parser() -> argparse.ArgumentParser:
         "daemon", help="Открыть SSH-сессию и запустить локальный relay."
     )
     add_session_name_argument(daemon_parser)
-    daemon_parser.add_argument("--host", required=True, help="Имя или адрес SSH-сервера.")
+    daemon_parser.add_argument("--host", required=True, help="SSH-цель; при --via-host это имя конечного узла в known_hosts.")
     daemon_parser.add_argument("--port", type=parse_port, default=22, help="Порт SSH-сервера, по умолчанию 22.")
     daemon_parser.add_argument("--user", "-u", default=getpass.getuser(), help="Имя SSH-пользователя.")
     daemon_parser.add_argument(
@@ -1943,6 +2000,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--known-hosts",
         help="Путь к проверенному файлу known_hosts; по умолчанию используется ~/.ssh/known_hosts.",
     )
+    daemon_parser.add_argument("--via-host", help="SSH-посредник, через который открыт обратный порт конечного узла.")
+    daemon_parser.add_argument("--via-port", type=parse_port, help="SSH-порт посредника, по умолчанию 22.")
+    daemon_parser.add_argument("--via-user", help="Отдельный SSH-пользователь посредника.")
+    daemon_parser.add_argument("--via-target-host", help="Адрес обратного порта на посреднике, по умолчанию 127.0.0.1.")
+    daemon_parser.add_argument("--via-target-port", type=parse_port, help="Обязательный номер обратного порта на посреднике.")
+    daemon_parser.add_argument("--via-identity-file", help="Отдельный SSH-ключ посредника; иначе запрашивается его пароль.")
+    daemon_parser.add_argument("--via-known-hosts", help="Проверенный known_hosts посредника; по умолчанию ~/.ssh/known_hosts.")
+    daemon_parser.add_argument("--via-ask-key-passphrase", action="store_true", help="Запросить passphrase ключа посредника.")
     daemon_parser.add_argument(
         "--command-timeout",
         type=parse_positive_seconds,

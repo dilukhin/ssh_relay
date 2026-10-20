@@ -31,6 +31,7 @@ jobs:
           python -m py_compile
           ssh_relay.py
           ssh_relay_core.py
+          ssh_relay_route.py
           ssh_relay_session.py
           ssh_relay_outcomes.py
           ssh_relay_verified_identity.py
@@ -79,6 +80,9 @@ jobs:
       - name: Проверить настоящий loopback SFTP
         run: python -m coverage run -m unittest discover -s tests -p "test_real_sftp_integration.py" -v
 
+      - name: Проверить посредника и настоящий обратный SSH-туннель
+        run: python -m coverage run -m unittest discover -s tests -p "test_ssh_route.py" -v
+
       - name: Проверить публичный CLI-контракт
         run: python -m coverage run -m unittest discover -s tests -p "test_cli*.py" -v
 
@@ -125,6 +129,7 @@ jobs:
           python -m py_compile
           ssh_relay.py
           ssh_relay_core.py
+          ssh_relay_route.py
           ssh_relay_session.py
           ssh_relay_outcomes.py
           ssh_relay_verified_identity.py
@@ -199,4 +204,5 @@ jobs:
         run: |
           python -m coverage combine coverage-windows coverage-ubuntu
           python -m coverage report
+
 
