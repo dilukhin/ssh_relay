@@ -1,8 +1,9 @@
 # Машинный контракт ssh_relay 0.9
 
 Неактивный этап короткого privileged-inspect #58 описан в
-[проекте контракта](docs/sudo_inspect_design_ru.md). `status` возвращает
-`sudo_inspect_enabled=false`; внутренний `action=sudo_inspect` всегда даёт
+[проекте контракта](docs/sudo_inspect_design_ru.md). Внутренний ответ daemon на
+`action=status` содержит `sudo_inspect_enabled=false`; публичный CLI
+`status --json` это поле не выводит. Внутренний `action=sudo_inspect` всегда даёт
 `not_started` с `sudo_inspect_not_implemented` без SSH/sudo, receipt и replay.
 Публичной команды и возможности включения пока нет. Это не capability допуска.
 

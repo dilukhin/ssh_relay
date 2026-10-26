@@ -77,7 +77,9 @@ Ubuntu; искать иной executable через недоверенный PAT
 envelope (например, `risky=true` для действия вне exec/sudo-exec) отклоняет
 существующий receipt-слой ещё до dispatcher: `ok=false`, `protocol_error`.
 Это также отказ без запуска; его нельзя трактовать как успех или повторять.
-`status` сообщает `sudo_inspect_enabled=false`, без положительной capability.
+Внутренний ответ daemon на `action=status` содержит
+`sudo_inspect_enabled=false`, без положительной capability; публичный CLI
+`status --json` это поле не выводит.
 Нет публичных `sudo-inspect` и `--enable-sudo-inspect`: argparse отклоняет их.
 Нет параметров grant/approved/trusted, включающих исполнение.
 
