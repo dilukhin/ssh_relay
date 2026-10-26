@@ -136,6 +136,38 @@ class CoreExecReconnectIntegrationTests(unittest.TestCase):
             response_timeout=response_timeout,
         )
 
+    def test_sudo_inspect_is_disabled_before_any_remote_command(self) -> None:
+        self.assertIs(False, self.status().get("sudo_inspect_enabled"))
+        before = self.command_lines()
+        # Даже прямой запрос с поддельным согласием не достигает SSH/replay.
+        for payload in ({}, {"probe": "nft_summary"}, {
+            "probe": "nft_summary; id", "command": "root-payload-marker",
+            "approved": True, "trusted": True, "grant": "fixture-grant-marker",
+            "request_id": "57bf51f9-d6a7-4c82-b409-c278a0626c20", "risky": True,
+        }):
+            with self.subTest(payload=payload):
+                result = core.request_daemon(self.session, "sudo_inspect", **payload)
+                if payload.get("risky"):
+                    # Общий receipt-слой отклоняет такой envelope ещё до dispatcher.
+                    self.assertIs(False, result.get("ok"))
+                    self.assertIn("protocol_error", result)
+                else:
+                    self.assertEqual("not_started", result.get("operation_status"))
+                    self.assertIs(False, result.get("command_started"))
+                    self.assertEqual("disabled", result.get("replay_status"))
+                    self.assertEqual("not_requested", result.get("receipt_status"))
+                self.assertNotIn("root-payload-marker", json.dumps(result))
+                self.assertNotIn("fixture-grant-marker", json.dumps(result))
+        self.assertEqual(before, self.command_lines())
+        for path in self.state.rglob("*"):
+            if path.is_file():
+                data = path.read_bytes()
+                self.assertNotIn(b"root-payload-marker", data)
+                self.assertNotIn(b"fixture-grant-marker", data)
+        replay = core.request_daemon(self.session, "replay", request_id="57bf51f9-d6a7-4c82-b409-c278a0626c20")
+        self.assertNotIn("root-payload-marker", json.dumps(replay))
+        self.assertNotIn("fixture-grant-marker", json.dumps(replay))
+
     def set_reconnect_failures(self, count: int) -> None:
         (self.control / "reconnect_failures.txt").write_text(str(count), encoding="utf-8")
 
