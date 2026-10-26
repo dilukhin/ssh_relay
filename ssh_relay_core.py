@@ -18,6 +18,7 @@ import argparse
 import ssh_relay_route as relay_route
 import ssh_relay_verified_identity as verified_identity_contract
 import ssh_relay_sudo_jobs as sudo_jobs_contract
+import ssh_relay_sudo_inspect as sudo_inspect_contract
 import hashlib
 import ssh_relay_replay_cli as replay_cli
 import atexit
@@ -1391,6 +1392,7 @@ def daemon(args: argparse.Namespace) -> int:
                            else {}),
                         "replay_schema_version": 1,
                         "sudo_enabled": bool(args.enable_sudo),
+                        "sudo_inspect_enabled": False,
                         "sudo_job_schema_version": sudo_jobs_contract.SCHEMA,
                         "sudo_jobs_enabled": bool(getattr(args, "enable_sudo_jobs", False) and args.enable_sudo),
                         "name": session_name,
@@ -1407,6 +1409,11 @@ def daemon(args: argparse.Namespace) -> int:
                     reconnect_event.set()
                     with connection_condition:
                         connection_condition.notify_all()
+                    return
+                if action == "sudo_inspect":
+                    # Первый этап #58: отказ до SSH, sudo, receipt и replay.
+                    # Флаги payload не могут включить ещё не реализованный допуск.
+                    reply(sudo_inspect_contract.blocked_result())
                     return
                 if action == "sudo_job":
                     operation_entered = False

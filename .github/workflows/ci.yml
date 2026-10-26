@@ -36,6 +36,7 @@ jobs:
           ssh_relay_outcomes.py
           ssh_relay_verified_identity.py
           ssh_relay_sudo_jobs.py
+          ssh_relay_sudo_inspect.py
           ssh_relay_sudo_job_remote.py
           ssh_relay_jobs.py
           ssh_relay_transfers.py
@@ -134,6 +135,7 @@ jobs:
           ssh_relay_outcomes.py
           ssh_relay_verified_identity.py
           ssh_relay_sudo_jobs.py
+          ssh_relay_sudo_inspect.py
           ssh_relay_sudo_job_remote.py
           ssh_relay_jobs.py
           ssh_relay_transfers.py

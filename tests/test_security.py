@@ -48,6 +48,24 @@ class SecurityIntegrationTests(unittest.TestCase):
             self.env_patcher.stop()
             self.tmp.cleanup()
 
+    def test_sudo_inspect_refuses_even_on_legacy_sudo_enabled_daemon(self) -> None:
+        self.start_daemon("sudo")
+        commands = self.control / "commands.log"
+        before = commands.read_bytes() if commands.exists() else b""
+        status = core.request_daemon(self.session, "status")
+        self.assertTrue(status.get("sudo_enabled"))
+        self.assertIs(False, status.get("sudo_inspect_enabled"))
+        result = core.request_daemon(
+            self.session, "sudo_inspect", probe="nft_summary", command="root-marker",
+            approved=True, trusted=True, grant="fake-grant-marker",
+        )
+        self.assertEqual("not_started", result.get("operation_status"))
+        self.assertIs(False, result.get("command_started"))
+        self.assertEqual(before, commands.read_bytes() if commands.exists() else b"")
+        stdout, stderr = self.stop_daemon()
+        self.assertNotIn("root-marker", stdout + stderr + json.dumps(result))
+        self.assertNotIn("fake-grant-marker", stdout + stderr + json.dumps(result))
+
     def start_daemon(self, mode: str = "normal", *, expect_session: bool = True) -> subprocess.Popen[str]:
         child_env = os.environ.copy()
         child_env.update(self.overrides)

@@ -20,6 +20,12 @@
 
 Каноническая спецификация машинного интерфейса находится в `MACHINE_CONTRACT.md`.
 
+Короткие привилегированные проверки #58 находятся на **неактивном этапе**:
+[граница доверия и контракт](docs/sudo_inspect_design_ru.md). Закрытый каталог
+и подготовка намерения не дают права sudo; daemon безусловно отказывает в
+`sudo_inspect`. Публичного `sudo-inspect`/`--enable-sudo-inspect` пока нет.
+Существующий `sudo-exec` не является безопасной заменой этого допуска в OpenCode.
+
 ## Version и diagnostic identity
 
 Для установленного runtime, собранного из Git commit, `ssh_relay --version` возвращает каноническую identity:
